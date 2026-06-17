@@ -507,7 +507,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== GOAL_STORAGE_TYPE) continue;
 			const data = (entry as { data?: Partial<GoalSnapshot> }).data;
-			if (data?.goal) goal = { ...data.goal } as GoalState;
+			if (data?.goal !== undefined) goal = data.goal ? { ...data.goal } as GoalState : null;
 		}
 	}
 
