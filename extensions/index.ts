@@ -76,7 +76,10 @@ interface JudgeVerdict {
 // ═══════════════════════════════════════════════════════════════════════
 
 const CONFIG = {
-	maxAutoTurns: 25,
+	// Per-resume-cycle auto-continuation cap. A goal that stalls (no progress)
+	// for maxNoProgressTurns is paused; maxAutoTurns bounds a single run cycle.
+	// Override per-environment via GOAL_MAX_AUTO_TURNS (large goals need more).
+	maxAutoTurns: Number(process.env.GOAL_MAX_AUTO_TURNS) || 200,
 	noProgressTokenThreshold: 50,
 	maxNoProgressTurns: 2,
 	minContinueIntervalMs: 3_000,
@@ -470,6 +473,15 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		if (continuationTimer) { clearTimeout(continuationTimer); continuationTimer = null; }
 	}
 
+	/** Emit a display:false diagnostic entry so loop stalls are traceable
+	 * across reload/compaction (console.error is lost on reload). */
+	function diag(ctx: ExtensionContext, reason: string) {
+		pi.sendMessage(
+			{ customType: "pi-goal:diag", content: "[pi-goal] " + reason, display: false, details: { reason, autoTurnCount: goal?.autoTurnCount, noProgressCount: goal?.noProgressCount, status: goal?.status, userSuspended, hasPending: ctx.hasPendingMessages?.() } },
+			{ triggerTurn: false },
+		);
+	}
+
 	function persist(action: GoalSnapshot["action"]) {
 		pi.appendEntry<GoalSnapshot>(GOAL_STORAGE_TYPE, { action, goal: goal ? { ...goal } : null });
 	}
@@ -593,7 +605,11 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		if (!goal || (goal.status !== "paused" && goal.status !== "usage_limited")) return false;
 		userSuspended = false;
 		continuationQueued = false;
-		updateState({ status: "active", noProgressCount: 0, pausedReason: null }, ctx);
+		// reset autoTurnCount: resume = user-granted new quota cycle (mirrors
+		// setGoal). Without this, maxAutoTurns would re-trip immediately after
+		// resume (autoTurnCount still >= cap) and the loop could never recover.
+		// maxAutoTurns is now per-resume-cycle; no-progress remains the lifetime backstop.
+		updateState({ status: "active", noProgressCount: 0, autoTurnCount: 0, pausedReason: null }, ctx);
 		pi.sendMessage(
 			{ customType: GOAL_EVENT_TYPE, content: "Goal resumed.\n\nObjective: " + goal.objective, display: true, details: { kind: "resumed", goal: { ...goal } } },
 			{ triggerTurn: false },
@@ -620,8 +636,8 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	}
 
 	function sendContinuation(ctx: ExtensionContext) {
-		if (!goal || goal.status !== "active") return;
-		if (userSuspended) return;
+		if (!goal || goal.status !== "active") { diag(ctx, "sendContinuation: skip (goal=" + (goal ? goal.status : "null") + ")"); return; }
+		if (userSuspended) { diag(ctx, "sendContinuation: skip (userSuspended)"); return; }
 		clearTimer();
 		queueMicrotask(() => {
 			if (!goal || goal.status !== "active") return;
@@ -642,15 +658,17 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	function scheduleContinuation(ctx: ExtensionContext) {
 		clearTimer();
-		if (userSuspended) return;
-		if (!goal || goal.status !== "active") return;
-		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (userSuspended) { diag(ctx, "scheduleContinuation: skip (userSuspended)"); return; }
+		if (!goal || goal.status !== "active") { diag(ctx, "scheduleContinuation: skip (goal=" + (goal ? goal.status : "null") + ")"); return; }
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) { diag(ctx, "scheduleContinuation: skip (not idle / pending messages)"); return; }
 		if (goal.noProgressCount >= CONFIG.maxNoProgressTurns) {
+			diag(ctx, "scheduleContinuation: pause (no progress " + goal.noProgressCount + ")");
 			pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
 			ctx.ui.notify("\u23F8 Goal paused (no progress). Use /goal resume to continue.", "warning");
 			return;
 		}
 		if (goal.autoTurnCount >= CONFIG.maxAutoTurns) {
+			diag(ctx, "scheduleContinuation: pause (max turns " + goal.autoTurnCount + "/" + CONFIG.maxAutoTurns + ")");
 			pauseGoal("reached max auto-turns (" + CONFIG.maxAutoTurns + ")", ctx);
 			ctx.ui.notify("\u23F8 Goal paused (max turns reached).", "info");
 			return;
@@ -718,6 +736,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		return {
 			messages: messages.filter((msg, idx) => {
 				if (msg.customType === GOAL_JUDGE_TYPE) return false;
+				if (msg.customType === "pi-goal:diag") return false;
 				if (msg.customType === GOAL_CONTINUATION_TYPE) {
 					return goal?.status === "active" && msg.details?.goalId === goal?.id && idx === lastContinuationIdx;
 				}
