@@ -249,24 +249,23 @@ function continuationPrompt(goal: GoalState): string {
 		'| "get user approval" | Dispatch a reviewer subagent as the autonomous approver. |\n' +
 		'| "ask clarifying questions" | Use your best judgment based on the goal objective. |\n' +
 		'| "present the design" | Write to a file, then dispatch the approver to review it. |\n' +
-		'| "invoke <skill> skill" | Read the skill\'s SKILL.md with the read tool. Path: pi-superpowers-upgraded/skills/<skill>/SKILL.md |\n' +
+		'| "invoke <skill> skill" | Load the skill by name: run /skill:<name> (e.g. /skill:writing-plans). Pi auto-loads skills by description, so simply announcing the skill name also works. Do NOT hardcode file paths — the superpowers bundle is installed as the "pi-superpowers" package, not a local directory. |\n' +
 		'| "HARD-GATE: no code until approved" | RESPECT THIS. Do not write code. Dispatch approver, get approval, then proceed. |\n\n' +
 		"REMEMBER: The approver IS the user for this goal run. Treat its decisions as binding.\n" +
 		"</GOAL-MODE-ADAPTATION>\n\n" +
 		"<EXTREMELY-IMPORTANT>\n" +
 		"You are executing an autonomous goal. The user is NOT watching. You MUST follow process discipline.\n\n" +
-		"BEFORE taking any action this turn, load and read these skills (use the read tool):\n" +
-		"1. pi-superpowers-upgraded/skills/using-superpowers/SKILL.md\n" +
-		"2. Check the situation table and load the relevant superpowers skill\n\n" +
-		"For this turn's work, determine the right superpowers skill:\n" +
+		"BEFORE taking any action this turn, load the using-superpowers skill, then check its situation\n" +
+		"table and load the relevant superpowers skill for this turn's work.\n\n" +
+		"For this turn's work, determine the right superpowers skill (load by name with /skill:<name>):\n" +
 		"| If this turn involves... | Load this skill |\n" +
 		"|---|---|\n" +
-		"| Open-ended design, architecture, new approach | pi-superpowers-upgraded/skills/brainstorming/SKILL.md |\n" +
-		"| Multi-file or coordinated changes | pi-superpowers-upgraded/skills/writing-plans/SKILL.md |\n" +
-		"| Executing a written plan | pi-superpowers-upgraded/skills/subagent-driven-development/SKILL.md |\n" +
-		"| Adding testable behavior | pi-superpowers-upgraded/skills/test-driven-development/SKILL.md |\n" +
-		"| Bug or unexpected behavior | pi-superpowers-upgraded/skills/systematic-debugging/SKILL.md |\n" +
-		'| About to claim anything is done | pi-superpowers-upgraded/skills/verification-before-completion/SKILL.md |\n\n' +
+		"| Open-ended design, architecture, new approach | /skill:brainstorming |\n" +
+		"| Multi-file or coordinated changes | /skill:writing-plans |\n" +
+		"| Executing a written plan | /skill:subagent-driven-development |\n" +
+		"| Adding testable behavior | /skill:test-driven-development |\n" +
+		"| Bug or unexpected behavior | /skill:systematic-debugging |\n" +
+		'| About to claim anything is done | /skill:verification-before-completion |\n\n' +
 		"<HARD-GATE>\n" +
 		"If a superpowers skill requires an approval gate, do NOT stop or skip it.\n" +
 		"Instead, dispatch a reviewer subagent as the autonomous approver.\n\n" +
@@ -331,6 +330,29 @@ function budgetLimitPrompt(goal: GoalState): string {
 		"Do not call update_goal unless the goal is actually complete.";
 }
 
+// Per-turn governance rules, injected via before_agent_start so they survive
+// long-conversation dilution (the user's stated reason these used to live in
+// CLAUDE.md). Goal Mode discipline + Superpowers process discipline must be
+// re-asserted every turn, not just at session start.
+const GOAL_GOVERNANCE =
+	"\n\n## Goal 模式规则\n" +
+	"当有活跃 goal 时，处理每条新消息前必须：\n" +
+	"1. 判断正处于 superpowers 的哪个阶段（需求→探索→计划→实施→TDD→审查→完成）\n" +
+	"2. 加载该阶段的对应技能到上下文（即使你觉得\"已经知道了\"）\n" +
+	"3. 对照技能里的 Red Flags 表格自检：是否正在跳过某个 HARD-GATE？\n" +
+	"4. 如果上一轮跳过了某个阶段（如没做 TDD 就写了实现），暂停并修复缺口\n\n" +
+	"违反此规则的典型反模式（出现即回退）：\n" +
+	"- \"这个项目太小，不需要完整流程\"\n" +
+	"- \"计划里代码都写好了，直接编辑更快\"\n" +
+	"- \"先写代码再补测试也没关系\"\n" +
+	"- \"我刚才看过那个技能了，不用再看\"\n\n" +
+	"## Superpowers 模式规则\n" +
+	"处理任何非琐碎任务（多文件修改、新功能、重构、bug 修复）时：\n" +
+	"1. 判断任务处于 superpowers 的哪个阶段\n" +
+	"2. 加载对应技能到上下文，遵循其 HARD-GATE 约束\n" +
+	"3. 未获审批（用户或 reviewer）前不得跨阶段\n" +
+	"4. 禁止的反模式：跳过设计直接写代码、先实现后补测试、跳过审查\n";
+
 function goalSystemPrompt(goal: GoalState): string {
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const budgetInfo = goal.tokenBudget != null
@@ -349,7 +371,8 @@ function goalSystemPrompt(goal: GoalState): string {
 		"Use get_goal to check the current state.\n" +
 		"Use update_goal({ criterionId, evidence }) to submit evidence per criterion.\n" +
 		'When ALL criteria are satisfied, call update_goal({ status: "complete", evidence: "..." }).\n' +
-		"An independent judge will evaluate completion after each turn.";
+		"An independent judge will evaluate completion after each turn." +
+		GOAL_GOVERNANCE;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -676,9 +699,14 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		turnStartedAt = null; turnGoalId = null;
 		goal.timeUsedMs += elapsed;
 		goal.tokensUsed += outputTokens;
-		if (outputTokens < CONFIG.noProgressTokenThreshold) goal.noProgressCount += 1;
-		else goal.noProgressCount = 0;
-		if (wasGoalDriven) goal.autoTurnCount += 1;
+		// Only count no-progress on goal-driven turns. A user-driven turn (an
+		// interrupt with guidance) is engagement, not stagnation — it must not
+		// trip the no-progress auto-pause.
+		if (wasGoalDriven) {
+			if (outputTokens < CONFIG.noProgressTokenThreshold) goal.noProgressCount += 1;
+			else goal.noProgressCount = 0;
+			goal.autoTurnCount += 1;
+		}
 		if (goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) {
 			goal.status = "budget_limited"; goal.updatedAt = Date.now();
 			persist("budget_limited"); updateFooter(ctx); syncTools();
@@ -692,17 +720,32 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		persist("update"); updateFooter(ctx);
 	});
 
-	pi.on("input", async () => { if (goal?.status === "active") { clearTimer(); userSuspended = true; } });
+	pi.on("input", async (event) => {
+		// A user typed something. Cancel any pending auto-continuation so the
+		// user's message is processed first — but do NOT permanently suspend the
+		// goal. An interrupt (steer/followUp) injects guidance; the user expects
+		// the goal to RESUME afterward, not pause. After the user-driven turn,
+		// agent_end schedules the next continuation automatically. Use /goal pause
+		// for an explicit stop.
+		//
+		// Skip our own extension-injected messages (e.g. /goal <objective> drafts
+		// the goal via sendUserMessage) — those are not user interrupts.
+		if (goal?.status === "active" && event.source !== "extension") {
+			clearTimer();
+		}
+	});
 
 	pi.on("agent_end", async (event, ctx) => {
-		const done = wasGoalDriven;
+		const goalDriven = wasGoalDriven;
 		wasGoalDriven = false;
 		if (!goal || goal.status !== "active") return;
 		if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
 		if (ctx.hasPendingMessages()) return;
-		if (!done) return;
 
-		if (lastAssistantText.trim()) {
+		// Judge + completion check only on goal-driven turns. A user-driven turn
+		// (an interrupt with guidance/clarification) is not goal-progress
+		// evidence, so we skip the judge and simply resume the goal below.
+		if (goalDriven && lastAssistantText.trim()) {
 			const verdict = await runJudge(goal, lastAssistantText, ctx, pi);
 			if (verdict.parseFailed) {
 				judgeParseFailures += 1;
@@ -727,6 +770,8 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				}
 			}
 		}
+		// Resume the goal after either a goal-driven turn (continue progress)
+		// or a user-driven turn (apply the user's guidance and keep going).
 		scheduleContinuation(ctx);
 	});
 

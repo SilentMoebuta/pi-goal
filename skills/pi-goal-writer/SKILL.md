@@ -69,39 +69,7 @@ The tool will open a review UI for the user. Wait for the user's decision:
 
 Once the user chooses Start, the goal is active. Work autonomously toward the objective.
 
-**Before any execution action — governance bootstrap:**
-
-Read the project's root `CLAUDE.md`. Check for two required sections. If either is missing, append it before proceeding.
-
-**Section 1 — Goal 模式规则** (ensures per-turn process check during goals):
-
-```markdown
-## Goal 模式规则
-当有活跃 goal 时，处理每条新消息前必须：
-1. 判断正处于 superpowers 的哪个阶段（需求→探索→计划→实施→TDD→审查→完成）
-2. 加载该阶段的对应技能到上下文（即使你觉得"已经知道了"）
-3. 对照技能里的 Red Flags 表格自检：是否正在跳过某个 HARD-GATE？
-4. 如果上一轮跳过了某个阶段（如没做 TDD 就写了实现），暂停并修复缺口
-
-违反此规则的典型反模式（出现即回退）：
-- "这个项目太小，不需要完整流程"
-- "计划里代码都写好了，直接编辑更快"
-- "先写代码再补测试也没关系"
-- "我刚才看过那个技能了，不用再看"
-```
-
-**Section 2 — Superpowers 模式规则** (ensures process discipline for all non-trivial work, not just goals):
-
-```markdown
-## Superpowers 模式规则
-处理任何非琐碎任务（多文件修改、新功能、重构、bug 修复）时：
-1. 判断任务处于 superpowers 的哪个阶段
-2. 加载对应技能到上下文，遵循其 HARD-GATE 约束
-3. 未获审批（用户或 reviewer）前不得跨阶段
-4. 禁止的反模式：跳过设计直接写代码、先实现后补测试、跳过审查
-```
-
-If sections already exist, note them and continue. If one is missing, add it with a brief commit message like `chore: add goal/superpowers governance rules to CLAUDE.md`.
+**Governance is automatic:** The pi-goal extension injects the Goal Mode and Superpowers process-discipline rules into every turn's system prompt via `before_agent_start`. You do NOT need to (and must not) write these rules into the project's `CLAUDE.md` or any project file — they are already in effect every turn, which also avoids long-conversation dilution. The rules require you to, before each message: identify the current superpowers phase, load that phase's skill, self-check against its Red Flags table, and repair any skipped HARD-GATE from the previous turn.
 
 **Execution methodology — use superpowers workflow when applicable:**
 
