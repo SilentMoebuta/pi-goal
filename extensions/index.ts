@@ -24,6 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, type GoalConfig } from "./config";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types
@@ -236,15 +237,7 @@ function buildCriteriaBlock(criteria: Criterion[]): string {
 }
 
 // continuationPrompt — uses string concatenation (no template literals with backticks)
-function continuationPrompt(goal: GoalState): string {
-	const budgetLine = goal.tokenBudget != null
-		? "- Token budget: " + formatTokens(goal.tokenBudget) + " (" + formatTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) + " remaining)"
-		: "- No token budget set";
-	const criteriaBlock = buildCriteriaBlock(goal.criteria);
-	const criteriaInstruction = goal.criteria.length > 0
-		? "\n3. Submit evidence per criterion:\n   Call update_goal({ criterionId: \"<id>\", evidence: \"<detail>\" }) for each completed criterion.\n4. When ALL criteria show \u2705, call update_goal({ status: \"complete\", evidence: \"<summary>\" }).\n5. The system will reject complete if any criterion lacks evidence."
-		: "";
-
+function superpowersAdaptationBlock(): string {
 	return (
 		"<GOAL-MODE-ADAPTATION>\n" +
 		"The superpowers skills you are about to load were designed for interactive use where\n" +
@@ -257,7 +250,12 @@ function continuationPrompt(goal: GoalState): string {
 		'| "invoke <skill> skill" | Load the skill by name: run /skill:<name> (e.g. /skill:writing-plans). Pi auto-loads skills by description, so simply announcing the skill name also works. Do NOT hardcode file paths — the superpowers bundle is installed as the "pi-superpowers" package, not a local directory. |\n' +
 		'| "HARD-GATE: no code until approved" | RESPECT THIS. Do not write code. Dispatch approver, get approval, then proceed. |\n\n' +
 		"REMEMBER: The approver IS the user for this goal run. Treat its decisions as binding.\n" +
-		"</GOAL-MODE-ADAPTATION>\n\n" +
+		"</GOAL-MODE-ADAPTATION>\n\n"
+	);
+}
+
+function superpowersDisciplineBlock(): string {
+	return (
 		"<EXTREMELY-IMPORTANT>\n" +
 		"You are executing an autonomous goal. The user is NOT watching. You MUST follow process discipline.\n\n" +
 		"BEFORE taking any action this turn, load the using-superpowers skill, then check its situation\n" +
@@ -297,7 +295,21 @@ function continuationPrompt(goal: GoalState): string {
 		"If claiming completion without verification-before-completion, STOP. Verify first.\n" +
 		"If implementing without TDD (test first, watch it fail, then code), STOP. Follow TDD.\n" +
 		"</HARD-GATE>\n" +
-		"</EXTREMELY-IMPORTANT>\n\n" +
+		"</EXTREMELY-IMPORTANT>\n\n"
+	);
+}
+
+function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
+	const budgetLine = goal.tokenBudget != null
+		? "- Token budget: " + formatTokens(goal.tokenBudget) + " (" + formatTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) + " remaining)"
+		: "- No token budget set";
+	const criteriaBlock = buildCriteriaBlock(goal.criteria);
+	const criteriaInstruction = goal.criteria.length > 0
+		? "\n3. Submit evidence per criterion:\n   Call update_goal({ criterionId: \"<id>\", evidence: \"<detail>\" }) for each completed criterion.\n4. When ALL criteria show \u2705, call update_goal({ status: \"complete\", evidence: \"<summary>\" }).\n5. The system will reject complete if any criterion lacks evidence."
+		: "";
+
+	return (
+		(config.superpowersIntegration ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -358,7 +370,7 @@ const GOAL_GOVERNANCE =
 	"3. 未获审批（用户或 reviewer）前不得跨阶段\n" +
 	"4. 禁止的反模式：跳过设计直接写代码、先实现后补测试、跳过审查\n";
 
-function goalSystemPrompt(goal: GoalState): string {
+function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const budgetInfo = goal.tokenBudget != null
 		? "Token budget: " + formatTokens(goal.tokenBudget) + " (" + formatTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) + " remaining)"
@@ -377,7 +389,7 @@ function goalSystemPrompt(goal: GoalState): string {
 		"Use update_goal({ criterionId, evidence }) to submit evidence per criterion.\n" +
 		'When ALL criteria are satisfied, call update_goal({ status: "complete", evidence: "..." }).\n' +
 		"An independent judge will evaluate completion after each turn." +
-		GOAL_GOVERNANCE;
+		(config.superpowersIntegration ? GOAL_GOVERNANCE : "");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -471,6 +483,11 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	function clearTimer() {
 		if (continuationTimer) { clearTimeout(continuationTimer); continuationTimer = null; }
+	}
+
+	function isTrusted(ctx: ExtensionContext): boolean {
+		const fn = (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted;
+		return typeof fn === "function" ? fn.call(ctx) : true;
 	}
 
 	/** Emit a display:false diagnostic entry so loop stalls are traceable
@@ -650,7 +667,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				return;
 			}
 			pi.sendMessage(
-				{ customType: GOAL_CONTINUATION_TYPE, content: continuationPrompt(goal), display: false, details: { goalId: goal.id } },
+				{ customType: GOAL_CONTINUATION_TYPE, content: continuationPrompt(goal, goalConfig), display: false, details: { goalId: goal.id } },
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
 		});
@@ -686,6 +703,8 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	// ═══════════════════════════════════════════════════════════════════
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Load project-local config (opt out of superpowers integration).
+		goalConfig = loadGoalConfig(ctx.cwd, isTrusted(ctx));
 		reconstruct(ctx);
 		syncTools();
 		if (goal?.status === "active") {
@@ -723,7 +742,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		if (!goal || goal.status !== "active") return;
-		return { systemPrompt: event.systemPrompt + "\n\n" + goalSystemPrompt(goal) };
+		return { systemPrompt: event.systemPrompt + "\n\n" + goalSystemPrompt(goal, goalConfig) };
 	});
 
 	pi.on("context", async (event) => {

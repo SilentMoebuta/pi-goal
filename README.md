@@ -61,8 +61,28 @@ Goal state is stored as session entries (`pi-goal` customType) — survives comp
 
 ## Configuration
 
+### Environment variables
+
+- `GOAL_MAX_AUTO_TURNS` — override the per-resume-cycle auto-continuation cap (default 200).
+
+### Project-local config (`.pi/goal.json`)
+
+pi-goal is designed to pair with [`pi-superpowers`](https://github.com/SilentMoebuta/pi-superpowers): by default, the goal continuation prompt and per-turn system prompt inject superpowers workflow discipline (skill mapping, HARD-GATE approval via reviewer subagent, TDD/verification-before-completion gates).
+
+If you use pi-goal **without** pi-superpowers, or prefer a standalone goal loop without the superpowers workflow, opt out in `.pi/goal.json` (trusted projects only):
+
+```json
+{ "superpowersIntegration": false }
+```
+
+With `superpowersIntegration: false`, the goal loop only injects the goal body (objective, progress, criteria, completion audit, judge) — no `/skill:*` references, no HARD-GATE, no reviewer-subagent template. pi-goal then works standalone.
+
+Default `true` keeps existing superpowers users' workflow unchanged.
+
+### Constants
+
 Constants in `extensions/index.ts`:
-- `maxAutoTurns`: 25
+- `maxAutoTurns`: 200 (was 25; raised for large goals. Override via `GOAL_MAX_AUTO_TURNS` env.)
 - `noProgressTokenThreshold`: 50
 - `maxNoProgressTurns`: 2
 - `minContinueIntervalMs`: 3000
