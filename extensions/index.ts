@@ -34,7 +34,7 @@ const GOAL_EVENT_TYPE = "pi-goal:event";
 const GOAL_CONTINUATION_TYPE = "pi-goal:continuation";
 const GOAL_JUDGE_TYPE = "pi-goal:judge";
 
-type GoalStatus = "active" | "paused" | "budget_limited" | "complete" | "unmet";
+type GoalStatus = "active" | "paused" | "budget_limited" | "usage_limited" | "blocked" | "complete" | "unmet";
 
 interface Criterion {
 	id: string;
@@ -86,19 +86,21 @@ const CONFIG = {
 // Utility Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-function formatTokens(value: number): string {
+export function formatTokens(value: number): string {
 	if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
 	if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
 	return String(value);
 }
 
-function formatDuration(ms: number): string {
+export function formatDuration(ms: number): string {
 	const seconds = Math.floor(ms / 1000);
 	if (seconds < 60) return `${seconds}s`;
 	const minutes = Math.floor(seconds / 60);
 	if (minutes < 60) return `${minutes}m`;
 	const hours = Math.floor(minutes / 60);
-	return `${hours}h ${minutes % 60}m`;
+	if (hours < 24) return `${hours}h ${minutes % 60}m`;
+	const days = Math.floor(hours / 24);
+	return `${days}d ${hours % 24}h ${minutes % 60}m`;
 }
 
 function escapeXml(s: string): string {
@@ -458,6 +460,9 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	let turnStartedAt: number | null = null;
 	let turnGoalId: string | null = null;
 	let lastAssistantText = "";
+	// Last judge verdict, surfaced in the goal card / /goal status so the user
+	// can see why the goal is still running (CONTINUE) or was deemed done.
+	let lastJudgeVerdict: JudgeVerdict | null = null;
 	let wasGoalDriven = false;
 	let continuationTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -474,7 +479,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	function syncTools() {
 		const active = new Set(pi.getActiveTools());
 		let changed = false;
-		const canPropose = !goal || ["active", "paused", "budget_limited", "complete", "unmet"].includes(goal.status);
+		const canPropose = !goal || ["active", "paused", "budget_limited", "usage_limited", "blocked", "complete", "unmet"].includes(goal.status);
 		const canGet = !!goal;
 		const canUpdate = goal?.status === "active";
 		const desired: Record<string, boolean> = { propose_goal_draft: canPropose, get_goal: canGet, update_goal: canUpdate };
@@ -506,6 +511,12 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			case "budget_limited":
 				ctx.ui.setStatus("pi-goal", theme.fg("warning", "\uD83D\uDCB0 budget reached"));
 				break;
+			case "usage_limited":
+				ctx.ui.setStatus("pi-goal", theme.fg("warning", "\u26A0 usage limited"));
+				break;
+			case "blocked":
+				ctx.ui.setStatus("pi-goal", theme.fg("error", "\uD83D\uDEA9 goal blocked"));
+				break;
 		}
 	}
 
@@ -527,6 +538,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		continuationQueued = false;
 		userSuspended = false;
 		judgeParseFailures = 0;
+		lastJudgeVerdict = null;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== GOAL_STORAGE_TYPE) continue;
 			const data = (entry as { data?: Partial<GoalSnapshot> }).data;
@@ -540,7 +552,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	): GoalState {
 		const now = Date.now();
 		if (goal?.status === "active") {
-			goal.status = "unmet";
+			goal.status = "blocked";
 			goal.blocker = "Replaced by new goal";
 			goal.updatedAt = now;
 		}
@@ -747,6 +759,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		// evidence, so we skip the judge and simply resume the goal below.
 		if (goalDriven && lastAssistantText.trim()) {
 			const verdict = await runJudge(goal, lastAssistantText, ctx, pi);
+			lastJudgeVerdict = verdict;
 			if (verdict.parseFailed) {
 				judgeParseFailures += 1;
 				if (judgeParseFailures >= 3) {
@@ -780,13 +793,16 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	// ═══════════════════════════════════════════════════════════════════
 
 	pi.registerMessageRenderer(GOAL_EVENT_TYPE, (message, options, theme) => {
-		const details = message.details as { kind?: string; goal?: GoalState | null } | undefined;
+		const details = message.details as { kind?: string; goal?: GoalState | null; judgeVerdict?: JudgeVerdict | null } | undefined;
 		const kind = details?.kind ?? "event";
 		const state = details?.goal ?? null;
+		const judge = details?.judgeVerdict ?? null;
 		const labels: Record<string, (t: typeof theme) => string> = {
 			active: (t) => t.fg("accent", "active"), continuing: (t) => t.fg("muted", "continuing"),
 			paused: (t) => t.fg("warning", "paused"), resumed: (t) => t.fg("accent", "resumed"),
 			cleared: (t) => t.fg("dim", "cleared"), budget_limited: (t) => t.fg("warning", "budget reached"),
+			usage_limited: (t) => t.fg("warning", "usage limited"), blocked: (t) => t.fg("error", "blocked"),
+			status: (t) => t.fg("accent", "status"),
 			complete: (t) => t.fg("success", "achieved"), unmet: (t) => t.fg("error", "unmet"),
 		};
 		return {
@@ -807,6 +823,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 						? formatTokens(state.tokensUsed) + "/" + formatTokens(state.tokenBudget)
 						: formatDuration(state.timeUsedMs);
 					lines.push(theme.fg("dim", "  Usage: ") + theme.fg("text", usage));
+					if (judge && !judge.parseFailed) {
+						const jl = judge.done ? theme.fg("success", "DONE") : theme.fg("muted", "CONTINUE");
+						lines.push(theme.fg("dim", "  Judge: ") + jl + theme.fg("dim", " — ") + theme.fg("text", judge.reason));
+					}
 				}
 				return lines;
 			},
@@ -896,7 +916,14 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "Goal created (non-interactive)." }], details: { goal: { ...goal! } } };
 			}
 			if (goal?.status === "active") {
-				return { content: [{ type: "text", text: "A goal is already active. Clear it first." }], isError: true, details: {} };
+				// Allow replacing after explicit confirm (the /goal command already
+				// confirms; this covers propose_goal_draft called directly).
+				if (ctx.hasUI) {
+					const ok = await ctx.ui.confirm("Replace active goal?", "A goal is already active. Starting a new one will mark it blocked (superseded).");
+					if (!ok) return { content: [{ type: "text", text: "Kept current goal." }], details: {} };
+				} else {
+					return { content: [{ type: "text", text: "A goal is already active. Clear it first." }], isError: true, details: {} };
+				}
 			}
 			const proposal: GoalProposal = { objective: params.objective, criteria: params.criteria, constraints: params.constraints ?? [] };
 			const choice = await showGoalReview(proposal, ctx);
@@ -948,16 +975,12 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /goal <objective> [--tokens 50k]\n  /goal status | pause | resume | clear | help\n\nNo goal currently set.", "info");
 					return;
 				}
-				const lines = ["Goal: " + goal.objective, "Status: " + goal.status,
-					"Tokens: " + formatTokens(goal.tokensUsed) + (goal.tokenBudget ? "/" + formatTokens(goal.tokenBudget) : ""),
-					"Time: " + formatDuration(goal.timeUsedMs), "Turns: " + goal.autoTurnCount];
-				if (goal.criteria.length > 0) {
-					lines.push("Criteria:");
-					for (const c of goal.criteria) lines.push("  " + (c.evidence.length > 0 ? "\u2705" : "\u23F3") + " " + c.description);
-				}
-				if (goal.blocker) lines.push("Blocker: " + goal.blocker);
-				if (goal.pausedReason) lines.push("Paused: " + goal.pausedReason);
-				ctx.ui.notify(lines.join("\n"), "info");
+				// Inject a persistent, collapsible goal card into the conversation
+				// (ctrl+o to expand) instead of a transient notify toast.
+				pi.sendMessage(
+					{ customType: GOAL_EVENT_TYPE, content: "Goal status: " + goal.objective, display: true, details: { kind: "status", goal: { ...goal }, judgeVerdict: lastJudgeVerdict } },
+					{ triggerTurn: false },
+				);
 				return;
 			}
 			if (trimmed === "help") {
@@ -970,6 +993,14 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 			const { objective, tokenBudget } = parseTokenBudget(trimmed);
 			if (!objective) { ctx.ui.notify("Usage: /goal <objective> [--tokens 50k]", "warning"); return; }
+			// If a goal is already active, confirm replacement before drafting.
+			if (goal && goal.status === "active" && ctx.hasUI) {
+				const ok = await ctx.ui.confirm(
+					"Replace goal?",
+					"New objective: " + objective.slice(0, 120) + "\n\nThe current goal will be marked blocked (superseded).",
+				);
+				if (!ok) { ctx.ui.notify("Kept current goal.", "info"); return; }
+			}
 			const proposeMsg = "Draft a formal goal for the following task using the pi-goal-writer skill. Call propose_goal_draft with a concise objective and 3-7 concrete, independently verifiable acceptance criteria.\n\n<untrusted_task>\n" + objective + "\n</untrusted_task>\n\nToken budget: " + (tokenBudget ? formatTokens(tokenBudget) : "none");
 			pi.sendUserMessage(proposeMsg);
 		},
