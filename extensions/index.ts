@@ -590,7 +590,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	}
 
 	function resumeGoal(ctx: ExtensionContext): boolean {
-		if (!goal || goal.status !== "paused") return false;
+		if (!goal || (goal.status !== "paused" && goal.status !== "usage_limited")) return false;
 		userSuspended = false;
 		continuationQueued = false;
 		updateState({ status: "active", noProgressCount: 0, pausedReason: null }, ctx);
@@ -627,6 +627,12 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			if (!goal || goal.status !== "active") return;
 			if (userSuspended) return;
 			wasGoalDriven = true;
+			// Re-check right before sending: a pause may have landed between
+			// the guard above and this sendMessage.
+			if (!goal || goal.status !== "active" || userSuspended) {
+				wasGoalDriven = false;
+				return;
+			}
 			pi.sendMessage(
 				{ customType: GOAL_CONTINUATION_TYPE, content: continuationPrompt(goal), display: false, details: { goalId: goal.id } },
 				{ triggerTurn: true, deliverAs: "followUp" },
@@ -677,6 +683,26 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	pi.on("session_tree", async (_event, ctx) => { reconstruct(ctx); syncTools(); updateFooter(ctx); });
 	pi.on("session_shutdown", async () => { clearTimer(); turnStartedAt = null; turnGoalId = null; });
 
+	// Provider rate-limit / server errors → usage_limited (distinct from a
+	// user-set token budget). Pause so the user can /goal resume once the
+	// provider recovers; do not auto-resume (mirrors budget_limited).
+	pi.on("after_provider_response", async (event, ctx) => {
+		if (!goal || goal.status !== "active") return;
+		if (event.status !== 429 && event.status < 500) return;
+		const retryAfter = event.headers?.["retry-after"] ?? event.headers?.["Retry-After"];
+		const reason = event.status === 429
+			? "provider rate limited (429)"
+			: "provider error (" + event.status + ")";
+		updateState({ status: "usage_limited", pausedReason: reason + (retryAfter ? "; retry-after " + retryAfter : ""), noProgressCount: 0 }, ctx);
+		clearTimer();
+		userSuspended = true;
+		pi.sendMessage(
+			{ customType: GOAL_EVENT_TYPE, content: "Goal usage-limited: " + reason + "\n\nObjective: " + goal.objective + "\nUse /goal resume to continue once the provider recovers.", display: true, details: { kind: "usage_limited", goal: { ...goal } } },
+			{ triggerTurn: false },
+		);
+		if (ctx.hasUI) ctx.ui.notify("\u26A0\uFE0F Goal paused (usage limited): " + reason, "warning");
+	});
+
 	pi.on("before_agent_start", async (event) => {
 		if (!goal || goal.status !== "active") return;
 		return { systemPrompt: event.systemPrompt + "\n\n" + goalSystemPrompt(goal) };
@@ -721,6 +747,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		}
 		if (goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) {
 			goal.status = "budget_limited"; goal.updatedAt = Date.now();
+			goal.noProgressCount = 0;
 			persist("budget_limited"); updateFooter(ctx); syncTools();
 			pi.sendMessage(
 				{ customType: GOAL_EVENT_TYPE, content: budgetLimitPrompt(goal), display: true, details: { kind: "budget_limited", goal: { ...goal } } },
@@ -989,7 +1016,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			}
 			if (trimmed === "clear") { if (!goal) { ctx.ui.notify("No goal to clear.", "info"); return; } clearGoal(ctx); ctx.ui.notify("Goal cleared.", "info"); return; }
 			if (trimmed === "pause") { if (!goal || goal.status !== "active") { ctx.ui.notify("No active goal.", "info"); return; } pauseGoal("user pause", ctx); ctx.ui.notify("Goal paused.", "info"); return; }
-			if (trimmed === "resume") { if (!goal || goal.status !== "paused") { ctx.ui.notify("No paused goal.", "info"); return; } resumeGoal(ctx); ctx.ui.notify("Goal resumed.", "info"); return; }
+			if (trimmed === "resume") { if (!goal || (goal.status !== "paused" && goal.status !== "usage_limited")) { ctx.ui.notify("No paused goal.", "info"); return; } resumeGoal(ctx); ctx.ui.notify("Goal resumed.", "info"); return; }
 
 			const { objective, tokenBudget } = parseTokenBudget(trimmed);
 			if (!objective) { ctx.ui.notify("Usage: /goal <objective> [--tokens 50k]", "warning"); return; }
