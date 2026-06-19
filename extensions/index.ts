@@ -943,8 +943,8 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			criterionId: Type.Optional(Type.String({ description: "ID of criterion for per-criterion evidence." })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			if (!goal || goal.status !== "active") {
-				return { content: [{ type: "text", text: "No active goal to update." }], isError: true, details: {} };
+			if (!goal) {
+				return { content: [{ type: "text", text: "No goal to update." }], isError: true, details: {} };
 			}
 			if (params.criterionId && params.evidence) {
 				const criterion = goal.criteria.find((c) => c.id === params.criterionId);
