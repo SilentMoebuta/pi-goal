@@ -469,6 +469,7 @@ async function showGoalReview(
 
 export default function piGoalExtension(pi: ExtensionAPI) {
 	let goal: GoalState | null = null;
+	let goalConfig: GoalConfig = DEFAULT_GOAL_CONFIG;
 	let judgeParseFailures = 0;
 	let userSuspended = false;
 	let continuationQueued = false;
