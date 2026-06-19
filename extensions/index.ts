@@ -273,10 +273,9 @@ function superpowersDisciplineBlock(): string {
 		"If a superpowers skill requires an approval gate, do NOT stop or skip it.\n" +
 		"Instead, dispatch a reviewer subagent as the autonomous approver.\n\n" +
 		"Use this dispatch template for the approver:\n\n" +
-		"    subagent({\n" +
-		'      subagent_type: "reviewer",\n' +
-		'      description: "Approve [design/plan/code]",\n' +
-		'      prompt: "You are the autonomous approver for an unattended goal run.\\n' +
+		"    spawn_role({\n" +
+		'      role: "reviewer",\n' +
+		'      task: "You are the autonomous approver for an unattended goal run.\\n' +
 		"      The user is not present. You make the call.\\n\\n" +
 		"      GOAL: <copy objective from above>\\n" +
 		"      REVIEWING: <the design, plan, or code being evaluated>\\n\\n" +
@@ -287,6 +286,8 @@ function superpowersDisciplineBlock(): string {
 		"      APPROVE if sound. REJECT if broken, skipped steps, or placeholders.\\n" +
 		'      Rejection MUST include specific, actionable feedback."\n' +
 		"    })\n\n" +
+		"    // ponytail: foreground (default mode) is correct for an approval gate — the\n" +
+		"    // approver blocks until the reviewer reports. background mode is Phase 5.\n\n" +
 		"APPROVE if sound. REJECT if broken, skipped steps, or doesn't meet the goal.\n" +
 		"IF THE APPROVER REJECTS 3 CONSECUTIVE TIMES: pause goal with update_goal({ status: \"unmet\" }).\n" +
 		"</HARD-GATE>\n\n" +
