@@ -24,7 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, type GoalConfig } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, isSubagentSession, type GoalConfig } from "./config";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types
@@ -473,6 +473,9 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	let judgeParseFailures = 0;
 	let userSuspended = false;
 	let continuationQueued = false;
+	// Set by session_shutdown so the queued sendContinuation microtask can
+	// short-circuit before calling pi.sendMessage on a torn-down session.
+	let shuttingDown = false;
 	let turnStartedAt: number | null = null;
 	let turnGoalId: string | null = null;
 	let lastAssistantText = "";
@@ -658,6 +661,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		if (userSuspended) { diag(ctx, "sendContinuation: skip (userSuspended)"); return; }
 		clearTimer();
 		queueMicrotask(() => {
+			// session_shutdown sets this and clears the timer, but a microtask
+			// already queued before shutdown still runs — without this guard it
+			// would call pi.sendMessage on a torn-down session.
+			if (shuttingDown) { wasGoalDriven = false; return; }
 			if (!goal || goal.status !== "active") return;
 			if (userSuspended) return;
 			wasGoalDriven = true;
@@ -704,6 +711,13 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	// ═══════════════════════════════════════════════════════════════════
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Subagent sessions (in-process, spawned by @gotgenes/pi-subagents) reuse
+		// this extension instance with a fresh SessionManager. Their empty branch
+		// would make reconstruct() null out the parent's live `goal` closure
+		// (held only here, not re-read from disk until the next reconstruct).
+		// Short-circuit: leave the parent's closure untouched. The subagent runs
+		// its own goal-less context.
+		if (isSubagentSession(ctx)) return;
 		// Load project-local config (opt out of superpowers integration).
 		goalConfig = loadGoalConfig(ctx.cwd, isTrusted(ctx));
 		reconstruct(ctx);
@@ -718,8 +732,8 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		updateFooter(ctx);
 	});
 
-	pi.on("session_tree", async (_event, ctx) => { reconstruct(ctx); syncTools(); updateFooter(ctx); });
-	pi.on("session_shutdown", async () => { clearTimer(); turnStartedAt = null; turnGoalId = null; });
+	pi.on("session_tree", async (_event, ctx) => { if (isSubagentSession(ctx)) return; reconstruct(ctx); syncTools(); updateFooter(ctx); });
+	pi.on("session_shutdown", async () => { shuttingDown = true; clearTimer(); turnStartedAt = null; turnGoalId = null; });
 
 	// Provider rate-limit / server errors → usage_limited (distinct from a
 	// user-set token budget). Pause so the user can /goal resume once the
@@ -780,7 +794,12 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		// interrupt with guidance) is engagement, not stagnation — it must not
 		// trip the no-progress auto-pause.
 		if (wasGoalDriven) {
-			if (outputTokens < CONFIG.noProgressTokenThreshold) goal.noProgressCount += 1;
+			// A turn that executed tool calls made forward progress even when the
+			// final assistant message had <threshold output tokens (e.g. a turn
+			// that ended on a tool-result message). Reset no-progress in that
+			// case so active tool work is never miscounted as stagnation.
+			const didToolWork = event.toolResults.length > 0;
+			if (outputTokens < CONFIG.noProgressTokenThreshold && !didToolWork) goal.noProgressCount += 1;
 			else goal.noProgressCount = 0;
 			goal.autoTurnCount += 1;
 		}
@@ -826,6 +845,11 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		if (goalDriven && lastAssistantText.trim()) {
 			const verdict = await runJudge(goal, lastAssistantText, ctx, pi);
 			lastJudgeVerdict = verdict;
+			// runJudge's LLM call is not abort-wired, so an ESC during the judge
+			// call is only observable now. Do not apply a verdict (e.g. mark the
+			// goal complete) to an aborted turn — treat it like the pre-judge
+			// abort above and pause without applying the verdict.
+			if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
 			if (verdict.parseFailed) {
 				judgeParseFailures += 1;
 				if (judgeParseFailures >= 3) {

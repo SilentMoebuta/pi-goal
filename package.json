@@ -1,17 +1,1 @@
-{
-  "name": "pi-goal",
-  "version": "1.0.0",
-  "description": "Persistent autonomous goals for Pi Agent — LLM judge evaluation, criteria tracking, no-progress detection, and token budgets. Inspired by Claude Code /goal.",
-  "keywords": ["pi-package"],
-  "license": "MIT",
-  "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"],
-    "prompts": ["./prompts"]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-tui": "*"
-  }
-}
+{"name": "pi-goal", "version": "1.0.0", "description": "Persistent autonomous goals for Pi Agent — LLM judge evaluation, criteria tracking, no-progress detection, and token budgets. Inspired by Claude Code /goal.", "keywords": ["pi-package"], "license": "MIT", "pi": {"extensions": ["./extensions"], "skills": ["./skills"], "prompts": ["./prompts"]}, "scripts": {"test": "tsx --test \"__tests__/**/*.test.ts\""}, "peerDependencies": {"@earendil-works/pi-ai": "*", "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*"}, "devDependencies": {"tsx": "^4.22.4"}}
