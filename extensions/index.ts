@@ -24,7 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, isSubagentSession, type GoalConfig } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, type GoalConfig, type GoalStatus } from "./config";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types
@@ -35,7 +35,6 @@ const GOAL_EVENT_TYPE = "pi-goal:event";
 const GOAL_CONTINUATION_TYPE = "pi-goal:continuation";
 const GOAL_JUDGE_TYPE = "pi-goal:judge";
 
-type GoalStatus = "active" | "paused" | "budget_limited" | "usage_limited" | "blocked" | "complete" | "unmet";
 
 interface Criterion {
 	id: string;
@@ -515,7 +514,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		let changed = false;
 		const canPropose = !goal || ["active", "paused", "budget_limited", "usage_limited", "blocked", "complete", "unmet"].includes(goal.status);
 		const canGet = !!goal;
-		const canUpdate = goal?.status === "active";
+		const canUpdate = canUpdateGoal(goal?.status);
 		const desired: Record<string, boolean> = { propose_goal_draft: canPropose, get_goal: canGet, update_goal: canUpdate };
 		for (const [name, want] of Object.entries(desired)) {
 			if (want && !active.has(name)) { active.add(name); changed = true; }
@@ -526,32 +525,18 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	function updateFooter(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
-		if (!goal || goal.status === "complete" || goal.status === "unmet") {
+		if (!goal) {
 			ctx.ui.setStatus("pi-goal", undefined);
 			return;
 		}
 		const theme = ctx.ui.theme;
-		switch (goal.status) {
-			case "active": {
-				const usage = goal.tokenBudget != null
-					? " (" + formatTokens(goal.tokensUsed) + "/" + formatTokens(goal.tokenBudget) + ")"
-					: " (" + formatDuration(goal.timeUsedMs) + ")";
-				ctx.ui.setStatus("pi-goal", theme.fg("accent", "\uD83C\uDFAF goal" + usage));
-				break;
-			}
-			case "paused":
-				ctx.ui.setStatus("pi-goal", theme.fg("warning", "\u23F8 goal paused"));
-				break;
-			case "budget_limited":
-				ctx.ui.setStatus("pi-goal", theme.fg("warning", "\uD83D\uDCB0 budget reached"));
-				break;
-			case "usage_limited":
-				ctx.ui.setStatus("pi-goal", theme.fg("warning", "\u26A0 usage limited"));
-				break;
-			case "blocked":
-				ctx.ui.setStatus("pi-goal", theme.fg("error", "\uD83D\uDEA9 goal blocked"));
-				break;
-		}
+		// P1-1/P1-2: surface pause reason + blocker. P1-3: keep complete/unmet
+		// visible (don't clear) so the user sees the outcome without scrolling.
+		const usage = goal.tokenBudget != null
+			? formatTokens(goal.tokensUsed) + "/" + formatTokens(goal.tokenBudget)
+			: formatDuration(goal.timeUsedMs);
+		const text = footerStatusText(goal.status, { usage, pausedReason: goal.pausedReason, blocker: goal.blocker }, theme);
+		ctx.ui.setStatus("pi-goal", text || undefined);
 	}
 
 	function updateState(patch: Partial<GoalState>, ctx: ExtensionContext) {
@@ -624,7 +609,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	}
 
 	function resumeGoal(ctx: ExtensionContext): boolean {
-		if (!goal || (goal.status !== "paused" && goal.status !== "usage_limited")) return false;
+		if (!goal || !canResumeGoal(goal.status)) return false;
 		userSuspended = false;
 		continuationQueued = false;
 		// reset autoTurnCount: resume = user-granted new quota cycle (mirrors
@@ -1080,7 +1065,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			}
 			if (trimmed === "clear") { if (!goal) { ctx.ui.notify("No goal to clear.", "info"); return; } clearGoal(ctx); ctx.ui.notify("Goal cleared.", "info"); return; }
 			if (trimmed === "pause") { if (!goal || goal.status !== "active") { ctx.ui.notify("No active goal.", "info"); return; } pauseGoal("user pause", ctx); ctx.ui.notify("Goal paused.", "info"); return; }
-			if (trimmed === "resume") { if (!goal || (goal.status !== "paused" && goal.status !== "usage_limited")) { ctx.ui.notify("No paused goal.", "info"); return; } resumeGoal(ctx); ctx.ui.notify("Goal resumed.", "info"); return; }
+			if (trimmed === "resume") { if (!goal || !canResumeGoal(goal.status)) { ctx.ui.notify("No resumable goal (paused/budget-limited/usage-limited only; blocked/unmet/complete require /goal clear).", "info"); return; } resumeGoal(ctx); ctx.ui.notify("Goal resumed: " + goal.objective.slice(0, 80) + (goal.objective.length > 80 ? "…" : ""), "info"); return; }
 
 			const { objective, tokenBudget } = parseTokenBudget(trimmed);
 			if (!objective) { ctx.ui.notify("Usage: /goal <objective> [--tokens 50k]", "warning"); return; }
