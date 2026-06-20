@@ -15,9 +15,20 @@ export interface GoalConfig {
 	 *  burning the main model every turn. Falls back to ctx.model when unset or
 	 *  unresolvable. Default undefined = backward-compatible (uses ctx.model). */
 	judgeModel?: string;
+
+	/** GG-1: a shell command run via child_process as a DETERMINISTIC
+	 *  verification gate before the LLM judge (trusted projects only, via
+	 *  .pi/goal.json, e.g. {"verifyCommand":"npm test"}). When set,
+	 *  runJudge runs it and short-circuits done:false on a non-zero exit,
+	 *  with the truncated stderr/stdout as the reason. When unset (default),
+	 *  runJudge is UNCHANGED — LLM-judge-only. The strongest SOTA completion
+	 *  signal per the C1 gap analysis; opt-in + trusted-gate keeps it safe.
+	 *  Security: loadGoalConfig only populates this for trusted projects, so
+	 *  runJudge can trust the field's presence without re-checking trust. */
+	verifyCommand?: string;
 }
 
-export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined };
+export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined };
 
 /** GG-14: parse a "provider/model-id" spec into {provider, modelId} for
  *  modelRegistry.find(). Returns null for anything that cannot resolve to a
@@ -70,6 +81,7 @@ export function loadGoalConfig(cwd: string, trusted: boolean): GoalConfig {
 		return {
 			superpowersIntegration: raw.superpowersIntegration === false ? false : true,
 			judgeModel: typeof raw.judgeModel === "string" ? raw.judgeModel : undefined,
+			verifyCommand: typeof raw.verifyCommand === "string" ? raw.verifyCommand : undefined,
 		};
 	} catch {
 		return { ...DEFAULT_GOAL_CONFIG };

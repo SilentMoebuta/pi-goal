@@ -25,6 +25,7 @@ import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, type GoalConfig, type GoalStatus } from "./config";
+import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types
@@ -155,6 +156,31 @@ async function runJudge(
 	pi: ExtensionAPI,
 	config: GoalConfig = DEFAULT_GOAL_CONFIG,
 ): Promise<JudgeVerdict> {
+	// GG-1: deterministic command-based verification (opt-in via .pi/goal.json
+	// verifyCommand, trusted projects only — loadGoalConfig only populates the
+	// field when trusted, so its presence here is proof of trust). Run BEFORE
+	// the LLM judge: a non-zero exit short-circuits done:false with the
+	// truncated output as the reason. When ok, fall through to the LLM judge
+	// (with a note that the verify command passed). When verifyCommand is
+	// unset, behavior is UNCHANGED — LLM-judge-only (backward compatible).
+	if (config.verifyCommand) {
+		const verify = runVerifyCommand(config.verifyCommand);
+		if (!verify.ok) {
+			const detail = (verify.stderr || verify.stdout).trim();
+			const exitPart = verify.exitCode === null
+				? "no exit code (killed or failed to spawn)"
+				: "exit " + verify.exitCode;
+			const reason = "verify command failed (" + exitPart + "): " + (detail || "(no output)");
+			const verdict: JudgeVerdict = { done: false, reason, parseFailed: false };
+			pi.sendMessage(
+				{ customType: GOAL_JUDGE_TYPE, content: "Judge: VERIFY-FAILED — " + reason, display: false, details: { verdict, durationMs: 0, modelId: null, verify } },
+				{ triggerTurn: false },
+			);
+			return verdict;
+		}
+		// verify.ok: fall through to the LLM judge, noting external verification passed.
+	}
+
 	// GG-14: resolve a configurable judge model ("provider/model-id" from
 	// .pi/goal.json, trusted projects). Falls back to ctx.model when unset or
 	// unresolvable so behavior is backward-compatible.
@@ -172,7 +198,10 @@ async function runJudge(
 		? "\nCriteria:\n" + goal.criteria.map((c) => `  [${c.evidence.length > 0 ? "\u2713" : " "}] ${c.description}`).join("\n")
 		: "";
 
-	const judgePrompt = "Goal: " + goal.objective + criteriaBlock + "\n\nAgent's most recent response:\n" + responseText.slice(0, 8_000) + "\n\nIs the goal fully achieved? Check each criterion against concrete evidence in the response.";
+	const verifyNote = config.verifyCommand
+		? "\n\nNote: a deterministic verify command was configured and PASSED (exit 0). Treat this as strong (but not sole) completion evidence — still check every criterion."
+		: "";
+	const judgePrompt = "Goal: " + goal.objective + criteriaBlock + "\n\nAgent's most recent response:\n" + responseText.slice(0, 8_000) + "\n\nIs the goal fully achieved? Check each criterion against concrete evidence in the response." + verifyNote;
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok) {
