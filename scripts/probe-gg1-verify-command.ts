@@ -15,17 +15,19 @@ function assert(cond: boolean, msg: string): void {
 }
 
 console.log("[probe-gg1] exercising runVerifyCommand with real shell commands...");
-const ok = runVerifyCommand('node -e "process.exit(0)"');
+(async () => {
+const ok = await runVerifyCommand('node -e "process.exit(0)"');
 assert(ok.ok === true && ok.exitCode === 0, "exit 0 -> ok=true, exitCode=0");
 
-const fail = runVerifyCommand('node -e "process.exit(1)"');
+const fail = await runVerifyCommand('node -e "process.exit(1)"');
 assert(fail.ok === false && fail.exitCode === 1, "exit 1 -> ok=false, exitCode=1");
 
-const withStdout = runVerifyCommand("echo probe-gg1-output");
+const withStdout = await runVerifyCommand("echo probe-gg1-output");
 assert(withStdout.ok === true, "echo -> ok=true");
 assert(withStdout.stdout.includes("probe-gg1-output"), "stdout captured");
 
-const blank = runVerifyCommand("");
+const blank = await runVerifyCommand("");
 assert(blank.ok === false && blank.exitCode === null, "blank command -> safe {ok:false, exitCode:null}");
 
 console.log("[probe-gg1] PASS: runVerifyCommand runtime path works (exit codes + stdout + blank-cmd safety).");
+})().catch((e) => { console.error("[probe-gg1] FAIL:", e); process.exit(1); });

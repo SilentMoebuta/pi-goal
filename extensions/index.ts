@@ -84,6 +84,9 @@ const CONFIG = {
 	noProgressTokenThreshold: 50,
 	maxNoProgressTurns: 2,
 	minContinueIntervalMs: 3_000,
+	// H1: cap a stuck-escalation model call so a hanging provider can't strand
+	// the goal in 'active' forever (escalateStuck falls back to pause on timeout).
+	escalateTimeoutMs: 30_000,
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -149,6 +152,9 @@ const JUDGE_SYSTEM_PROMPT = "You are a strict completion judge for an autonomous
 	"or\n" +
 	'{"done": false, "reason": "what\'s missing"}';
 
+// M2: module-level — runJudge sets it; sendContinuation (closure) reads+clears it.
+let verifyFailNote: string | null = null;
+
 async function runJudge(
 	goal: GoalState,
 	responseText: string,
@@ -164,7 +170,7 @@ async function runJudge(
 	// (with a note that the verify command passed). When verifyCommand is
 	// unset, behavior is UNCHANGED — LLM-judge-only (backward compatible).
 	if (config.verifyCommand) {
-		const verify = runVerifyCommand(config.verifyCommand);
+		const verify = await runVerifyCommand(config.verifyCommand, config.verifyTimeoutMs ?? 120_000);
 		if (!verify.ok) {
 			const detail = (verify.stderr || verify.stdout).trim();
 			const exitPart = verify.exitCode === null
@@ -172,6 +178,10 @@ async function runJudge(
 				: "exit " + verify.exitCode;
 			const reason = "verify command failed (" + exitPart + "): " + (detail || "(no output)");
 			const verdict: JudgeVerdict = { done: false, reason, parseFailed: false };
+			// M2/L2: feed the failure back to the agent (next continuation prepends
+			// verifyFailNote) + notify the user proactively.
+			verifyFailNote = reason;
+			ctx.ui?.notify?.("⚠ Verify command failed (" + exitPart + "). See /goal status.", "warning");
 			pi.sendMessage(
 				{ customType: GOAL_JUDGE_TYPE, content: "Judge: VERIFY-FAILED — " + reason, display: false, details: { verdict, durationMs: 0, modelId: null, verify } },
 				{ triggerTurn: false },
@@ -189,6 +199,7 @@ async function runJudge(
 		const spec = parseModelSpec(config.judgeModel);
 		const found = spec ? ctx.modelRegistry?.find?.(spec.provider, spec.modelId) : undefined;
 		if (found) model = found;
+		else console.warn("[pi-goal] judgeModel \"" + config.judgeModel + "\" not found in registry; falling back to ctx.model.");
 	}
 	if (!model) {
 		return { done: false, reason: "no model available for judge", parseFailed: false };
@@ -533,7 +544,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	function isTrusted(ctx: ExtensionContext): boolean {
 		const fn = (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted;
-		return typeof fn === "function" ? fn.call(ctx) : true;
+		// H2: fail CLOSED when isProjectTrusted is absent — verifyCommand (GG-1)
+		// is arbitrary shell exec, so the trust gate must not degrade to 'trusted'
+		// on older/custom pi builds lacking the isProjectTrusted surface.
+		return typeof fn === "function" ? fn.call(ctx) : false;
 	}
 
 	/** Emit a display:false diagnostic entry so loop stalls are traceable
@@ -688,8 +702,20 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	function sendContinuation(ctx: ExtensionContext) {
 		if (!goal || goal.status !== "active") { diag(ctx, "sendContinuation: skip (goal=" + (goal ? goal.status : "null") + ")"); return; }
 		if (userSuspended) { diag(ctx, "sendContinuation: skip (userSuspended)"); return; }
+		// M6: guard against two rapid sendContinuation calls (e.g. resumeGoal + an
+		// async escalateStuck completion) queueing two continuation turns back-to-back.
+		if (continuationQueued) { diag(ctx, "sendContinuation: skip (already queued)"); return; }
 		clearTimer();
+		continuationQueued = true;
 		queueMicrotask(() => {
+			// M6: consumed. M3: capture+clear the one-shot notes at the TOP so a
+			// guard early-exit (shutdown/pause/suspend) doesn't leak them into a
+			// later continuation.
+			continuationQueued = false;
+			const suggestion = stuckSuggestion;
+			const verifyFail = verifyFailNote;
+			stuckSuggestion = null;
+			verifyFailNote = null;
 			// session_shutdown sets this and clears the timer, but a microtask
 			// already queued before shutdown still runs — without this guard it
 			// would call pi.sendMessage on a torn-down session.
@@ -705,12 +731,16 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			}
 			pi.sendMessage(
 				{ customType: GOAL_CONTINUATION_TYPE, content: (() => {
+					let body = continuationPrompt(goal, goalConfig);
+					// M2: feed the verify-command failure back so the agent can see WHY
+					// its tests failed (prevents a re-claim-completion loop).
+					if (verifyFail) {
+						body = "⚠ Verify command failed last turn — fix this before claiming completion:\n" + verifyFail + "\n\n---\n\n" + body;
+					}
 					// GG-3: if escalateStuck produced a fresh suggestion, prepend it to the
 					// continuation so the stalled agent gets a stronger model's nudge.
-					let body = continuationPrompt(goal, goalConfig);
-					if (stuckSuggestion) {
-						body = "💡 Stuck-escalation suggestion (from a stronger model — try this fresh approach next):\n" + stuckSuggestion + "\n\n---\n\n" + body;
-						stuckSuggestion = null; // one-shot per escalation
+					if (suggestion) {
+						body = "💡 Stuck-escalation suggestion (from a stronger model — try this fresh approach next):\n" + suggestion + "\n\n---\n\n" + body;
 					}
 					return body;
 				})(), display: false, details: { goalId: goal.id } },
@@ -724,29 +754,34 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	 *  into the next continuation (via stuckSuggestion), resetting no-progress so
 	 *  the goal gets another chance. Falls back to pause on any failure. */
 	async function escalateStuck(ctx: ExtensionContext): Promise<void> {
-		if (!goal || !goalConfig.stuckEscalateModel) {
-			pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
-			ctx.ui.notify("⏸ Goal paused (no progress). Use /goal resume to continue.", "warning");
-			return;
-		}
-		const spec = parseModelSpec(goalConfig.stuckEscalateModel);
-		const model = spec ? ctx.modelRegistry?.find?.(spec.provider, spec.modelId) : undefined;
-		if (!model) {
-			pauseGoal("stuck-escalation model not found: " + goalConfig.stuckEscalateModel, ctx);
-			ctx.ui.notify("⏸ Goal paused (no progress; escalation model unavailable).", "warning");
-			return;
-		}
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok) {
-			pauseGoal("stuck-escalation auth failed: " + auth.error, ctx);
-			return;
-		}
+		// H1+M4: the whole body is try-wrapped so any throw (find/getApiKey/
+		// complete) falls back to pauseGoal instead of an unhandled rejection +
+		// silent stall (scheduleContinuation returned without scheduling). The
+		// complete() call passes timeoutMs so a hanging escalate model can't
+		// strand the goal in 'active' forever.
 		try {
+			if (!goal || !goalConfig.stuckEscalateModel) {
+				pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
+				ctx.ui.notify("⏸ Goal paused (no progress). Use /goal resume to continue.", "warning");
+				return;
+			}
+			const spec = parseModelSpec(goalConfig.stuckEscalateModel);
+			const model = spec ? ctx.modelRegistry?.find?.(spec.provider, spec.modelId) : undefined;
+			if (!model) {
+				pauseGoal("stuck-escalation model not found: " + goalConfig.stuckEscalateModel, ctx);
+				ctx.ui.notify("⏸ Goal paused (no progress; escalation model unavailable).", "warning");
+				return;
+			}
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok) {
+				pauseGoal("stuck-escalation auth failed: " + auth.error, ctx);
+				return;
+			}
 			const criteriaSummary = goal.criteria.map((c) => "  " + (c.evidence.length > 0 ? "✅" : "⏳") + " [" + c.id + "] " + c.description).join("\n");
 			const result = await complete(model, {
 				systemPrompt: "You are a senior engineer unblocking a stalled autonomous agent. Reply with ONE concrete next step.",
 				messages: [{ role: "user", content: [{ type: "text", text: buildEscalationPrompt({ objective: goal.objective, criteriaSummary }) }], timestamp: Date.now() }],
-			}, { apiKey: auth.apiKey, headers: auth.headers, temperature: 0.4, maxTokens: 512 });
+			}, { apiKey: auth.apiKey, headers: auth.headers, temperature: 0.4, maxTokens: 512, timeoutMs: CONFIG.escalateTimeoutMs });
 			const suggestion = extractTextContent(result).trim();
 			if (!suggestion) {
 				pauseGoal("stuck-escalation returned no suggestion", ctx);

@@ -1,11 +1,11 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 // GG-1: deterministic command-based verification, opt-in via .pi/goal.json
 // `verifyCommand` (trusted projects only — see config.loadGoalConfig).
 //
-// runVerifyCommand is the PURE, unit-testable unit: it runs a shell command
-// synchronously and returns a normalized {ok, exitCode, stdout, stderr}. It is
-// deliberately free of any pi context so it can be exercised in isolation.
+// runVerifyCommand is the unit-testable unit: it runs a shell command and
+// returns a normalized {ok, exitCode, stdout, stderr}. It is deliberately
+// free of any pi context so it can be exercised in isolation.
 //
 // runJudge (extensions/index.ts) calls this BEFORE the LLM judge when a
 // verifyCommand is configured: a non-zero exit short-circuits done:false with
@@ -14,10 +14,12 @@ import { spawnSync } from "node:child_process";
 // analysis) while keeping the LLM judge as the backward-compatible fallback
 // when no command is configured.
 //
-// Security: runJudge receives a GoalConfig (not ctx-trust), but
-// loadGoalConfig only populates `verifyCommand` for trusted projects, so the
-// field's mere presence is proof the project is trusted. runVerifyCommand
-// itself trusts whatever string it is handed — it is the caller's job to gate.
+// M1 (Step-5 audit): ASYNC via child_process.spawn (not spawnSync) so a slow
+// verify command (e.g. `npm test`) does NOT block the Node event loop / freeze
+// the TUI, with a configurable timeout (default 120s — real test suites exceed
+// the old 30s cap) that SIGKILLs an overrun. Security: loadGoalConfig only
+// populates verifyCommand for trusted projects, so runVerifyCommand can trust
+// the field's presence without re-checking trust.
 
 /** Normalized result of running the verify command. */
 export interface VerifyResult {
@@ -38,61 +40,60 @@ export interface VerifyResult {
 /** Cap on captured stdout/stderr length (chars). A runaway verify command
  *  must not flood the judge prompt / session entry with output. */
 const VERIFY_MAX_OUTPUT = 2_000;
-/** Hard kill timeout (ms) so a hanging verify command cannot stall the
- *  agent_end judge path indefinitely. */
-const VERIFY_TIMEOUT_MS = 30_000;
-/** spawnSync maxBuffer (bytes). Beyond this the child is killed and the
- *  partial output is still returned. */
-const VERIFY_MAX_BUFFER = 1024 * 256;
 
 function truncate(s: string): string {
 	return s.length > VERIFY_MAX_OUTPUT ? s.slice(0, VERIFY_MAX_OUTPUT) : s;
 }
 
-/** Run a verify command synchronously via a shell and return a normalized
- *  result. `ok` is true iff the command exits 0.
+/** Run a verify command asynchronously via a shell and return a normalized
+ *  result. `ok` is true iff the command exits 0. Resolves (never rejects) —
+ *  spawn errors, timeouts, and signals all fold into a {ok:false} result.
  *
  *  Contract for blank / non-string input: the command is NEVER handed to the
  *  shell — runVerifyCommand short-circuits to a safe {ok:false, exitCode:null}
  *  result with an explanatory stderr, rather than relying on shell quirks for
  *  an empty command line. This keeps behavior deterministic across shells. */
-export function runVerifyCommand(cmd: string): VerifyResult {
+export async function runVerifyCommand(cmd: string, timeoutMs = 120_000): Promise<VerifyResult> {
 	if (typeof cmd !== "string" || cmd.trim().length === 0) {
 		return { ok: false, exitCode: null, stdout: "", stderr: "verify command is empty" };
 	}
 
-	const result = spawnSync(cmd, {
-		shell: true,
-		timeout: VERIFY_TIMEOUT_MS,
-		maxBuffer: VERIFY_MAX_BUFFER,
-		encoding: "utf8",
+	return new Promise<VerifyResult>((resolve) => {
+		let settled = false;
+		let stdout = "";
+		let stderr = "";
+
+		const finish = (result: VerifyResult): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(result);
+		};
+
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(cmd, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+		} catch (e) {
+			finish({ ok: false, exitCode: null, stdout: "", stderr: "verify command failed to spawn: " + (e instanceof Error ? e.message : String(e)) });
+			return;
+		}
+
+		const timer = setTimeout(() => {
+			try { child.kill("SIGKILL"); } catch { /* already dead */ }
+			finish({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: truncate(stderr) + (stderr ? "\n" : "") + "verify command timed out after " + timeoutMs + "ms" });
+		}, timeoutMs);
+
+		child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
+		child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+		child.on("error", (e) => {
+			finish({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: "verify command failed to spawn: " + e.message });
+		});
+		child.on("close", (code, signal) => {
+			if (signal) {
+				finish({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: truncate(stderr) + (stderr ? "\n" : "") + "verify command killed by signal: " + signal });
+			} else {
+				finish({ ok: code === 0, exitCode: code, stdout: truncate(stdout), stderr: truncate(stderr) });
+			}
+		});
 	});
-
-	if (result.error) {
-		// Could not spawn (e.g. shell binary missing). No meaningful exit code.
-		return {
-			ok: false,
-			exitCode: null,
-			stdout: "",
-			stderr: "verify command failed to spawn: " + result.error.message,
-		};
-	}
-
-	const stdout = truncate(typeof result.stdout === "string" ? result.stdout : "");
-	const stderr = truncate(typeof result.stderr === "string" ? result.stderr : "");
-
-	if (result.status === null) {
-		// Killed by signal (e.g. timeout SIGTERM, or maxBuffer exceeded). The
-		// child did not exit normally, so there is no meaningful exit code;
-		// fold the signal into stderr so the reason is traceable.
-		const sig = result.signal ?? "unknown";
-		return {
-			ok: false,
-			exitCode: null,
-			stdout,
-			stderr: stderr + (stderr ? "\n" : "") + "verify command killed by signal: " + sig,
-		};
-	}
-
-	return { ok: result.status === 0, exitCode: result.status, stdout, stderr };
 }

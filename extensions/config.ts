@@ -33,9 +33,13 @@ export interface GoalConfig {
 	 *  suggestion, injected into the next continuation before pausing. Falls
 	 *  back to pause-only when unset. Default undefined = backward-compatible. */
 	stuckEscalateModel?: string;
+
+	/** GG-1: max ms the verify command may run before being SIGKILLed (default
+	 *  120000 — real test suites exceed the old 30s cap). Trusted projects only. */
+	verifyTimeoutMs?: number;
 }
 
-export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined, stuckEscalateModel: undefined };
+export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined, stuckEscalateModel: undefined, verifyTimeoutMs: undefined };
 
 /** GG-3: build the prompt sent to a stronger model when the goal stalls, asking
  *  for ONE concrete next step to unstick it. Pure + unit-testable; the model
@@ -100,6 +104,7 @@ export function loadGoalConfig(cwd: string, trusted: boolean): GoalConfig {
 			judgeModel: typeof raw.judgeModel === "string" ? raw.judgeModel : undefined,
 			verifyCommand: typeof raw.verifyCommand === "string" ? raw.verifyCommand : undefined,
 			stuckEscalateModel: typeof raw.stuckEscalateModel === "string" ? raw.stuckEscalateModel : undefined,
+			verifyTimeoutMs: typeof raw.verifyTimeoutMs === "number" ? raw.verifyTimeoutMs : undefined,
 		};
 	} catch {
 		return { ...DEFAULT_GOAL_CONFIG };

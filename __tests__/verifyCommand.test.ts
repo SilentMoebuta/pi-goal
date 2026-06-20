@@ -16,66 +16,66 @@ import { loadGoalConfig, DEFAULT_GOAL_CONFIG, type GoalConfig } from "../extensi
 // loadGoalConfig surfaces verifyCommand from .pi/goal.json (trusted only).
 
 describe("runVerifyCommand (GG-1 command execution)", () => {
-	it("exit 0 → ok:true, exitCode:0", () => {
-		const r = runVerifyCommand('node -e "process.exit(0)"');
+	it("exit 0 → ok:true, exitCode:0", async () => {
+		const r = await runVerifyCommand('node -e "process.exit(0)"');
 		assert.equal(r.ok, true);
 		assert.equal(r.exitCode, 0);
 	});
 
-	it("exit 1 → ok:false, exitCode:1", () => {
-		const r = runVerifyCommand('node -e "process.exit(1)"');
+	it("exit 1 → ok:false, exitCode:1", async () => {
+		const r = await runVerifyCommand('node -e "process.exit(1)"');
 		assert.equal(r.ok, false);
 		assert.equal(r.exitCode, 1);
 	});
 
-	it("captures stdout (echo hello → stdout contains 'hello')", () => {
-		const r = runVerifyCommand("echo hello");
+	it("captures stdout (echo hello → stdout contains 'hello')", async () => {
+		const r = await runVerifyCommand("echo hello");
 		assert.equal(r.ok, true);
 		assert.equal(r.exitCode, 0);
 		assert.match(r.stdout, /hello/);
 	});
 
-	it("exit code 2 propagates as ok:false, exitCode:2", () => {
-		const r = runVerifyCommand('node -e "process.exit(2)"');
+	it("exit code 2 propagates as ok:false, exitCode:2", async () => {
+		const r = await runVerifyCommand('node -e "process.exit(2)"');
 		assert.equal(r.ok, false);
 		assert.equal(r.exitCode, 2);
 	});
 
-	it("captures stderr from a failing command", () => {
-		const r = runVerifyCommand('node -e "process.stderr.write(\'boom\'); process.exit(3)"');
+	it("captures stderr from a failing command", async () => {
+		const r = await runVerifyCommand('node -e "process.stderr.write(\'boom\'); process.exit(3)"');
 		assert.equal(r.ok, false);
 		assert.equal(r.exitCode, 3);
 		assert.match(r.stderr, /boom/);
 	});
 
-	it("empty string → defined safe result (ok:false, exitCode:null, explained stderr)", () => {
+	it("empty string → defined safe result (ok:false, exitCode:null, explained stderr)", async () => {
 		// Documented contract: an empty/blank command is NEVER handed to the
 		// shell — runVerifyCommand short-circuits to a safe {ok:false} result
 		// rather than relying on shell quirks for an empty command line.
-		const r = runVerifyCommand("");
+		const r = await runVerifyCommand("");
 		assert.equal(r.ok, false);
 		assert.equal(r.exitCode, null);
 		assert.ok(r.stderr.length > 0, "stderr should explain why the command didn't run");
 	});
 
-	it("whitespace-only string → same safe result as empty", () => {
-		const r = runVerifyCommand("   ");
+	it("whitespace-only string → same safe result as empty", async () => {
+		const r = await runVerifyCommand("   ");
 		assert.equal(r.ok, false);
 		assert.equal(r.exitCode, null);
 	});
 
-	it("returns a full VerifyResult shape (all four fields present)", () => {
-		const r: VerifyResult = runVerifyCommand("echo ok");
+	it("returns a full VerifyResult shape (all four fields present)", async () => {
+		const r: VerifyResult = await runVerifyCommand("echo ok");
 		assert.equal(typeof r.ok, "boolean");
 		assert.ok(r.exitCode === null || typeof r.exitCode === "number");
 		assert.equal(typeof r.stdout, "string");
 		assert.equal(typeof r.stderr, "string");
 	});
 
-	it("truncates very long stdout to a bounded length (≤ ~2000 chars)", () => {
+	it("truncates very long stdout to a bounded length (≤ ~2000 chars)", async () => {
 		// Print 5000 chars; result.stdout must be capped so a runaway verify
 		// command cannot flood the judge prompt / session entry with output.
-		const r = runVerifyCommand('node -e "process.stdout.write(\'x\'.repeat(5000))"');
+		const r = await runVerifyCommand('node -e "process.stdout.write(\'x\'.repeat(5000))"');
 		assert.equal(r.ok, true);
 		assert.ok(r.stdout.length <= 2000, "stdout must be truncated to <= 2000 chars, got " + r.stdout.length);
 		assert.ok(r.stdout.length > 0, "stdout must still contain the (truncated) output");

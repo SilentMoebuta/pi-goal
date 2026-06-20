@@ -79,6 +79,28 @@ With `superpowersIntegration: false`, the goal loop only injects the goal body (
 
 Default `true` keeps existing superpowers users' workflow unchanged.
 
+#### SOTA-refresh opt-in fields (trusted projects only)
+
+These fields are only honored when the project is trusted (pi's `isProjectTrusted`).
+All default to unset = backward-compatible (no behavior change).
+
+| Field | Description |
+|---|---|
+| `judgeModel` | `"provider/model-id"` for the per-turn judge LLM (GG-14). Uses a separate cheap/fast evaluator via `modelRegistry.find` instead of the session model; falls back to the session model if unresolvable. |
+| `verifyCommand` | A shell command run as a **deterministic** verification gate before the LLM judge (GG-1), e.g. `"npm test"`. Non-zero exit short-circuits `done:false` with the truncated output fed back to the next continuation. **Security: arbitrary shell exec — trusted projects only.** |
+| `verifyTimeoutMs` | Max ms the verify command may run before SIGKILL (default `120000`). |
+| `stuckEscalateModel` | `"provider/model-id"` consulted when the goal stalls (GG-3). Asks the stronger model for ONE concrete next step, injected into the next continuation before pausing; falls back to pause on any failure. |
+
+Example:
+```json
+{
+  "judgeModel": "ksyun/glm-5.2",
+  "verifyCommand": "npm test",
+  "verifyTimeoutMs": 180000,
+  "stuckEscalateModel": "anthropic/claude-sonnet-4"
+}
+```
+
 ### Constants
 
 Constants in `extensions/index.ts`:
@@ -90,7 +112,7 @@ Constants in `extensions/index.ts`:
 ## Development
 
 ```
-npx tsx --test __tests__/   # format + parseTokenBudget tests (17 cases)
+npx tsx --test "__tests__/**/*.test.ts"   # 78 tests across 8 files
 npx tsc --noEmit            # typecheck (install @earendil-works/pi-ai pi-coding-agent pi-tui typebox first)
 ```
 
