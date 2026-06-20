@@ -19,12 +19,12 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, type GoalConfig, type GoalStatus } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, type GoalConfig, type GoalStatus } from "./config";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types
@@ -153,8 +153,17 @@ async function runJudge(
 	responseText: string,
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
+	config: GoalConfig = DEFAULT_GOAL_CONFIG,
 ): Promise<JudgeVerdict> {
-	const model = ctx.model;
+	// GG-14: resolve a configurable judge model ("provider/model-id" from
+	// .pi/goal.json, trusted projects). Falls back to ctx.model when unset or
+	// unresolvable so behavior is backward-compatible.
+	let model = ctx.model;
+	if (config.judgeModel) {
+		const spec = parseModelSpec(config.judgeModel);
+		const found = spec ? ctx.modelRegistry?.find?.(spec.provider, spec.modelId) : undefined;
+		if (found) model = found;
+	}
 	if (!model) {
 		return { done: false, reason: "no model available for judge", parseFailed: false };
 	}
@@ -406,7 +415,7 @@ type ReviewResult = "start" | "edit" | "cancel";
 
 async function showGoalReview(
 	proposal: GoalProposal,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 ): Promise<ReviewResult> {
 	const items: SelectItem[] = [
 		{ value: "start", label: "Start — begin working toward this goal" },
@@ -536,7 +545,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		const usage = goal.tokenBudget != null
 			? formatTokens(goal.tokensUsed) + "/" + formatTokens(goal.tokenBudget)
 			: formatDuration(goal.timeUsedMs);
-		const text = footerStatusText(goal.status, { usage, pausedReason: goal.pausedReason, blocker: goal.blocker }, theme);
+		const text = footerStatusText(goal.status, { usage, pausedReason: goal.pausedReason, blocker: goal.blocker }, theme as { fg: (color: string, text: string) => string } | undefined);
 		ctx.ui.setStatus("pi-goal", text || undefined);
 	}
 
@@ -748,7 +757,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("context", async (event) => {
-		if (!goal) return event;
+		if (!goal) return;
 		let lastContinuationIdx = -1;
 		const messages = event.messages as Array<{ customType?: string; details?: { goalId?: string } }>;
 		for (let i = 0; i < messages.length; i++) {
@@ -762,7 +771,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 					return goal?.status === "active" && msg.details?.goalId === goal?.id && idx === lastContinuationIdx;
 				}
 				return true;
-			}),
+			}) as typeof event.messages,
 		};
 	});
 
@@ -830,7 +839,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		// (an interrupt with guidance/clarification) is not goal-progress
 		// evidence, so we skip the judge and simply resume the goal below.
 		if (goalDriven && lastAssistantText.trim()) {
-			const verdict = await runJudge(goal, lastAssistantText, ctx, pi);
+			const verdict = await runJudge(goal, lastAssistantText, ctx, pi, goalConfig);
 			lastJudgeVerdict = verdict;
 			// runJudge's LLM call is not abort-wired, so an ESC during the judge
 			// call is only observable now. Do not apply a verdict (e.g. mark the
@@ -920,7 +929,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		description: "Read the current active goal: objective, status, criteria, token usage, and budget.",
 		parameters: Type.Object({}),
 		async execute() {
-			if (!goal) return { content: [{ type: "text", text: "No goal is currently set." }], details: {} };
+			if (!goal) return { content: [{ type: "text", text: "No goal is currently set." }], details: {} as { goal?: GoalState } };
 			return {
 				content: [{ type: "text", text: JSON.stringify({
 					objective: goal.objective, status: goal.status,

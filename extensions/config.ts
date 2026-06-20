@@ -7,9 +7,31 @@ export interface GoalConfig {
 	 *  per-turn system prompt. Default true: pi-goal is designed to pair with
 	 *  pi-superpowers. Set false in .pi/goal.json for standalone use. */
 	superpowersIntegration: boolean;
+
+	/** GG-14: a "provider/model-id" spec for the per-turn judge LLM call.
+	 *  When set (trusted projects only, via .pi/goal.json), runJudge resolves it
+	 *  via ctx.modelRegistry.find(provider, modelId) and uses that model instead
+	 *  of the session's ctx.model — so a cheap/fast evaluator can judge without
+	 *  burning the main model every turn. Falls back to ctx.model when unset or
+	 *  unresolvable. Default undefined = backward-compatible (uses ctx.model). */
+	judgeModel?: string;
 }
 
-export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true };
+export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined };
+
+/** GG-14: parse a "provider/model-id" spec into {provider, modelId} for
+ *  modelRegistry.find(). Returns null for anything that cannot resolve to a
+ *  (non-empty provider, non-empty modelId) pair, so runJudge can fall back to
+ *  ctx.model safely. */
+export function parseModelSpec(spec: string): { provider: string; modelId: string } | null {
+	if (!spec || typeof spec !== "string") return null;
+	const slash = spec.indexOf("/");
+	if (slash <= 0) return null; // no slash, or empty provider before it
+	const provider = spec.slice(0, slash);
+	const modelId = spec.slice(slash + 1).trim();
+	if (!provider.trim() || !modelId) return null;
+	return { provider, modelId };
+}
 
 /** Detect an in-process subagent session (spawned by @gotgenes/pi-subagents).
  *  Mirrors the isSubagentSession guard in pi-plan-execute-gate/gate.ts: a
@@ -47,6 +69,7 @@ export function loadGoalConfig(cwd: string, trusted: boolean): GoalConfig {
 		const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as Partial<GoalConfig> & Record<string, unknown>;
 		return {
 			superpowersIntegration: raw.superpowersIntegration === false ? false : true,
+			judgeModel: typeof raw.judgeModel === "string" ? raw.judgeModel : undefined,
 		};
 	} catch {
 		return { ...DEFAULT_GOAL_CONFIG };
