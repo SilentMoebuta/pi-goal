@@ -1082,11 +1082,4 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			pi.sendUserMessage(proposeMsg);
 		},
 	});
-
-	// Safety net: sync tools at the end of extension init. During init,
-	// pi.registerTool stores tools but refreshTools is a no-op until bind().
-	// The session_start handler re-enables tools after reconstruct() loads the
-	// goal, but a final sync ensures tools are activated if any other path
-	// (reload, session reuse) bypassed the handler. Harmless when goal is null.
-	syncTools();
 }
