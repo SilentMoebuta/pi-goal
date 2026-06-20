@@ -988,19 +988,21 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!ctx.hasUI) {
-				if (goal?.status === "active") return { content: [{ type: "text", text: "A goal is already active." }], isError: true, details: {} };
+				if (goal) return { content: [{ type: "text", text: "A goal is already set (status: " + goal.status + "). Clear it first." }], isError: true, details: {} };
 				setGoal(params.objective, params.criteria, params.constraints ?? [], {}, ctx);
 				return { content: [{ type: "text", text: "Goal created (non-interactive)." }], details: { goal: { ...goal! } } };
 			}
-			if (goal?.status === "active") {
-				// Allow replacing after explicit confirm (the /goal command already
-				// confirms; this covers propose_goal_draft called directly).
-				if (ctx.hasUI) {
-					const ok = await ctx.ui.confirm("Replace active goal?", "A goal is already active. Starting a new one will mark it blocked (superseded).");
-					if (!ok) return { content: [{ type: "text", text: "Kept current goal." }], details: {} };
-				} else {
-					return { content: [{ type: "text", text: "A goal is already active. Clear it first." }], isError: true, details: {} };
-				}
+			if (goal) {
+				// Any existing goal (active/paused/complete/unmet/blocked) requires
+				// explicit user confirmation before replacing. The user may want to
+				// resume a paused goal, review a completed one, or keep the current
+				// context — silently overwriting loses that.
+				const statusLabel = goal.status === "active" ? "active" : goal.status;
+				const ok = await ctx.ui.confirm(
+					"Replace existing goal?",
+					"A goal is currently " + statusLabel + ". Starting a new one will replace it" + (goal.status === "active" ? " (the current goal will be marked blocked)" : "") + ".\n\nChoose OK to start a new goal, or Cancel to keep the current goal.",
+				);
+				if (!ok) return { content: [{ type: "text", text: "Kept current goal." }], details: {} };
 			}
 			const proposal: GoalProposal = { objective: params.objective, criteria: params.criteria, constraints: params.constraints ?? [] };
 			const choice = await showGoalReview(proposal, ctx);
