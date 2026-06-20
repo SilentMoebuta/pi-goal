@@ -24,7 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, type GoalConfig, type GoalStatus } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, type GoalConfig, type GoalStatus } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -521,6 +521,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	// can see why the goal is still running (CONTINUE) or was deemed done.
 	let lastJudgeVerdict: JudgeVerdict | null = null;
 	let wasGoalDriven = false;
+	// GG-3: a fresh next-step suggestion from a stronger model, injected into the
+	// next continuation when the goal stalled. Set by escalateStuck, consumed +
+	// cleared by sendContinuation.
+	let stuckSuggestion: string | null = null;
 	let continuationTimer: ReturnType<typeof setTimeout> | null = null;
 
 	function clearTimer() {
@@ -700,10 +704,61 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				return;
 			}
 			pi.sendMessage(
-				{ customType: GOAL_CONTINUATION_TYPE, content: continuationPrompt(goal, goalConfig), display: false, details: { goalId: goal.id } },
+				{ customType: GOAL_CONTINUATION_TYPE, content: (() => {
+					// GG-3: if escalateStuck produced a fresh suggestion, prepend it to the
+					// continuation so the stalled agent gets a stronger model's nudge.
+					let body = continuationPrompt(goal, goalConfig);
+					if (stuckSuggestion) {
+						body = "💡 Stuck-escalation suggestion (from a stronger model — try this fresh approach next):\n" + stuckSuggestion + "\n\n---\n\n" + body;
+						stuckSuggestion = null; // one-shot per escalation
+					}
+					return body;
+				})(), display: false, details: { goalId: goal.id } },
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
 		});
+	}
+
+	/** GG-3: when the goal stalls and a stuckEscalateModel is configured (trusted
+	 *  projects), ask that stronger model for ONE concrete next step and inject it
+	 *  into the next continuation (via stuckSuggestion), resetting no-progress so
+	 *  the goal gets another chance. Falls back to pause on any failure. */
+	async function escalateStuck(ctx: ExtensionContext): Promise<void> {
+		if (!goal || !goalConfig.stuckEscalateModel) {
+			pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
+			ctx.ui.notify("⏸ Goal paused (no progress). Use /goal resume to continue.", "warning");
+			return;
+		}
+		const spec = parseModelSpec(goalConfig.stuckEscalateModel);
+		const model = spec ? ctx.modelRegistry?.find?.(spec.provider, spec.modelId) : undefined;
+		if (!model) {
+			pauseGoal("stuck-escalation model not found: " + goalConfig.stuckEscalateModel, ctx);
+			ctx.ui.notify("⏸ Goal paused (no progress; escalation model unavailable).", "warning");
+			return;
+		}
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) {
+			pauseGoal("stuck-escalation auth failed: " + auth.error, ctx);
+			return;
+		}
+		try {
+			const criteriaSummary = goal.criteria.map((c) => "  " + (c.evidence.length > 0 ? "✅" : "⏳") + " [" + c.id + "] " + c.description).join("\n");
+			const result = await complete(model, {
+				systemPrompt: "You are a senior engineer unblocking a stalled autonomous agent. Reply with ONE concrete next step.",
+				messages: [{ role: "user", content: [{ type: "text", text: buildEscalationPrompt({ objective: goal.objective, criteriaSummary }) }], timestamp: Date.now() }],
+			}, { apiKey: auth.apiKey, headers: auth.headers, temperature: 0.4, maxTokens: 512 });
+			const suggestion = extractTextContent(result).trim();
+			if (!suggestion) {
+				pauseGoal("stuck-escalation returned no suggestion", ctx);
+				return;
+			}
+			stuckSuggestion = suggestion;
+			updateState({ noProgressCount: 0 }, ctx);
+			ctx.ui.notify("🔁 Goal stuck — escalated to " + goalConfig.stuckEscalateModel + " for a fresh approach.", "info");
+			sendContinuation(ctx);
+		} catch (err) {
+			pauseGoal("stuck-escalation failed: " + (err instanceof Error ? err.message : String(err)), ctx);
+		}
 	}
 
 	function scheduleContinuation(ctx: ExtensionContext) {
@@ -712,6 +767,13 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		if (!goal || goal.status !== "active") { diag(ctx, "scheduleContinuation: skip (goal=" + (goal ? goal.status : "null") + ")"); return; }
 		if (!ctx.isIdle() || ctx.hasPendingMessages()) { diag(ctx, "scheduleContinuation: skip (not idle / pending messages)"); return; }
 		if (goal.noProgressCount >= CONFIG.maxNoProgressTurns) {
+			// GG-3: if a stuckEscalateModel is configured, escalate to it for a fresh
+			// next step instead of pausing (fire-and-forget; it pauses on failure).
+			if (goalConfig.stuckEscalateModel) {
+				diag(ctx, "scheduleContinuation: escalate (no progress " + goal.noProgressCount + ")");
+				void escalateStuck(ctx);
+				return;
+			}
 			diag(ctx, "scheduleContinuation: pause (no progress " + goal.noProgressCount + ")");
 			pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
 			ctx.ui.notify("\u23F8 Goal paused (no progress). Use /goal resume to continue.", "warning");

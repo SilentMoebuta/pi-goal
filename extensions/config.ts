@@ -26,9 +26,26 @@ export interface GoalConfig {
 	 *  Security: loadGoalConfig only populates this for trusted projects, so
 	 *  runJudge can trust the field's presence without re-checking trust. */
 	verifyCommand?: string;
+
+	/** GG-3: a "provider/model-id" spec for a stronger model consulted when the
+	 *  goal stalls (no-progress). When set (trusted projects only, via
+	 *  .pi/goal.json), a stuck goal asks this model for ONE concrete next-step
+	 *  suggestion, injected into the next continuation before pausing. Falls
+	 *  back to pause-only when unset. Default undefined = backward-compatible. */
+	stuckEscalateModel?: string;
 }
 
-export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined };
+export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined, stuckEscalateModel: undefined };
+
+/** GG-3: build the prompt sent to a stronger model when the goal stalls, asking
+ *  for ONE concrete next step to unstick it. Pure + unit-testable; the model
+ *  call + injection is runtime (escalateStuck in extensions/index.ts). */
+export function buildEscalationPrompt(input: { objective: string; criteriaSummary: string }): string {
+	return "A goal-driven agent has stalled (no progress for several turns). Propose ONE concrete next step to unstick it — a specific action it should take next, not a plan.\n\n"
+		+ "Goal objective: " + input.objective + "\n\n"
+		+ "Criteria progress:\n" + (input.criteriaSummary || "(none)") + "\n\n"
+		+ "Reply with ONLY the single concrete next step, no preamble or explanation.";
+}
 
 /** GG-14: parse a "provider/model-id" spec into {provider, modelId} for
  *  modelRegistry.find(). Returns null for anything that cannot resolve to a
@@ -82,6 +99,7 @@ export function loadGoalConfig(cwd: string, trusted: boolean): GoalConfig {
 			superpowersIntegration: raw.superpowersIntegration === false ? false : true,
 			judgeModel: typeof raw.judgeModel === "string" ? raw.judgeModel : undefined,
 			verifyCommand: typeof raw.verifyCommand === "string" ? raw.verifyCommand : undefined,
+			stuckEscalateModel: typeof raw.stuckEscalateModel === "string" ? raw.stuckEscalateModel : undefined,
 		};
 	} catch {
 		return { ...DEFAULT_GOAL_CONFIG };
