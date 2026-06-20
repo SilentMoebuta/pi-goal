@@ -510,15 +510,16 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	const GOAL_TOOLS = ["get_goal", "update_goal", "propose_goal_draft"];
 
 	function syncTools() {
+		// ponytail: always-add, never-remove. The tools' execute() functions
+		// handle the "no goal" case internally. This eliminates a timing
+		// source: _refreshToolRegistry resets activeTools to built-ins,
+		// and if syncTools removes get_goal/update_goal before the handler
+		// can re-add them, the tools become permanently unavailable.
+		// By only adding (never removing), the tools always stay active.
 		const active = new Set(pi.getActiveTools());
 		let changed = false;
-		const canPropose = !goal || ["active", "paused", "budget_limited", "usage_limited", "blocked", "complete", "unmet"].includes(goal.status);
-		const canGet = !!goal;
-		const canUpdate = canUpdateGoal(goal?.status);
-		const desired: Record<string, boolean> = { propose_goal_draft: canPropose, get_goal: canGet, update_goal: canUpdate };
-		for (const [name, want] of Object.entries(desired)) {
-			if (want && !active.has(name)) { active.add(name); changed = true; }
-			else if (!want && active.has(name)) { active.delete(name); changed = true; }
+		for (const name of GOAL_TOOLS) {
+			if (!active.has(name)) { active.add(name); changed = true; }
 		}
 		if (changed) pi.setActiveTools(Array.from(active));
 	}
