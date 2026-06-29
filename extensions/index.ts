@@ -24,7 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, type GoalConfig, type GoalStatus } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, type GoalConfig, type GoalStatus } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -358,7 +358,8 @@ function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_C
 		: "";
 
 	return (
-		(config.superpowersIntegration ? superpowersAdaptationBlock() + superpowersDisciplineBlock() + taskRoutingBlock(config) : "") +
+		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
+		(injectSuperpowersCoding(config) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -438,7 +439,8 @@ function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CON
 		"Use update_goal({ criterionId, evidence }) to submit evidence per criterion.\n" +
 		'When ALL criteria are satisfied, call update_goal({ status: "complete", evidence: "..." }).\n' +
 		"An independent judge will evaluate completion after each turn." +
-		(config.superpowersIntegration ? GOAL_GOVERNANCE + taskRoutingBlock(config) : "");
+		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
+		(injectSuperpowersCoding(config) ? GOAL_GOVERNANCE : "");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

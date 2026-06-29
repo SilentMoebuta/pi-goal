@@ -49,6 +49,18 @@ export interface GoalConfig {
 
 export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined, stuckEscalateModel: undefined, verifyTimeoutMs: undefined, forceTaskType: undefined };
 
+/** Whether to inject the superpowers coding-flow blocks (superpowersAdaptation
+ *  + superpowersDiscipline + GOAL_GOVERNANCE). True when superpowersIntegration
+ *  is on AND the task is coding — either forceTaskType is unset (LLM
+ *  auto-judges, default) or explicitly "coding". False when forceTaskType is a
+ *  non-coding type (research/pm/review) — clean rollback: suppress the coding
+ *  gates so the LLM does not receive competing instructions ("follow TDD
+ *  HARD-GATE" + "use research workflow"). Gating on explicit USER-DECLARED
+ *  config is NOT a runtime task-type classifier (no research violated). */
+export function injectSuperpowersCoding(config: GoalConfig = DEFAULT_GOAL_CONFIG): boolean {
+	return config.superpowersIntegration && (!config.forceTaskType || config.forceTaskType === "coding");
+}
+
 /** Phase-1 task-routing清单 (design: task_workflow_routing_design.md). Pure
  *  prompt string builder, unit-testable. Injected alongside the superpowers
  *  block so the LLM self-judges the task type (no hard classifier — research

@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
 	loadGoalConfig,
 	taskRoutingBlock,
+	injectSuperpowersCoding,
 	DEFAULT_GOAL_CONFIG,
 	type GoalConfig,
 } from "../extensions/config";
@@ -15,6 +16,31 @@ import {
 // Tests verify the routing清单 content: task-type→workflow mapping, tiebreak
 // rule, on-miss dynamic-generation instruction, superpowers-is-coding-only note,
 // and forceTaskType override. Per design task_workflow_routing_design.md.
+
+describe("injectSuperpowersCoding (rollback cleanliness)", () => {
+	it("injects superpowers when forceTaskType unset (LLM auto-judges, default)", () => {
+		assert.equal(injectSuperpowersCoding(DEFAULT_GOAL_CONFIG), true);
+		const cfg: GoalConfig = { ...DEFAULT_GOAL_CONFIG, forceTaskType: undefined };
+		assert.equal(injectSuperpowersCoding(cfg), true);
+	});
+
+	it("injects superpowers when forceTaskType explicitly 'coding'", () => {
+		const cfg: GoalConfig = { ...DEFAULT_GOAL_CONFIG, forceTaskType: "coding" };
+		assert.equal(injectSuperpowersCoding(cfg), true);
+	});
+
+	it("suppresses superpowers when forceTaskType is non-coding (research/pm/review) — clean rollback, no competing instructions", () => {
+		for (const t of ["research", "pm", "review"]) {
+			const cfg: GoalConfig = { ...DEFAULT_GOAL_CONFIG, forceTaskType: t };
+			assert.equal(injectSuperpowersCoding(cfg), false, `forceTaskType=${t} should suppress superpowers`);
+		}
+	});
+
+	it("returns false when superpowersIntegration off (regardless of forceTaskType)", () => {
+		const cfg: GoalConfig = { superpowersIntegration: false, forceTaskType: undefined };
+		assert.equal(injectSuperpowersCoding(cfg), false);
+	});
+});
 
 describe("taskRoutingBlock", () => {
 	it("contains routing entries for all 4 task types (coding/research/pm/review)", () => {
