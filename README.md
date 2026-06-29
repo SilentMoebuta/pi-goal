@@ -94,7 +94,7 @@ All default to unset = backward-compatible (no behavior change).
 Example:
 ```json
 {
-  "judgeModel": "ksyun/glm-5.2",
+  "judgeModel": "testprov/test-model",
   "verifyCommand": "npm test",
   "verifyTimeoutMs": 180000,
   "stuckEscalateModel": "anthropic/claude-sonnet-4"

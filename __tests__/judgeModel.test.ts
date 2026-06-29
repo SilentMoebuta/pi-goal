@@ -10,7 +10,7 @@ import { parseModelSpec, type GoalConfig, DEFAULT_GOAL_CONFIG } from "../extensi
 
 describe("parseModelSpec (GG-14 judge model resolution)", () => {
 	it("parses a provider/model-id spec", () => {
-		assert.deepEqual(parseModelSpec("ksyun/glm-5.2"), { provider: "ksyun", modelId: "glm-5.2" });
+		assert.deepEqual(parseModelSpec("testprov/test-model"), { provider: "testprov", modelId: "test-model" });
 		assert.deepEqual(parseModelSpec("anthropic/claude-sonnet-4"), { provider: "anthropic", modelId: "claude-sonnet-4" });
 	});
 
@@ -27,13 +27,13 @@ describe("parseModelSpec (GG-14 judge model resolution)", () => {
 
 	it("returns null when there is no slash (cannot resolve a provider)", () => {
 		assert.equal(parseModelSpec("noproviderslash"), null);
-		assert.equal(parseModelSpec("glm-5.2"), null);
+		assert.equal(parseModelSpec("test-model"), null);
 	});
 
 	it("returns null for a spec with an empty provider or model-id", () => {
-		assert.equal(parseModelSpec("/glm-5.2"), null);
-		assert.equal(parseModelSpec("ksyun/"), null);
-		assert.equal(parseModelSpec("ksyun/  "), null);
+		assert.equal(parseModelSpec("/test-model"), null);
+		assert.equal(parseModelSpec("testprov/"), null);
+		assert.equal(parseModelSpec("testprov/  "), null);
 	});
 });
 
@@ -42,7 +42,7 @@ describe("GoalConfig.judgeModel (GG-14 config wiring)", () => {
 		assert.equal(DEFAULT_GOAL_CONFIG.judgeModel, undefined);
 	});
 	it("is a valid typed field", () => {
-		const c: GoalConfig = { superpowersIntegration: true, judgeModel: "ksyun/glm-5.2" };
-		assert.equal(c.judgeModel, "ksyun/glm-5.2");
+		const c: GoalConfig = { superpowersIntegration: true, judgeModel: "testprov/test-model" };
+		assert.equal(c.judgeModel, "testprov/test-model");
 	});
 });
