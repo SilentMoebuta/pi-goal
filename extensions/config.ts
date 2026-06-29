@@ -37,9 +37,52 @@ export interface GoalConfig {
 	/** GG-1: max ms the verify command may run before being SIGKILLed (default
 	 *  120000 — real test suites exceed the old 30s cap). Trusted projects only. */
 	verifyTimeoutMs?: number;
+
+	/** Phase-1 task-routing: force a task type so the main agent skips LLM
+	 *  auto-judgment and uses the named workflow directly. Rollback path for
+	 *  misjudged task types (e.g. a non-coding goal that wrongly entered the
+	 *  superpowers coding flow). Values: "coding" | "research" | "pm" |
+	 *  "review" | undefined. Default undefined = LLM auto-judges via the
+	 *  routing清单. Trusted projects only (read from .pi/goal.json). */
+	forceTaskType?: string;
 }
 
-export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined, stuckEscalateModel: undefined, verifyTimeoutMs: undefined };
+export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined, stuckEscalateModel: undefined, verifyTimeoutMs: undefined, forceTaskType: undefined };
+
+/** Phase-1 task-routing清单 (design: task_workflow_routing_design.md). Pure
+ *  prompt string builder, unit-testable. Injected alongside the superpowers
+ *  block so the LLM self-judges the task type (no hard classifier — research
+ *  strong-evidence: no mature system uses a task-type auto-classifier; Claude
+ *  Code uses subagent description for LLM self-matching). On no-match, the LLM
+ *  MUST generate a DAGSpec and call dag_execute (not free-form) — per user
+ *  requirement. forceTaskType (trusted config) is the rollback path for
+ *  misjudged types. */
+export function taskRoutingBlock(config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
+	const overrideNote = config.forceTaskType
+		? `\nTASK-TYPE OVERRIDE: user explicitly set forceTaskType="${config.forceTaskType}" — use the ${config.forceTaskType} workflow, do NOT auto-judge the task type.\n`
+		: "";
+	return (
+		"<TASK-ROUTING>\n" +
+		"Judge the task type from the goal objective, then route to the matching workflow.\n" +
+		"This清单 is fallback guidance — you (the LLM) judge, no hard classifier.\n\n" +
+		overrideNote +
+		"| task 特征 | workflow | role | 触发词 |\n" +
+		"|---|---|---|---|\n" +
+		"| 写代码/改代码/修 bug/重构 | superpowers (coding) | coder | 实现/修复/重构/测试 |\n" +
+		"| 调研/对比/现状/可行性 | research (5-Phase) | researcher | 调研/了解/对比/现状 |\n" +
+		"| 产品方向/机会/规划/PRD | pm-discovery (PM SOP) | pm | 机会/规划/方向/PRD |\n" +
+		"| 审查/审计/评估 | review | reviewer | 审查/审计/评估 |\n" +
+		"| 无匹配 | 现场生成 (MUST, 不纯自由发挥) | 按需 spawn | — |\n\n" +
+		"多匹配 tiebreak: 编排型 role (PM/reviewer) > 执行型 role (researcher/coder)。\n" +
+		"例: \"调研 X 痛点并识别产品机会\" 同时匹配 research(调研)+PM(机会) → PM 胜出, PM 在 workflow 内 spawn researcher 做调研。\n" +
+		"理由: 编排型 role 能调度执行型 role, 反之不能。\n\n" +
+		"无匹配时 (MUST): 生成 DAGSpec (多 role 协作探索) → 调 dag_execute (inline spec, 不落盘) → 各 node spawn role 跑 per-role workflow。\n" +
+		"跑通后可建议固化为新 preset (Phase 2, 可选)。\n\n" +
+		"重要: superpowers (brainstorm→plan→TDD→review) 是 coding 专用流程。\n" +
+		"非 coding 任务 (research/pm/review) 不要套 superpowers 的 coding 门 (如强制 TDD) — 按对应 workflow 走。\n" +
+		"</TASK-ROUTING>\n"
+	);
+}
 
 /** GG-3: build the prompt sent to a stronger model when the goal stalls, asking
  *  for ONE concrete next step to unstick it. Pure + unit-testable; the model
@@ -105,6 +148,7 @@ export function loadGoalConfig(cwd: string, trusted: boolean): GoalConfig {
 			verifyCommand: typeof raw.verifyCommand === "string" ? raw.verifyCommand : undefined,
 			stuckEscalateModel: typeof raw.stuckEscalateModel === "string" ? raw.stuckEscalateModel : undefined,
 			verifyTimeoutMs: typeof raw.verifyTimeoutMs === "number" ? raw.verifyTimeoutMs : undefined,
+			forceTaskType: typeof raw.forceTaskType === "string" ? raw.forceTaskType : undefined,
 		};
 	} catch {
 		return { ...DEFAULT_GOAL_CONFIG };
