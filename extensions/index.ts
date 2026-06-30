@@ -293,7 +293,7 @@ function superpowersAdaptationBlock(): string {
 		"| Skill says... | You do this instead... |\n" +
 		"|---|---|\n" +
 		'| "get user approval" | Dispatch a reviewer subagent as the autonomous approver. |\n' +
-		'| "ask clarifying questions" | Use your best judgment based on the goal objective. |\n' +
+		'| "ask clarifying questions" | Spawn a researcher subagent to gather context, then a reviewer to validate assumptions before proceeding. |\n' +
 		'| "present the design" | Write to a file, then dispatch the approver to review it. |\n' +
 		'| "invoke <skill> skill" | Load the skill by name: run /skill:<name> (e.g. /skill:writing-plans). Pi auto-loads skills by description, so simply announcing the skill name also works. Do NOT hardcode file paths — the superpowers bundle is installed as the "pi-superpowers" package, not a local directory. |\n' +
 		'| "HARD-GATE: no code until approved" | RESPECT THIS. Do not write code. Dispatch approver, get approval, then proceed. |\n\n' +
