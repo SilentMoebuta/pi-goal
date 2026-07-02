@@ -251,6 +251,56 @@ export function canComplete(goal: CompletableGoal): { ok: boolean; reason?: stri
 	return { ok: true };
 }
 
+/** A goal slice sufficient for the get_goal text serializer. Decoupled from the
+ *  full GoalState (index.ts) so serializeGoalText is a pure, unit-testable
+ *  function with no pi-runtime types. Fields mirror the GoalState shape.
+ *  taskType/reviewerPassed/executionMode are optional (深修 D/A); undefined →
+ *  JSON.stringify omits the key, keeping legacy coding-goal output clean. */
+export interface SerializableGoal {
+	objective: string;
+	status: string;
+	criteria: { id: string; description: string; evidence: string[] }[];
+	constraints: string[];
+	tokensUsed: number;
+	tokenBudget: number | null;
+	timeUsedMs: number;
+	autoTurnCount: number;
+	/** Per-goal task type (深修 A). undefined = legacy coding goal. */
+	taskType?: "coding" | "research" | "pm" | "review";
+	/** True after independent reviewer APPROVE (深修 D). undefined = not applicable
+	 *  (coding goal, no gate); false = research goal under review, not yet approved. */
+	reviewerPassed?: boolean;
+	/** Execution mode (深修 A). single (default) = main agent 直执; orchestrated = spawn role. */
+	executionMode?: "single" | "orchestrated";
+}
+
+/** Serializes a goal to the text payload returned by the get_goal tool.
+ *  Pure + unit-testable. Extracted from an inline hand-written field whitelist
+ *  in index.ts's get_goal handler that silently dropped taskType/reviewerPassed/
+ *  executionMode (the 深修 D/A fields) — the bug surfaced during 深修 D live
+ *  verification (goal-d-live-verification.md): get_goal text omitted taskType
+ *  even though state held it. `details: { goal }` carried the full state so the
+ *  canComplete gate still worked (it reads state, not text), but the user-facing
+ *  text lied. Centralizing here makes the field list testable against the real
+ *  implementation, not a spec-mirror (circular).
+ *
+ *  Key naming: snake_case to match the existing get_goal text contract
+ *  (tokens_used/time_used_seconds/auto_turns). undefined optional fields are
+ *  omitted by JSON.stringify (not emitted as null), so legacy coding goals keep
+ *  a noise-free output. */
+export function serializeGoalText(goal: SerializableGoal): string {
+	return JSON.stringify({
+		objective: goal.objective, status: goal.status,
+		criteria: goal.criteria.map((c) => ({ id: c.id, description: c.description, done: c.evidence.length > 0, evidence: c.evidence })),
+		constraints: goal.constraints, tokens_used: goal.tokensUsed, token_budget: goal.tokenBudget,
+		remaining_tokens: goal.tokenBudget !== null ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : null,
+		time_used_seconds: Math.floor(goal.timeUsedMs / 1000), auto_turns: goal.autoTurnCount,
+		task_type: goal.taskType,
+		reviewer_passed: goal.reviewerPassed,
+		execution_mode: goal.executionMode,
+	}, null, 2);
+}
+
 /** GG-3: build the prompt sent to a stronger model when the goal stalls, asking
  *  for ONE concrete next step to unstick it. Pure + unit-testable; the model
  *  call + injection is runtime (escalateStuck in extensions/index.ts). */

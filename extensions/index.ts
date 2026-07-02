@@ -24,7 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, type GoalConfig, type GoalStatus } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, type GoalConfig, type GoalStatus } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1054,13 +1054,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		async execute() {
 			if (!goal) return { content: [{ type: "text", text: "No goal is currently set." }], details: {} as { goal?: GoalState } };
 			return {
-				content: [{ type: "text", text: JSON.stringify({
-					objective: goal.objective, status: goal.status,
-					criteria: goal.criteria.map((c) => ({ id: c.id, description: c.description, done: c.evidence.length > 0, evidence: c.evidence })),
-					constraints: goal.constraints, tokens_used: goal.tokensUsed, token_budget: goal.tokenBudget,
-					remaining_tokens: goal.tokenBudget !== null ? Math.max(0, goal.tokenBudget - goal.tokensUsed) : null,
-					time_used_seconds: Math.floor(goal.timeUsedMs / 1000), auto_turns: goal.autoTurnCount,
-				}, null, 2) }],
+				content: [{ type: "text", text: serializeGoalText(goal) }],
 				details: { goal },
 			};
 		},
