@@ -1,0 +1,77 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+
+import {
+	injectSuperpowersCoding,
+	taskGovernanceBlock,
+	DEFAULT_GOAL_CONFIG,
+	type GoalConfig,
+} from "../extensions/config";
+
+// 深修 C: governance 分流 — 非 coding 任务不套 coding 门,各有自己的 governance 块。
+// injectSuperpowersCoding 接收 goalTaskType 参数(per-goal,来自 GoalState.taskType),
+// 优先级: goalTaskType > config.forceTaskType > undefined(coding 默认,backward-compat)。
+// Design: docs/superpowers/specs/2026-07-02-non-coding-goal-design.md §四
+
+describe("injectSuperpowersCoding — goalTaskType 分流 (深修 C)", () => {
+	it("injects coding gate for undefined goalTaskType (backward-compat)", () => {
+		assert.equal(injectSuperpowersCoding(DEFAULT_GOAL_CONFIG, undefined), true);
+	});
+
+	it("injects coding gate for explicit 'coding' goalTaskType", () => {
+		assert.equal(injectSuperpowersCoding(DEFAULT_GOAL_CONFIG, "coding"), true);
+	});
+
+	for (const t of ["research", "pm", "review"] as const) {
+		it(`suppresses coding gate for ${t} goalTaskType (no competing instructions)`, () => {
+			assert.equal(injectSuperpowersCoding(DEFAULT_GOAL_CONFIG, t), false, `goalTaskType=${t} should suppress coding gate`);
+		});
+	}
+
+	it("goalTaskType overrides config.forceTaskType (per-goal wins)", () => {
+		// config says coding, but goal says research → research wins (suppress)
+		const cfg: GoalConfig = { ...DEFAULT_GOAL_CONFIG, forceTaskType: "coding" };
+		assert.equal(injectSuperpowersCoding(cfg, "research"), false);
+		// config says research, goal undefined → config wins (suppress)
+		const cfg2: GoalConfig = { ...DEFAULT_GOAL_CONFIG, forceTaskType: "research" };
+		assert.equal(injectSuperpowersCoding(cfg2, undefined), false);
+	});
+
+	it("returns false when superpowersIntegration off (regardless of goalTaskType)", () => {
+		const cfg: GoalConfig = { superpowersIntegration: false };
+		assert.equal(injectSuperpowersCoding(cfg, "coding"), false);
+		assert.equal(injectSuperpowersCoding(cfg, "research"), false);
+	});
+});
+
+describe("taskGovernanceBlock — per-task-type governance (深修 C)", () => {
+	it("coding → superpowers 阶段门 (existing behavior preserved)", () => {
+		const block = taskGovernanceBlock("coding");
+		assert.ok(block.length > 0, "coding governance should be non-empty");
+		assert.ok(block.includes("superpowers") || block.includes("TDD") || block.includes("阶段"), `coding governance should mention superpowers/TDD, got: ${block.slice(0, 200)}`);
+	});
+
+	it("research → 计划→采集→交叉验证→综合→reviewer 验引用", () => {
+		const block = taskGovernanceBlock("research");
+		assert.ok(block.includes("交叉验证"), `research governance should mention 交叉验证, got: ${block.slice(0, 200)}`);
+		assert.ok(block.includes("reviewer") || block.includes("引用"), `research governance should mention reviewer/引用, got: ${block.slice(0, 200)}`);
+	});
+
+	it("pm → 盘点→痛点→机会→优先级→reviewer 验论证", () => {
+		const block = taskGovernanceBlock("pm");
+		assert.ok(block.includes("机会") || block.includes("优先级"), `pm governance should mention 机会/优先级, got: ${block.slice(0, 200)}`);
+		assert.ok(block.includes("reviewer") || block.includes("论证"), `pm governance should mention reviewer/论证, got: ${block.slice(0, 200)}`);
+	});
+
+	it("review → 审计清单 + reviewer 复核", () => {
+		const block = taskGovernanceBlock("review");
+		assert.ok(block.includes("审计") || block.includes("复核"), `review governance should mention 审计/复核, got: ${block.slice(0, 200)}`);
+	});
+
+	it("undefined → coding governance (backward-compat)", () => {
+		const block = taskGovernanceBlock(undefined);
+		assert.ok(block.length > 0);
+		// undefined falls back to coding governance
+		assert.ok(block.includes("superpowers") || block.includes("TDD") || block.includes("阶段"), `undefined should fall back to coding, got: ${block.slice(0, 200)}`);
+	});
+});

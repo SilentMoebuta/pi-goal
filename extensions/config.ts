@@ -56,9 +56,17 @@ export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, j
  *  non-coding type (research/pm/review) — clean rollback: suppress the coding
  *  gates so the LLM does not receive competing instructions ("follow TDD
  *  HARD-GATE" + "use research workflow"). Gating on explicit USER-DECLARED
- *  config is NOT a runtime task-type classifier (no research violated). */
-export function injectSuperpowersCoding(config: GoalConfig = DEFAULT_GOAL_CONFIG): boolean {
-	return config.superpowersIntegration && (!config.forceTaskType || config.forceTaskType === "coding");
+ *  config is NOT a runtime task-type classifier (no research violated).
+ *
+ *  深修 C: 加 goalTaskType 参数(per-goal,来自 GoalState.taskType)。
+ *  优先级: goalTaskType > config.forceTaskType > undefined(coding 默认,backward-compat)。
+ *  undefined → 仍注入 coding(legacy 行为不变),只有显式非 coding 才抑制。 */
+export function injectSuperpowersCoding(config: GoalConfig = DEFAULT_GOAL_CONFIG, goalTaskType?: string): boolean {
+	// goalTaskType (per-goal) 优先于 config.forceTaskType (global trusted)
+	const t = goalTaskType ?? config.forceTaskType;
+	// backward-compat: undefined → 仍注入 coding (default behavior preserved)
+	// 非 coding → 抑制 coding 门 (no competing instructions)
+	return config.superpowersIntegration && (t === undefined || t === "coding");
 }
 
 /** Phase-1 task-routing清单 (design: task_workflow_routing_design.md). Pure
@@ -94,6 +102,153 @@ export function taskRoutingBlock(config: GoalConfig = DEFAULT_GOAL_CONFIG): stri
 		"非 coding 任务 (research/pm/review) 不要套 superpowers 的 coding 门 (如强制 TDD) — 按对应 workflow 走。\n" +
 		"</TASK-ROUTING>\n"
 	);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 深修 C: per-task-type governance 分流
+// Design: docs/superpowers/specs/2026-07-02-non-coding-goal-design.md §四
+// 非 coding 任务不套 coding 门 (superpowers 阶段门),各有自己的 governance 块。
+// 由 goalSystemPrompt / continuationPrompt 注入,替代硬编码的 GOAL_GOVERNANCE。
+// undefined → coding governance (backward-compat)。
+// ═════════════════════════════════════════════════════════════════════
+
+/** Per-task-type governance block. Pure + unit-testable.
+ *  - coding/undefined → superpowers 阶段门 (existing GOAL_GOVERNANCE content)
+ *  - research → 计划→采集→交叉验证→综合→reviewer 验引用 + 质量门清单
+ *  - pm → 盘点→痛点→机会→优先级→reviewer 验论证
+ *  - review → 审计清单 + reviewer 复核
+ *  Returns the governance text injected into goalSystemPrompt/continuationPrompt. */
+export function taskGovernanceBlock(goalTaskType?: string): string {
+	switch (goalTaskType) {
+		case "research":
+			return RESEARCH_GOVERNANCE;
+		case "pm":
+			return PM_GOVERNANCE;
+		case "review":
+			return REVIEW_GOVERNANCE;
+		default: // coding / undefined → backward-compat
+			return CODING_GOVERNANCE;
+	}
+}
+
+/** 深修 B: orchestrated 模式编排者身份约束 (prompt 层,不做工具 deny)。
+ *  executionMode=orchestrated 时注入 continuationPrompt,明确:
+ *  - main agent 是编排者,执行工作必须 spawn role
+ *  - 直接调 web_search/write/edit 执行实质工作 = 违约(可被 reviewer 检测)
+ *  - 违约检测靠 reviewer 事后审查 + judge turn 级评估,不靠工具 deny
+ *  主张: 执行权与验收权正交 — 简单任务(single)可直执,但验收必须独立。
+ *  Returns empty string for single/undefined (no constraint, backward-compat). */
+export function orchestratorConstraintBlock(executionMode?: string): string {
+	if (executionMode !== "orchestrated") return "";
+	return "\n\n## Orchestrated 模式约束 (executionMode=orchestrated)\n" +
+		"你是编排者。执行工作必须 spawn role (researcher/coder/pm/reviewer)。\n" +
+		"直接调 web_search/write/edit 执行实质工作 = 违约 (可被 reviewer 检测)。\n" +
+		"违约检测靠 reviewer 事后审查 + judge turn 级评估 — 不硬 deny 工具 (执行权与验收权正交)。\n" +
+		"例外: 读文件/跑测试等编排辅助操作可直接调 (非实质执行工作)。\n";
+}
+
+// Governance block texts (kept as module-level consts for testability + clarity)
+const CODING_GOVERNANCE =
+	"\n\n## Goal 模式规则\n" +
+	"当有活跃 goal 时，处理每条新消息前必须：\n" +
+	"1. 判断正处于 superpowers 的哪个阶段（需求→探索→计划→实施→TDD→审查→完成）\n" +
+	"2. 加载该阶段的对应技能到上下文（即使你觉得\"已经知道了\"）\n" +
+	"3. 对照技能里的 Red Flags 表格自检：是否正在跳过某个 HARD-GATE？\n" +
+	"4. 如果上一轮跳过了某个阶段（如没做 TDD 就写了实现），暂停并修复缺口\n\n" +
+	"违反此规则的典型反模式（出现即回退）：\n" +
+	"- \"这个项目太小，不需要完整流程\"\n" +
+	"- \"计划里代码都写好了，直接编辑更快\"\n" +
+	"- \"先写代码再补测试也没关系\"\n" +
+	"- \"我刚才看过那个技能了，不用再看\"\n\n" +
+	"## Superpowers 模式规则\n" +
+	"处理任何非琐碎任务（多文件修改、新功能、重构、bug 修复）时：\n" +
+	"1. 判断任务处于 superpowers 的哪个阶段\n" +
+	"2. 加载对应技能到上下文，遵循其 HARD-GATE 约束\n" +
+	"3. 未获审批（用户或 reviewer）前不得跨阶段\n" +
+	"4. 禁止的反模式：跳过设计直接写代码、先实现后补测试、跳过审查\n";
+
+const RESEARCH_GOVERNANCE =
+	"\n\n## Research 模式规则 (taskType=research)\n" +
+	"调研类任务不套 superpowers coding 门（无 TDD/HARD-GATE），按 research workflow 走：\n" +
+	"1. 计划：列出 ≥3 个独立研究角度（多角度并发，单 agent 串行 = 偷懒信号）\n" +
+	"2. 采集：每条数据标注来源（URL/文件路径）+ 置信度（高/中/低/猜测）\n" +
+	"3. 交叉验证：关键数据用 ≥2 个独立来源佐证，二手编译数据追源头\n" +
+	"4. 综合：诚实标注数据/推理/假设的边界\n" +
+	"5. reviewer 验引用：完成前 spawn 独立 reviewer 审引用可溯率 + 判断可信度（reviewer ≠ 产出者）\n\n" +
+	"质量门（reviewer 检查清单）：引用可溯率（URL/路径占比）、来源多样性（域名/机构数）、置信度标注完整性、是否循环论证。\n" +
+	"禁止的反模式：自评自己写的报告（循环论证）、单源断言、拍脑袋置信度。\n";
+
+const PM_GOVERNANCE =
+	"\n\n## PM 模式规则 (taskType=pm)\n" +
+	"产品方向类任务不套 superpowers coding 门，按 PM Discovery SOP 走：\n" +
+	"1. 盘点：领域现状 + 竞品格局\n" +
+	"2. 痛点：用数据说话（来源+置信度），区分 AI 能解 vs 流程/治理问题\n" +
+	"3. 机会：3-5 个，每个含技术可行性/业界现状/差异化/风险\n" +
+	"4. 优先级：用户价值×可行性×差异化，MVP 边界（做/不做）+ 成功指标（领域特化）\n" +
+	"5. reviewer 验论证：完成前 spawn 独立 reviewer 审机会是否有据、优先级是否合理、假设是否标注\n\n" +
+	"禁止的反模式：纯口号式建议（如\"用 AI 做合同管理\"）、无数据支撑的判断、自评自审。\n";
+
+const REVIEW_GOVERNANCE =
+	"\n\n## Review 模式规则 (taskType=review)\n" +
+	"审查/审计类任务不套 superpowers coding 门，按 review workflow 走：\n" +
+	"1. 审计清单：按正确性/安全/可维护/迁移风险维度逐项查\n" +
+	"2. 证据：每条发现附文件行号/源码/测试输出\n" +
+	"3. 分级：critical/major/minor/nit，给修改建议\n" +
+	"4. reviewer 复核：完成前 spawn 独立 reviewer 复核审计覆盖度 + 分级合理性（reviewer ≠ 产出者）\n\n" +
+	"禁止的反模式：只夸不批、无证据的主观判断、跳过分级。\n";
+
+// ═══════════════════════════════════════════════════════════════════════
+// 深修 D: 独立 reviewer gate (非 coding goal 完成前强制 spawn reviewer)
+// Design: docs/superpowers/specs/2026-07-02-non-coding-goal-design.md §三
+// Root cause: SESSION_HANDOFF §八 根因2+4 — main agent 自审自评 = 循环论证。
+// 业界调研发现:四框架(CrewAI/LangGraph/AutoGen/MetaGPT)均无"reviewer≠producer"
+// 硬约束,pi-goal 深修 D 是差异化增量。
+// 主张:执行权与验收权正交 — 简单任务用 goal 仍可直执(single),
+// 但验收必须独立(reviewer ≠ producer),根除自审自评。
+// Backward-compat: undefined taskType 和 "coding" 无 reviewer gate(行为不变)。
+// ═════════════════════════════════════════════════════════════════════
+
+/** A goal slice sufficient for the complete-gate decision. Decoupled from
+ *  the full GoalState (index.ts) so this is a pure, unit-testable function
+ *  with no pi-runtime types. Fields mirror the GoalState additions for 深修 D. */
+export interface CompletableGoal {
+	/** Per-goal task type declared at propose_goal_draft time (深修 A).
+	 *  undefined = legacy goal (backward-compat: treated as coding, no gate). */
+	taskType?: "coding" | "research" | "pm" | "review";
+	/** True only after an independent reviewer (subagent ≠ producer) has
+	 *  APPROVED. Non-coding goals require this to complete. */
+	reviewerPassed?: boolean;
+	/** Criteria with their collected evidence (existing field). */
+	criteria: { evidence: string[] }[];
+}
+
+/** Gate checked before a goal may transition to "complete". Pure + unit-
+ *  testable. Called by both complete paths:
+ *    1. update_goal({status:"complete"}) — index.ts update_goal handler
+ *    2. judge verdict.done — index.ts runJudge path
+ *  Both must pass this gate, so the logic lives here once (DRY).
+ *
+ *  Order of checks (cheap deterministic first):
+ *    1. All criteria have evidence (existing behavior, preserved)
+ *    2. Non-coding taskType requires reviewerPassed=true (深修 D)
+ *
+ *  Backward-compat: taskType undefined or "coding" → no reviewer gate.
+ *  Legacy goals behave exactly as before. */
+export function canComplete(goal: CompletableGoal): { ok: boolean; reason?: string } {
+	// 1. Evidence gate (existing behavior — preserved verbatim)
+	const uncovered = goal.criteria.filter((c) => c.evidence.length === 0);
+	if (uncovered.length > 0) {
+		return { ok: false, reason: uncovered.length + " criteria lack evidence" };
+	}
+	// 2. 深修 D: reviewer gate for non-coding goals
+	//    undefined / "coding" → no gate (backward-compat).
+	if (goal.taskType && goal.taskType !== "coding" && !goal.reviewerPassed) {
+		return {
+			ok: false,
+			reason: "Non-coding goal (taskType=" + goal.taskType + ") requires independent reviewer APPROVE before complete. Spawn a reviewer (reviewer ≠ producer) and have it submit its verdict, then the gate opens. Root cause addressed: prevent main-agent self-review (循环论证).",
+		};
+	}
+	return { ok: true };
 }
 
 /** GG-3: build the prompt sent to a stronger model when the goal stalls, asking

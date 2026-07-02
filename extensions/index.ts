@@ -24,7 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, type GoalConfig, type GoalStatus } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, type GoalConfig, type GoalStatus } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -59,6 +59,11 @@ interface GoalState {
 	pausedReason: string | null;
 	blocker: string | null;
 	completionEvidence: string | null;
+	// 深修 D/A: per-goal task type + reviewer gate. undefined = legacy (backward-compat).
+	taskType?: "coding" | "research" | "pm" | "review";
+	reviewerPassed?: boolean;
+	// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
+	executionMode?: "single" | "orchestrated";
 }
 
 interface GoalSnapshot {
@@ -359,7 +364,9 @@ function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_C
 
 	return (
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
-		(injectSuperpowersCoding(config) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
+		(injectSuperpowersCoding(config, goal.taskType) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
+		(config.superpowersIntegration ? taskGovernanceBlock(goal.taskType) : "") +
+		orchestratorConstraintBlock(goal.executionMode) +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -399,27 +406,8 @@ function budgetLimitPrompt(goal: GoalState): string {
 
 // Per-turn governance rules, injected via before_agent_start so they survive
 // long-conversation dilution (the user's stated reason these used to live in
-// CLAUDE.md). Goal Mode discipline + Superpowers process discipline must be
-// re-asserted every turn, not just at session start.
-const GOAL_GOVERNANCE =
-	"\n\n## Goal 模式规则\n" +
-	"当有活跃 goal 时，处理每条新消息前必须：\n" +
-	"1. 判断正处于 superpowers 的哪个阶段（需求→探索→计划→实施→TDD→审查→完成）\n" +
-	"2. 加载该阶段的对应技能到上下文（即使你觉得\"已经知道了\"）\n" +
-	"3. 对照技能里的 Red Flags 表格自检：是否正在跳过某个 HARD-GATE？\n" +
-	"4. 如果上一轮跳过了某个阶段（如没做 TDD 就写了实现），暂停并修复缺口\n\n" +
-	"违反此规则的典型反模式（出现即回退）：\n" +
-	"- \"这个项目太小，不需要完整流程\"\n" +
-	"- \"计划里代码都写好了，直接编辑更快\"\n" +
-	"- \"先写代码再补测试也没关系\"\n" +
-	"- \"我刚才看过那个技能了，不用再看\"\n\n" +
-	"## Superpowers 模式规则\n" +
-	"处理任何非琐碎任务（多文件修改、新功能、重构、bug 修复）时：\n" +
-	"1. 判断任务处于 superpowers 的哪个阶段\n" +
-	"2. 加载对应技能到上下文，遵循其 HARD-GATE 约束\n" +
-	"3. 未获审批（用户或 reviewer）前不得跨阶段\n" +
-	"4. 禁止的反模式：跳过设计直接写代码、先实现后补测试、跳过审查\n";
-
+// CLAUDE.md). 深修 C: governance 按 task_type 分流 (config.ts taskGovernanceBlock),
+// 非 coding 任务不套 coding 门,各有自己的 governance 块。
 function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const budgetInfo = goal.tokenBudget != null
@@ -440,7 +428,7 @@ function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CON
 		'When ALL criteria are satisfied, call update_goal({ status: "complete", evidence: "..." }).\n' +
 		"An independent judge will evaluate completion after each turn." +
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
-		(injectSuperpowersCoding(config) ? GOAL_GOVERNANCE : "");
+		(config.superpowersIntegration ? taskGovernanceBlock(goal.taskType) : "");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -451,6 +439,9 @@ interface GoalProposal {
 	objective: string;
 	criteria: string[];
 	constraints: string[];
+	// 深修 A/D: carried from propose_goal_draft params into setGoal.
+	taskType?: "coding" | "research" | "pm" | "review";
+	executionMode?: "single" | "orchestrated";
 }
 
 type ReviewResult = "start" | "edit" | "cancel";
@@ -626,7 +617,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	function setGoal(
 		objective: string, criteria: string[], constraints: string[],
-		opts: { tokenBudget?: number | null }, ctx: ExtensionContext,
+		opts: { tokenBudget?: number | null; taskType?: "coding" | "research" | "pm" | "review"; executionMode?: "single" | "orchestrated" }, ctx: ExtensionContext,
 	): GoalState {
 		const now = Date.now();
 		if (goal?.status === "active") {
@@ -644,6 +635,9 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			tokenBudget: opts.tokenBudget ?? null, tokensUsed: 0, timeUsedMs: 0,
 			createdAt: now, updatedAt: now, noProgressCount: 0, autoTurnCount: 0,
 			pausedReason: null, blocker: null, completionEvidence: null,
+			taskType: opts.taskType,
+			reviewerPassed: false,
+			executionMode: opts.executionMode,
 		};
 		goal = newGoal;
 		userSuspended = false;
@@ -984,9 +978,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			} else { judgeParseFailures = 0; }
 
 			if (verdict.done) {
-				const uncovered = goal.criteria.filter((c) => c.evidence.length === 0);
-				if (uncovered.length > 0) {
-					ctx.ui.notify("\u26A0\uFE0F Judge says done, but " + uncovered.length + " criteria lack evidence. Continuing...", "warning");
+				// 深修 D: route through canComplete gate (evidence + reviewer for non-coding).
+				const gate = canComplete(goal);
+				if (!gate.ok) {
+					ctx.ui.notify("\u26A0\uFE0F Judge says done, but " + gate.reason + ". Continuing...", "warning");
 				} else {
 					updateState({ status: "complete", completionEvidence: verdict.reason, noProgressCount: 0 }, ctx);
 					pi.sendMessage(
@@ -1079,6 +1074,9 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			evidence: Type.Optional(Type.String({ description: "Required for complete." })),
 			blocker: Type.Optional(Type.String({ description: "Required for unmet." })),
 			criterionId: Type.Optional(Type.String({ description: "ID of criterion for per-criterion evidence." })),
+			// 深修 D: reviewer APPROVE writeback. Set true after an independent reviewer
+			// (subagent ≠ producer) approves — opens the complete gate for non-coding goals.
+			reviewerPassed: Type.Optional(Type.Boolean({ description: "Set true after independent reviewer APPROVE (opens complete gate for non-coding goals)." })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!goal) {
@@ -1093,11 +1091,17 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				updateState({ criteria: [...goal.criteria] }, ctx);
 				return { content: [{ type: "text", text: "Evidence recorded for \"" + criterion.description + "\": " + params.evidence }], details: { criterionId: criterion.id } };
 			}
+			// 深修 D: reviewer APPROVE writeback — flip reviewerPassed to open the complete gate.
+			if (params.reviewerPassed !== undefined) {
+				updateState({ reviewerPassed: params.reviewerPassed }, ctx);
+				return { content: [{ type: "text", text: "Reviewer gate " + (params.reviewerPassed ? "OPENED (approved)" : "CLOSED (rejected)") + "." }], details: { reviewerPassed: params.reviewerPassed } };
+			}
 			if (params.status === "complete") {
 				if (!params.evidence) return { content: [{ type: "text", text: "Evidence is required." }], isError: true, details: {} };
-				const uncovered = goal.criteria.filter((c) => c.evidence.length === 0);
-				if (uncovered.length > 0) {
-					return { content: [{ type: "text", text: "Cannot mark complete: " + uncovered.length + " criteria lack evidence." }], isError: true, details: {} };
+				// 深修 D: route through canComplete gate (evidence + reviewer for non-coding).
+				const gate = canComplete(goal);
+				if (!gate.ok) {
+					return { content: [{ type: "text", text: "Cannot mark complete: " + (gate.reason ?? "gate failed") }], isError: true, details: {} };
 				}
 				updateState({ status: "complete", completionEvidence: params.evidence, noProgressCount: 0 }, ctx);
 				pi.sendMessage(
@@ -1122,11 +1126,16 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			objective: Type.String({ description: "Concise 1-2 sentence objective." }),
 			criteria: Type.Array(Type.String(), { description: "3-7 verifiable criteria." }),
 			constraints: Type.Optional(Type.Array(Type.String())),
+			// 深修 A/D: per-goal task type. undefined = legacy (coding default, backward-compat).
+			// Non-coding (research/pm/review) triggers the reviewer gate on complete (深修 D).
+			taskType: Type.Optional(StringEnum(["coding", "research", "pm", "review"] as const)),
+			// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
+			executionMode: Type.Optional(StringEnum(["single", "orchestrated"] as const)),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!ctx.hasUI) {
 				if (goal) return { content: [{ type: "text", text: "A goal is already set (status: " + goal.status + "). Clear it first." }], isError: true, details: {} };
-				setGoal(params.objective, params.criteria, params.constraints ?? [], {}, ctx);
+				setGoal(params.objective, params.criteria, params.constraints ?? [], { taskType: params.taskType, executionMode: params.executionMode }, ctx);
 				return { content: [{ type: "text", text: "Goal created (non-interactive)." }], details: { goal: { ...goal! } } };
 			}
 			if (goal) {
@@ -1141,10 +1150,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				);
 				if (!ok) return { content: [{ type: "text", text: "Kept current goal." }], details: {} };
 			}
-			const proposal: GoalProposal = { objective: params.objective, criteria: params.criteria, constraints: params.constraints ?? [] };
+			const proposal: GoalProposal = { objective: params.objective, criteria: params.criteria, constraints: params.constraints ?? [], taskType: params.taskType, executionMode: params.executionMode };
 			const choice = await showGoalReview(proposal, ctx);
 			switch (choice) {
-				case "start": { setGoal(proposal.objective, proposal.criteria, proposal.constraints, {}, ctx); return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! } } }; }
+				case "start": { setGoal(proposal.objective, proposal.criteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode }, ctx); return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! } } }; }
 				case "edit": {
 					const editedObjective = await ctx.ui.editor("Edit goal objective:", proposal.objective);
 					if (!editedObjective?.trim()) return { content: [{ type: "text", text: "Cancelled (empty objective)." }], details: {} };
@@ -1152,7 +1161,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 					const editedCriteria = await ctx.ui.editor("Edit criteria (one per line):", criteriaText);
 					const newCriteria = (editedCriteria ?? criteriaText).split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
 					if (newCriteria.length === 0) return { content: [{ type: "text", text: "Cancelled (no criteria)." }], details: {} };
-					setGoal(editedObjective.trim(), newCriteria, proposal.constraints, {}, ctx);
+					setGoal(editedObjective.trim(), newCriteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode }, ctx);
 					return { content: [{ type: "text", text: "Goal started after edit: " + goal!.objective }], details: { goal: { ...goal! } } };
 				}
 				default: return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
