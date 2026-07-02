@@ -309,6 +309,70 @@ export function validateReviewerVerdict(v: ReviewerVerdict): { ok: boolean; reas
 	return { ok: true };
 }
 
+/** G3 (CLM 二次 live 测试复盘 / 教训6): extract the reviewer's actual report_role_result
+ *  findings from a sub-session's .jsonl transcript. The sub-session jsonl is written by
+ *  pi-core (not forgeable by the main agent) and contains ONLY that reviewer's turns,
+ *  so finding a report_role_result toolCall with non-empty findings proves a real
+ *  reviewer session existed and reported substantively — closing the "fabricated
+ *  verdict with no real reviewer" gap that reviewerVerdict (结构合规) + reportPath
+ *  re-run (报告内容真伪) alone could not close.
+ *
+ *  Cross-extension reality: pi-goal cannot read pi-roles' in-memory ReportState, so
+ *  the sessionFile is the only independent ground-truth bridge. Pure + unit-testable
+ *  (no fs); the handler does the file read and calls this. Returns {found, findings?}:
+ *  found=true means a report_role_result toolCall was parsed; findings may still be
+ *  empty (handler rejects empty findings even when found). */
+export function extractReviewerFindings(jsonlText: string): { found: boolean; findings?: unknown } {
+	if (!jsonlText || jsonlText.trim().length === 0) return { found: false };
+	const lines = jsonlText.split("\n");
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let parsed: any;
+		try { parsed = JSON.parse(trimmed); } catch { continue; } // skip malformed lines
+		const msg = parsed && typeof parsed === "object" ? parsed.message : undefined;
+		if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		for (const c of msg.content) {
+			if (c && typeof c === "object" && c.type === "toolCall" && c.name === "report_role_result") {
+				const args = c.arguments && typeof c.arguments === "object" ? c.arguments : {};
+				return { found: true, findings: args.findings };
+			}
+		}
+	}
+	return { found: false };
+}
+
+/** G3 helper: are the extracted findings non-empty? (array with items, or non-empty
+ *  string). Pure. */
+export function findingsAreNonEmpty(findings: unknown): boolean {
+	if (Array.isArray(findings)) return findings.length > 0;
+	if (typeof findings === "string") return findings.trim().length > 0;
+	return false;
+}
+
+/** G3 helper: pure decision over whether a reviewer verdict is source-authentic, given
+ *  the caller-supplied agentId/sessionFile and the findings extracted from the jsonl.
+ *  Tested directly (no fs) — the handler does the file read + extractReviewerFindings,
+ *  then calls this. Returns {ok, reason}. Closing 教训6: a verdict with no real reviewer
+ *  session (no agentId/sessionFile, or no report_role_result, or empty findings) is
+ *  rejected — main agent cannot fabricate a reviewer. */
+export function verifyReviewerSource(
+	agentId: string | undefined,
+	sessionFile: string | undefined,
+	extracted: { found: boolean; findings?: unknown },
+): { ok: boolean; reason?: string } {
+	if (!agentId || !sessionFile) {
+		return { ok: false, reason: "reviewerPassed=true for non-coding goal requires reviewerAgentId + reviewerSessionFile (G3: verdict source authenticity). The verdict must come from a real spawned reviewer session, not a self-constructed JSON. Re-spawn a reviewer and pass its agentId + sessionFile." };
+	}
+	if (!extracted.found) {
+		return { ok: false, reason: "No report_role_result found in reviewerSessionFile (G3: the referenced session did not actually report — verdict not sourced from a real reviewer). Re-spawn and ensure the reviewer calls report_role_result." };
+	}
+	if (!findingsAreNonEmpty(extracted.findings)) {
+		return { ok: false, reason: "reviewerSessionFile contains report_role_result but findings are empty (G3: a rubber-stamp reviewer with no substantive report). Re-spawn a reviewer that reports substantive findings." };
+	}
+	return { ok: true };
+}
+
 /** 第1条 (CLM run 复盘): validate a goal proposal BEFORE setGoal. Pure + unit-
  *  testable. Root cause: executionMode 缺省=undefined=single, 非 coding 任务默认走
  *  single, orchestratorConstraintBlock 不触发, main agent 直执成默认——"把复杂任务

@@ -25,7 +25,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, verifyQualityGates, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, verifyQualityGates, extractReviewerFindings, findingsAreNonEmpty, verifyReviewerSource, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -65,6 +65,10 @@ interface GoalState {
 	reviewerPassed?: boolean;
 	// 第2条: 结构化验收凭证, canComplete 验契约. 非 coding goal reviewerPassed=true 时必携.
 	reviewerVerdict?: ReviewerVerdict;
+	// G3 (教训6): verdict 来源真实性. reviewerAgentId + reviewerSessionFile 指向真实 spawn 的
+	// reviewer session (.jsonl 由 pi-core 写, 不可伪造). handler 读之提取 findings 验非空.
+	reviewerAgentId?: string;
+	reviewerSessionFile?: string;
 	// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
 	executionMode?: "single" | "orchestrated";
 }
@@ -1085,6 +1089,11 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				reportPath: Type.Optional(Type.String()),
 				notes: Type.Optional(Type.String()),
 			})),
+			// G3 (教训6): verdict 来源真实性. reviewerPassed=true (非 coding) 须携 reviewerAgentId +
+			// reviewerSessionFile — handler 读该 jsonl 提取 report_role_result 的 findings, 验非空.
+			// sessionFile 由 pi-core 写 (main agent 不可伪造), 是跨 ext 唯一独立验证路径.
+			reviewerAgentId: Type.Optional(Type.String({ description: "agentId of the spawned reviewer session (from spawn_role result). Required for non-coding reviewerPassed=true (G3: verdict source authenticity)." })),
+			reviewerSessionFile: Type.Optional(Type.String({ description: "sessionFile (.jsonl) of the spawned reviewer. Handler reads it to extract the reviewer's actual report_role_result findings (G3)." })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!goal) {
@@ -1127,7 +1136,24 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 							return { content: [{ type: "text", text: "reviewerVerdict.checksPassed=false but quality gates re-verify passed — reviewer mis-reported. Set checksPassed=true." }], isError: true, details: {} };
 						}
 					}
-					updateState({ reviewerPassed: params.reviewerPassed, reviewerVerdict: verdict }, ctx);
+					// G3 (教训6): verdict 来源真实性 — 必须指向一个真实的 spawn reviewer session.
+				// 读 reviewerSessionFile (.jsonl, sub-session 独有文件, pi-core 写、不可伪造), 提取
+				// report_role_result 的 findings, 验非空. 纯决策走 verifyReviewerSource (已单测).
+				if (!params.reviewerAgentId || !params.reviewerSessionFile) {
+					return { content: [{ type: "text", text: "reviewerPassed=true for non-coding goal requires reviewerAgentId + reviewerSessionFile (G3: verdict source authenticity). The verdict must come from a real spawned reviewer session, not a self-constructed JSON. Re-spawn a reviewer and pass its agentId + sessionFile." }], isError: true, details: {} };
+				}
+				let reviewerJsonl = "";
+				try {
+					reviewerJsonl = fs.readFileSync(params.reviewerSessionFile, "utf8");
+				} catch (e) {
+					return { content: [{ type: "text", text: "reviewerSessionFile unreadable: " + params.reviewerSessionFile + " (" + (e as Error).message + "). Cannot verify the reviewer actually reported (G3)." }], isError: true, details: {} };
+				}
+				const extracted = extractReviewerFindings(reviewerJsonl);
+				const source = verifyReviewerSource(params.reviewerAgentId, params.reviewerSessionFile, extracted);
+				if (!source.ok) {
+					return { content: [{ type: "text", text: source.reason ?? "Reviewer source verification failed (G3)." }], isError: true, details: {} };
+				}
+				updateState({ reviewerPassed: params.reviewerPassed, reviewerVerdict: verdict, reviewerAgentId: params.reviewerAgentId, reviewerSessionFile: params.reviewerSessionFile }, ctx);
 				} else {
 					updateState({ reviewerPassed: params.reviewerPassed }, ctx);
 				}
