@@ -239,20 +239,33 @@ export interface CompletableGoal {
  *  Returns {ok, reason?, metrics?}. metrics 供 handler 写回 verdict 供审计. */
 export const QUALITY_GATE_THRESHOLDS = { citationTraceability: 0.3, sourceDiversity: 3 } as const;
 
+// G4 (CLM 二次 live 测试复盘): citation-traceability bar graded by taskType.
+// research reports are data-dense (high citation bar); pm reports are analysis-dense
+// (PRD/roadmap/优先级 legitimately cite fewer external sources) — a single 0.3 bar
+// mis-scores analysis-heavy work and traps it below the gate (the CLM failure mode).
+// review keeps 0.3 (review work should cite what it checks against). undefined/legacy
+// falls back to QUALITY_GATE_THRESHOLDS.citationTraceability (0.3) for backward-compat.
+export const CITATION_TRACEABILITY_BY_TASK_TYPE: Record<string, number> = {
+	research: 0.3,
+	pm: 0.2,
+	review: 0.3,
+};
+
 export interface QualityGateMetrics {
 	citationTraceability: number;
 	sourceDiversity: number;
 	confidenceAnnotated: boolean;
 }
 
-export function verifyQualityGates(reportText: string): { ok: boolean; reason?: string; metrics?: QualityGateMetrics } {
+export function verifyQualityGates(reportText: string, taskType?: string): { ok: boolean; reason?: string; metrics?: QualityGateMetrics } {
 	if (!reportText || reportText.trim().length === 0) return { ok: false, reason: "Report text is empty — nothing to verify." };
 	const citationTraceability = checkCitationTraceability(reportText);
 	const sourceDiversity = checkSourceDiversity(reportText);
 	const confidenceAnnotated = checkConfidenceAnnotation(reportText);
 	const metrics: QualityGateMetrics = { citationTraceability, sourceDiversity, confidenceAnnotated };
-	if (citationTraceability < QUALITY_GATE_THRESHOLDS.citationTraceability) {
-		return { ok: false, reason: "Citation traceability " + citationTraceability.toFixed(2) + " < threshold " + QUALITY_GATE_THRESHOLDS.citationTraceability + " — too few data points carry a URL/path citation.", metrics };
+	const citationBar = taskType ? (CITATION_TRACEABILITY_BY_TASK_TYPE[taskType] ?? QUALITY_GATE_THRESHOLDS.citationTraceability) : QUALITY_GATE_THRESHOLDS.citationTraceability;
+	if (citationTraceability < citationBar) {
+		return { ok: false, reason: "Citation traceability " + citationTraceability.toFixed(2) + " < threshold " + citationBar + " (taskType=" + (taskType ?? "undefined") + ") — too few data points carry a URL/path citation.", metrics };
 	}
 	if (sourceDiversity < QUALITY_GATE_THRESHOLDS.sourceDiversity) {
 		return { ok: false, reason: "Source diversity " + sourceDiversity + " < threshold " + QUALITY_GATE_THRESHOLDS.sourceDiversity + " — not enough distinct sources.", metrics };

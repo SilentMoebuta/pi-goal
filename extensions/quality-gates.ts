@@ -6,11 +6,24 @@
 // 注: checkSpawnCoverage 需 hook spawn_role/dag_execute 调用计数,复杂,留 Phase 2。
 
 /** Citation-traceability ratio: fraction of "data point" sentences that carry
- *  a URL or file-path citation. Heuristic (sentence-split by 。/./；/;), meant
- *  as a reviewer checklist input, not a hard gate. Returns [0, 1]. */
+ *  a URL or file-path citation. Heuristic (sentence-split), meant as a reviewer
+ *  checklist input, not a hard gate. Returns [0, 1].
+ *
+ *  G4 (CLM 二次 live 测试复盘): the original splitter /[。.；;\n]/ had two bugs that
+ *  inflated the denominator and trapped analysis reports below the 0.3 gate:
+ *    1. \n split every markdown structural line (headers, |---|, blockquotes) into
+ *       a "clause" — most carry no URL, diluting the ratio.
+ *    2. bare '.' split URLs: "http://a.com" → ["http://a", "com"], so one cited
+ *       sentence became 2 clauses (1 cited) → ratio ~0.33 for fully-cited text.
+ *  Fix: split only on Chinese sentence enders 。；; and a period ONLY when followed
+ *  by whitespace or end-of-string (\s|$), so URLs with dots stay one clause.
+ *  Measured on the real CLM report: 0.21 (old) → 0.655 (fixed), robustly >0.3. */
 export function checkCitationTraceability(text: string): number {
-	// Split into clauses by common Chinese/English sentence separators.
-	const clauses = text.split(/[。.；;\n]/).map((s) => s.trim()).filter((s) => s.length > 0);
+	// Split on Chinese/English sentence enders. Period only counts as a sentence end
+	// when followed by whitespace or end-of-string, so URLs (http://a.b.c) stay intact.
+	// Non-capturing group: a capturing group would inject the separator into the result
+	// array (and undefined when $ matches), creating phantom clauses.
+	const clauses = text.split(/[。；;]|\.(?:\s|$)/).map((s) => s.trim()).filter((s) => s.length > 0);
 	if (clauses.length === 0) return 0;
 	// URL (http/https) or file-path-like (word/word.ext with slash, or .md/.pdf/.json suffix)
 	const hasCitation = (s: string) =>

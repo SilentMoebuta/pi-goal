@@ -32,6 +32,40 @@ describe("checkCitationTraceability — 引用可溯率 (URL/路径占比)", () 
 		const r = checkCitationTraceability(text);
 		assert.ok(r >= 0 && r <= 1, `ratio should be in [0,1], got ${r}`);
 	});
+
+	// G4 (CLM 二次 live 测试): bare '.' splitter broke URLs (http://a.com → 2 clauses),
+	// inflating denominator. Fix: split only on 。；; and period-when-followed-by-space/end,
+	// so URLs with dots stay one clause. Regression guard.
+	it("G4: does not split URLs containing dots (URL stays one clause, cited)", () => {
+		const text = "数据见 http://example.com/report.html 第5节。";
+		assert.equal(checkCitationTraceability(text), 1, "single cited clause → ratio 1.0 (was ~0.33 with bare '.' splitter)");
+	});
+
+	it("G4: does not treat \n as a clause separator (markdown structural lines must not inflate denominator)", () => {
+		// Two data lines joined by newline, both cited. With \n in splitter this became
+		// 4+ clauses (incl. empty fragments), diluting ratio. Without \n it's 2 cited clauses.
+		const text = "数据1见 http://a.com 。\n数据2见 http://b.com 。";
+		const r = checkCitationTraceability(text);
+		assert.equal(r, 1, "two cited clauses → ratio 1.0 (\n must not split)");
+	});
+
+	it("G4: CLM-style mixed report (cited data + analysis prose) passes >=0.3 with URL-intact splitter", () => {
+		// Regression for the CLM 二次 live 测试 failure (0.21 with bare '.' + \n splitter).
+		// Root cause: '.' split broke URLs (http://a.com → 2 clauses) + \n split every
+		// markdown line. Fix: split only on 。；; and period-when-followed-by-space.
+		// Note: analysis prose without citations still counts toward denominator, but
+		// with URLs intact the cited data claims dominate — no need for fragile
+		// analysis-prose exclusion (YAGNI; real CLM report measures 0.655 with this fix).
+		const text = [
+			"Deloitte 报告显示全球合同管理年损失 $2T (置信度：高)。来源 http://deloitte.com/a.html 。",
+			"WorldCC 调研 9.2% 收入泄漏 (置信度：高)。来源 http://worldcc.com/b.html 。",
+			"Stanford RegLab AI 幻觉率 17-33%。来源 http://stanford.edu/c.html 。",
+			"本节基于上述数据识别五个产品机会。", // analysis prose
+			"推荐 MVP 选智能履约追踪 Agent。",   // analysis prose
+		].join(" \n");
+		const r = checkCitationTraceability(text);
+		assert.ok(r >= 0.3, `CLM-style mixed report should pass >=0.3 with URL-intact splitter, got ${r.toFixed(3)}`);
+	});
 });
 
 describe("checkSourceDiversity — 来源多样性 (域名/机构数)", () => {

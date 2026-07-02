@@ -51,3 +51,36 @@ describe("verifyQualityGates — 第3条 quality-gates 接线 (重跑验真伪)"
 		assert.equal(verifyQualityGates("").ok, false);
 	});
 });
+
+// G4 (CLM 二次 live 测试): citation-traceability threshold graded by taskType.
+// research reports are data-dense (high citation bar); pm reports are analysis-dense
+// (PRD/roadmap/优先级 legitimately cite fewer external sources). A single 0.3 bar
+// mis-scores analysis-heavy work. Fix: per-taskType threshold (research 0.3, pm 0.2,
+// review 0.3); undefined/legacy falls back to the default 0.3 (backward-compat).
+describe("verifyQualityGates — G4 taskType-graded citation threshold", () => {
+	// A report with ~0.25 traceability: 4 clauses, 1 cited (analysis-heavy, pm-style).
+	// The cited clause carries 3 distinct domains so sourceDiversity (>=3) is NOT the
+	// differentiator — only citationTraceability varies between taskType thresholds.
+	const pmStyleReport = [
+		"数据见 http://a.com http://b.com http://c.com （置信度：高）。", // cited, 3 sources
+		"推荐 MVP 选智能履约追踪 Agent。",       // analysis
+		"本产品机会差异化在于场景化。",         // analysis
+		"第三阶段计划连接 ERP 系统。",         // analysis
+	].join(" ");
+
+	it("research taskType keeps the strict 0.3 bar (analysis-heavy report fails)", () => {
+		const r = verifyQualityGates(pmStyleReport, "research");
+		assert.equal(r.ok, false, "research bar is 0.3, this ~0.25 report should fail");
+		assert.match(r.reason ?? "", /citation|引用|traceab/i);
+	});
+
+	it("pm taskType uses the relaxed 0.2 bar (same analysis-heavy report passes)", () => {
+		const r = verifyQualityGates(pmStyleReport, "pm");
+		assert.equal(r.ok, true, `pm bar is 0.2, this ~0.25 report should pass, reason: ${r.reason}`);
+	});
+
+	it("undefined taskType falls back to default 0.3 (backward-compat for legacy callers)", () => {
+		const r = verifyQualityGates(pmStyleReport); // no taskType
+		assert.equal(r.ok, false, "undefined taskType → default 0.3 bar → this report fails");
+	});
+});

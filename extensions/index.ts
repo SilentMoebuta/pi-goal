@@ -1119,7 +1119,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 						} catch (e) {
 							return { content: [{ type: "text", text: "reviewerVerdict.reportPath unreadable: " + verdict.reportPath + " (" + (e as Error).message + "). Cannot re-verify quality gates (第3条)." }], isError: true, details: {} };
 						}
-						const qg = verifyQualityGates(reportText);
+						const qg = verifyQualityGates(reportText, goal.taskType);
 						if (!qg.ok) {
 							return { content: [{ type: "text", text: "Quality gates re-verify FAILED (第3条, not trusting reviewer self-report): " + (qg.reason ?? "unknown") + ". Report does not meet citation/source/confidence thresholds." }], isError: true, details: { metrics: qg.metrics } };
 						}
