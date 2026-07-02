@@ -48,8 +48,20 @@ describe("canComplete — reviewer gate for non-coding goals (深修 D)", () => 
 			assert.ok(r.reason?.match(/reviewer/i), `reason should mention reviewer, got: ${r.reason}`);
 		});
 
-		it(`passes ${t} goal after reviewer APPROVE (reviewerPassed=true)`, () => {
-			const goal = makeGoal({ taskType: t, reviewerPassed: true });
+		it(`rejects ${t} goal with reviewerPassed=true but NO reviewerVerdict (第2条: 裸布尔不再够)`, () => {
+			const goal = makeGoal({ taskType: t, reviewerPassed: true, reviewerVerdict: undefined });
+			const r = canComplete(goal);
+			assert.equal(r.ok, false);
+			assert.ok(r.reason?.match(/verdict/i), `should demand verdict, got: ${r.reason}`);
+		});
+
+		it(`rejects ${t} goal with reviewerVerdict failing contract (shallow thinking)`, () => {
+			const goal = makeGoal({ taskType: t, reviewerPassed: true, reviewerVerdict: { thinkingLevel: "low", verifiedSources: 1, checksPassed: true } });
+			assert.equal(canComplete(goal).ok, false);
+		});
+
+		it(`passes ${t} goal after reviewer APPROVE with valid verdict (第2条)`, () => {
+			const goal = makeGoal({ taskType: t, reviewerPassed: true, reviewerVerdict: { model: "x/y", thinkingLevel: "medium", verifiedSources: 3, checksPassed: true } });
 			assert.equal(canComplete(goal).ok, true);
 		});
 	}
@@ -63,6 +75,11 @@ describe("canComplete — backward-compat (coding/undefined have no reviewer gat
 
 	it("undefined taskType (legacy) passes without reviewer APPROVE", () => {
 		const goal = makeGoal({ taskType: undefined, reviewerPassed: false });
+		assert.equal(canComplete(goal).ok, true);
+	});
+
+	it("coding goal passes with reviewerPassed=true but no verdict (backward-compat, 第2条只约束非 coding)", () => {
+		const goal = makeGoal({ taskType: "coding", reviewerPassed: true, reviewerVerdict: undefined });
 		assert.equal(canComplete(goal).ok, true);
 	});
 });

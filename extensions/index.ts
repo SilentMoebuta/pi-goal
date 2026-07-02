@@ -17,6 +17,7 @@
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
+import * as fs from "node:fs";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -24,7 +25,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, type GoalConfig, type GoalStatus } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, verifyQualityGates, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -62,6 +63,8 @@ interface GoalState {
 	// 深修 D/A: per-goal task type + reviewer gate. undefined = legacy (backward-compat).
 	taskType?: "coding" | "research" | "pm" | "review";
 	reviewerPassed?: boolean;
+	// 第2条: 结构化验收凭证, canComplete 验契约. 非 coding goal reviewerPassed=true 时必携.
+	reviewerVerdict?: ReviewerVerdict;
 	// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
 	executionMode?: "single" | "orchestrated";
 }
@@ -1071,6 +1074,17 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			// 深修 D: reviewer APPROVE writeback. Set true after an independent reviewer
 			// (subagent ≠ producer) approves — opens the complete gate for non-coding goals.
 			reviewerPassed: Type.Optional(Type.Boolean({ description: "Set true after independent reviewer APPROVE (opens complete gate for non-coding goals)." })),
+			// 第2条: 结构化验收凭证. reviewerPassed=true (非 coding) 必携. 含 model/thinkingLevel/
+			// verifiedSources/checksPassed/reportPath. handler 读 reportPath 重跑 verifyQualityGates
+			// 验 checksPassed 真伪 (第3条), 防 reviewer 自报假数值.
+			reviewerVerdict: Type.Optional(Type.Object({
+				model: Type.Optional(Type.String()),
+				thinkingLevel: Type.Optional(Type.String()),
+				verifiedSources: Type.Number(),
+				checksPassed: Type.Boolean(),
+				reportPath: Type.Optional(Type.String()),
+				notes: Type.Optional(Type.String()),
+			})),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!goal) {
@@ -1087,7 +1101,36 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			}
 			// 深修 D: reviewer APPROVE writeback — flip reviewerPassed to open the complete gate.
 			if (params.reviewerPassed !== undefined) {
-				updateState({ reviewerPassed: params.reviewerPassed }, ctx);
+				// 第2+3条: reviewerPassed=true 须携 reviewerVerdict, 验契约 + 重跑 quality-gates 验真伪.
+				if (params.reviewerPassed && goal.taskType && goal.taskType !== "coding") {
+					const verdict = params.reviewerVerdict;
+					if (!verdict) {
+						return { content: [{ type: "text", text: "reviewerPassed=true for non-coding goal requires reviewerVerdict (model/thinkingLevel>=medium/verifiedSources>=3/checksPassed/reportPath). A bare boolean is no longer sufficient (第2条: prevents rubber-stamp review)." }], isError: true, details: {} };
+					}
+					const contract = validateReviewerVerdict(verdict);
+					if (!contract.ok) {
+						return { content: [{ type: "text", text: "Reviewer verdict contract not satisfied: " + (contract.reason ?? "unknown") }], isError: true, details: {} };
+					}
+					// 第3条: 读 reportPath 重跑 quality-gates, 验 reviewer 自报 checksPassed 真伪.
+					if (verdict.reportPath) {
+						let reportText = "";
+						try {
+							reportText = fs.readFileSync(verdict.reportPath, "utf8");
+						} catch (e) {
+							return { content: [{ type: "text", text: "reviewerVerdict.reportPath unreadable: " + verdict.reportPath + " (" + (e as Error).message + "). Cannot re-verify quality gates (第3条)." }], isError: true, details: {} };
+						}
+						const qg = verifyQualityGates(reportText);
+						if (!qg.ok) {
+							return { content: [{ type: "text", text: "Quality gates re-verify FAILED (第3条, not trusting reviewer self-report): " + (qg.reason ?? "unknown") + ". Report does not meet citation/source/confidence thresholds." }], isError: true, details: { metrics: qg.metrics } };
+						}
+						if (!verdict.checksPassed) {
+							return { content: [{ type: "text", text: "reviewerVerdict.checksPassed=false but quality gates re-verify passed — reviewer mis-reported. Set checksPassed=true." }], isError: true, details: {} };
+						}
+					}
+					updateState({ reviewerPassed: params.reviewerPassed, reviewerVerdict: verdict }, ctx);
+				} else {
+					updateState({ reviewerPassed: params.reviewerPassed }, ctx);
+				}
 				return { content: [{ type: "text", text: "Reviewer gate " + (params.reviewerPassed ? "OPENED (approved)" : "CLOSED (rejected)") + "." }], details: { reviewerPassed: params.reviewerPassed } };
 			}
 			if (params.status === "complete") {

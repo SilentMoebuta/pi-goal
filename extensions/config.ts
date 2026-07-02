@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { checkCitationTraceability, checkSourceDiversity, checkConfidenceAnnotation } from "./quality-gates";
 
 export interface GoalConfig {
 	/** Inject superpowers workflow discipline (skill mapping, HARD-GATE,
@@ -218,8 +219,78 @@ export interface CompletableGoal {
 	/** True only after an independent reviewer (subagent ≠ producer) has
 	 *  APPROVED. Non-coding goals require this to complete. */
 	reviewerPassed?: boolean;
+	/** 第2条: 结构化验收凭证, 替代裸布尔. 非 coding goal reviewerPassed=true 时
+	 *  必须携带, canComplete 验契约满足. undefined = 未提供 (非 coding 拒, coding 忽略). */
+	reviewerVerdict?: ReviewerVerdict;
 	/** Criteria with their collected evidence (existing field). */
 	criteria: { evidence: string[] }[];
+}
+
+/** 第3条 (CLM run 复盘): verifyQualityGates — 接线 quality-gates.ts 三个死函数.
+ *  Root cause: checkCitationTraceability/checkSourceDiversity/checkConfidenceAnnotation
+ *  定义了但无人调 (handoff §八 根因5 残余). Fix: 此纯函数调它们, update_goal handler
+ *  在 reviewerPassed=true 时读 reportPath 重跑, 验 reviewer 自报 checksPassed 真伪.
+ *  不信任 reviewer 自报 (第2条: reviewer 可廉价满足). 阈值: traceability>=0.3,
+ *  diversity>=3, confidenceAnnotated=true. 阈值依据: 本次 CLM 报告实测 (15 URL,
+ *  多源) 刚好过线; 过松=形同虚设, 过紧=误杀. 可调 (常量集中此处).
+ *  Returns {ok, reason?, metrics?}. metrics 供 handler 写回 verdict 供审计. */
+export const QUALITY_GATE_THRESHOLDS = { citationTraceability: 0.3, sourceDiversity: 3 } as const;
+
+export interface QualityGateMetrics {
+	citationTraceability: number;
+	sourceDiversity: number;
+	confidenceAnnotated: boolean;
+}
+
+export function verifyQualityGates(reportText: string): { ok: boolean; reason?: string; metrics?: QualityGateMetrics } {
+	if (!reportText || reportText.trim().length === 0) return { ok: false, reason: "Report text is empty — nothing to verify." };
+	const citationTraceability = checkCitationTraceability(reportText);
+	const sourceDiversity = checkSourceDiversity(reportText);
+	const confidenceAnnotated = checkConfidenceAnnotation(reportText);
+	const metrics: QualityGateMetrics = { citationTraceability, sourceDiversity, confidenceAnnotated };
+	if (citationTraceability < QUALITY_GATE_THRESHOLDS.citationTraceability) {
+		return { ok: false, reason: "Citation traceability " + citationTraceability.toFixed(2) + " < threshold " + QUALITY_GATE_THRESHOLDS.citationTraceability + " — too few data points carry a URL/path citation.", metrics };
+	}
+	if (sourceDiversity < QUALITY_GATE_THRESHOLDS.sourceDiversity) {
+		return { ok: false, reason: "Source diversity " + sourceDiversity + " < threshold " + QUALITY_GATE_THRESHOLDS.sourceDiversity + " — not enough distinct sources.", metrics };
+	}
+	if (!confidenceAnnotated) {
+		return { ok: false, reason: "No confidence annotation found — report must mark 置信度 (高/中/低/猜测) on data points.", metrics };
+	}
+	return { ok: true, metrics };
+}
+
+/** 第2条 (CLM run 复盘): reviewer verdict — 结构化验收凭证, 替代裸布尔 reviewerPassed.
+ *  Root cause: reviewerPassed 是裸布尔, main agent 说 true 就 true, 框架不知 reviewer 用了
+ *  什么配置/验了多少源——reviewer 可被廉价满足 (浅模型+low thinking+不验源, 读结构 APPROVE).
+ *  handoff §八 根因2. Fix: reviewerPassed=true 须携带此 verdict, canComplete 验契约满足.
+ *  契约: thinking≥medium (独立验收要够思考), verifiedSources≥3 (验源下限), model 非空,
+ *  checksPassed=true (第3条 quality-gates 机器项). notes=reviewer 主观判断 (不可机器验项).
+ *  软约束: verdict 由 reviewer LLM 填, 但 update_goal handler 重跑 quality-gates 验真伪 (第3条). */
+export interface ReviewerVerdict {
+	/** reviewer 用的模型 (provider/model-id 或 bare id). 非空=声明用了真模型. */
+	model?: string;
+	/** thinking level: low/medium/high/xhigh. <medium 拒 (独立验收不能浅思考). */
+	thinkingLevel?: string;
+	/** reviewer 实际独立验源的 URL/路径数. <3 拒 (验源下限). */
+	verifiedSources: number;
+	/** quality-gates 机器项是否全过 (第3条). reviewer 报, handler 重跑验真伪. */
+	checksPassed: boolean;
+	/** 报告产物路径, update_goal handler 读它重跑 quality-gates 验 checksPassed 真伪. */
+	reportPath?: string;
+	/** reviewer 主观判断 (判断可信度/循环论证等不可机器验项). */
+	notes?: string;
+}
+
+/** 第2条: validate reviewer verdict 契约. Pure + unit-testable. Returns {ok, reason?}.
+ *  Empty/undefined verdict → ok=false (caller 区分 "未传" vs "传了但不达标"). */
+export function validateReviewerVerdict(v: ReviewerVerdict): { ok: boolean; reason?: string } {
+	if (!v.model) return { ok: false, reason: "Reviewer verdict missing model — cannot confirm a real model was used." };
+	const thinkingOk = v.thinkingLevel && ["medium", "high", "xhigh"].includes(v.thinkingLevel);
+	if (!thinkingOk) return { ok: false, reason: "Reviewer thinkingLevel must be >= medium (got " + (v.thinkingLevel ?? "undefined") + ") — independent review cannot be shallow (handoff §八 root cause 2)." };
+	if (typeof v.verifiedSources !== "number" || v.verifiedSources < 3) return { ok: false, reason: "Reviewer verifiedSources must be >= 3 (got " + v.verifiedSources + ") — 验源下限, prevents rubber-stamp review." };
+	if (!v.checksPassed) return { ok: false, reason: "Reviewer checksPassed=false — machine-verifiable quality gates (citation traceability / source diversity / confidence annotation) not satisfied." };
+	return { ok: true };
 }
 
 /** 第1条 (CLM run 复盘): validate a goal proposal BEFORE setGoal. Pure + unit-
@@ -265,6 +336,15 @@ export function canComplete(goal: CompletableGoal): { ok: boolean; reason?: stri
 			ok: false,
 			reason: "Non-coding goal (taskType=" + goal.taskType + ") requires independent reviewer APPROVE before complete. Spawn a reviewer (reviewer ≠ producer) and have it submit its verdict, then the gate opens. Root cause addressed: prevent main-agent self-review (循环论证).",
 		};
+	}
+	// 第2条: reviewerPassed=true 须携带结构化 verdict, 验契约满足. 裸布尔不再够
+	// (CLM run 复盘: 浅 reviewer 橡皮图章 APPROVE). coding/undefined 无此检查 (backward-compat).
+	if (goal.taskType && goal.taskType !== "coding" && goal.reviewerPassed) {
+		if (!goal.reviewerVerdict) {
+			return { ok: false, reason: "Non-coding goal reviewerPassed=true but no reviewerVerdict provided — a bare boolean is no longer sufficient (第2条: prevents rubber-stamp review). Re-spawn reviewer with a structured verdict (model/thinkingLevel>=medium/verifiedSources>=3/checksPassed)." };
+		}
+		const v = validateReviewerVerdict(goal.reviewerVerdict);
+		if (!v.ok) return { ok: false, reason: "Reviewer verdict contract not satisfied: " + (v.reason ?? "unknown") };
 	}
 	return { ok: true };
 }
