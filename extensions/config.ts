@@ -170,14 +170,17 @@ const CODING_GOVERNANCE =
 
 const RESEARCH_GOVERNANCE =
 	"\n\n## Research 模式规则 (taskType=research)\n" +
-	"调研类任务不套 superpowers coding 门（无 TDD/HARD-GATE），按 research workflow 走：\n" +
+	"调研类任务不套 superpowers coding 门（无 TDD），但 research workflow 阶段是 HARD-GATE：\n" +
 	"1. 计划：列出 ≥3 个独立研究角度（多角度并发，单 agent 串行 = 偷懒信号）\n" +
 	"2. 采集：每条数据标注来源（URL/文件路径）+ 置信度（高/中/低/猜测）\n" +
-	"3. 交叉验证：关键数据用 ≥2 个独立来源佐证，二手编译数据追源头\n" +
+	"3. 交叉验证：关键数据用 ≥2 个独立来源佐证，二手编译数据追源头 — 跳过此阶段=违约\n" +
 	"4. 综合：诚实标注数据/推理/假设的边界\n" +
 	"5. reviewer 验引用：完成前 spawn 独立 reviewer 审引用可溯率 + 判断可信度（reviewer ≠ 产出者）\n\n" +
-	"质量门（reviewer 检查清单）：引用可溯率（URL/路径占比）、来源多样性（域名/机构数）、置信度标注完整性、是否循环论证。\n" +
-	"禁止的反模式：自评自己写的报告（循环论证）、单源断言、拍脑袋置信度。\n";
+	"⚠️ 阶段 HARD-GATE: criteria 对应阶段产物, evidence 必须分阶段提交 (criterionId 标记阶段).\n" +
+	"跳过交叉验证 (阶段 3) 直接综合 = 违约, reviewer 会拒 (第2条). 机器形式验: criteria>=3 +\n" +
+	"evidence 全覆盖; 实质验 (per-claim >=2 源) 靠 reviewer, 不可机器化 (根因5残余, 诚实标注).\n\n" +
+	"质量门（reviewer 检查清单 + update_goal 重跑验真伪）: 引用可溯率 (URL/路径占比 >=0.3)、来源多样性 (>=3)、置信度标注完整性、是否循环论证。\n" +
+	"禁止的反模式：自评自己写的报告（循环论证）、单源断言、拍脑袋置信度、跳过交叉验证。\n";
 
 const PM_GOVERNANCE =
 	"\n\n## PM 模式规则 (taskType=pm)\n" +
@@ -300,12 +303,20 @@ export function validateReviewerVerdict(v: ReviewerVerdict): { ok: boolean; reas
  *  executionMode 不可缺省, 必须显式选 single|orchestrated. coding/undefined 不变
  *  (backward-compat). 不硬 deny single — 执行权保留, 但逼 main agent 做这个判断.
  *  Returns {ok, reason?}. Empty input (legacy coding goal) → ok. */
-export function validateGoalProposal(input: { taskType?: string; executionMode?: string }): { ok: boolean; reason?: string } {
+export function validateGoalProposal(input: { taskType?: string; executionMode?: string; criteria?: string[] }): { ok: boolean; reason?: string } {
 	const nonCoding = input.taskType && input.taskType !== "coding";
 	if (nonCoding && !input.executionMode) {
 		return {
 			ok: false,
 			reason: "Non-coding taskType (" + input.taskType + ") requires an explicit executionMode (\"single\" for main-agent direct execution, or \"orchestrated\" for role-based delegation). Omitting it defaults to single — a structural bias toward treating complex tasks as simple (handoff §八). Choose explicitly.",
+		};
+	}
+	// 第5条: research 阶段 HARD-GATE (形式). criteria >=3 对应 plan/collect/cross-validate
+	// 阶段产物. 诚实: 形式验非实质验, per-claim 交叉验证靠 reviewer (根因5残余).
+	if (input.taskType === "research" && input.criteria && input.criteria.length < 3) {
+		return {
+			ok: false,
+			reason: "Research goal requires >= 3 criteria (corresponding to plan/collect/cross-validate stage artifacts). Fewer = skipping research workflow stages (handoff §八 第5条).",
 		};
 	}
 	return { ok: true };

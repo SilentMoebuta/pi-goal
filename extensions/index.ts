@@ -1171,7 +1171,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			// 第1条: 非 coding taskType 必须显式 executionMode (治"判简单"偏见).
-			const proposalCheck = validateGoalProposal({ taskType: params.taskType, executionMode: params.executionMode });
+			const proposalCheck = validateGoalProposal({ taskType: params.taskType, executionMode: params.executionMode, criteria: params.criteria });
 			if (!proposalCheck.ok) {
 				return { content: [{ type: "text", text: proposalCheck.reason ?? "Invalid goal proposal." }], isError: true, details: {} };
 			}

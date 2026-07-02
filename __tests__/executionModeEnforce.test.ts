@@ -49,3 +49,25 @@ describe("validateGoalProposal — 第1条 executionMode 强制 (非 coding)", (
 		assert.equal(r.ok, true);
 	});
 });
+
+// 第5条: research 阶段无 HARD-GATE (CLM run 复盘).
+// 根因: RESEARCH_GOVERNANCE 是 prompt 文字 (计划→采集→交叉验证→综合→reviewer), 无阶段
+// gate 强制——main agent 走 collect→synthesize 跳过交叉验证, 无东西拦 (handoff §八 根因1).
+// 诚实标注: per-claim 交叉验证实质不可机器验 (根因5残余), 只能靠 reviewer (第2条已强化) +
+// prompt. 机器能做的形式 gate: research goal criteria >=3 (对应 plan/collect/cross-validate
+// 阶段产物), evidence 全覆盖 (现有 evidence gate). 形式验非实质验.
+describe("validateGoalProposal — 第5条 research 阶段 HARD-GATE (形式)", () => {
+	it("rejects research goal with < 3 criteria (need plan/collect/cross-validate stage artifacts)", () => {
+		const r = validateGoalProposal({ taskType: "research", executionMode: "single", criteria: ["a", "b"] });
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /criteria|>= ?3|阶段/i);
+	});
+	it("accepts research goal with >= 3 criteria", () => {
+		const r = validateGoalProposal({ taskType: "research", executionMode: "single", criteria: ["a", "b", "c"] });
+		assert.equal(r.ok, true);
+	});
+	it("does not enforce criteria count for coding goals (backward-compat)", () => {
+		const r = validateGoalProposal({ taskType: "coding", criteria: ["a"] });
+		assert.equal(r.ok, true);
+	});
+});
