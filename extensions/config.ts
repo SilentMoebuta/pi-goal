@@ -222,6 +222,24 @@ export interface CompletableGoal {
 	criteria: { evidence: string[] }[];
 }
 
+/** 第1条 (CLM run 复盘): validate a goal proposal BEFORE setGoal. Pure + unit-
+ *  testable. Root cause: executionMode 缺省=undefined=single, 非 coding 任务默认走
+ *  single, orchestratorConstraintBlock 不触发, main agent 直执成默认——"把复杂任务
+ *  判成简单"的结构性偏见 (handoff §八 根因1+3). Fix: 非 coding taskType 时
+ *  executionMode 不可缺省, 必须显式选 single|orchestrated. coding/undefined 不变
+ *  (backward-compat). 不硬 deny single — 执行权保留, 但逼 main agent 做这个判断.
+ *  Returns {ok, reason?}. Empty input (legacy coding goal) → ok. */
+export function validateGoalProposal(input: { taskType?: string; executionMode?: string }): { ok: boolean; reason?: string } {
+	const nonCoding = input.taskType && input.taskType !== "coding";
+	if (nonCoding && !input.executionMode) {
+		return {
+			ok: false,
+			reason: "Non-coding taskType (" + input.taskType + ") requires an explicit executionMode (\"single\" for main-agent direct execution, or \"orchestrated\" for role-based delegation). Omitting it defaults to single — a structural bias toward treating complex tasks as simple (handoff §八). Choose explicitly.",
+		};
+	}
+	return { ok: true };
+}
+
 /** Gate checked before a goal may transition to "complete". Pure + unit-
  *  testable. Called by both complete paths:
  *    1. update_goal({status:"complete"}) — index.ts update_goal handler

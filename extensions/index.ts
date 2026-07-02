@@ -24,7 +24,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, type GoalConfig, type GoalStatus } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, type GoalConfig, type GoalStatus } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1127,6 +1127,11 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			executionMode: Type.Optional(StringEnum(["single", "orchestrated"] as const)),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			// 第1条: 非 coding taskType 必须显式 executionMode (治"判简单"偏见).
+			const proposalCheck = validateGoalProposal({ taskType: params.taskType, executionMode: params.executionMode });
+			if (!proposalCheck.ok) {
+				return { content: [{ type: "text", text: proposalCheck.reason ?? "Invalid goal proposal." }], isError: true, details: {} };
+			}
 			if (!ctx.hasUI) {
 				if (goal) return { content: [{ type: "text", text: "A goal is already set (status: " + goal.status + "). Clear it first." }], isError: true, details: {} };
 				setGoal(params.objective, params.criteria, params.constraints ?? [], { taskType: params.taskType, executionMode: params.executionMode }, ctx);
