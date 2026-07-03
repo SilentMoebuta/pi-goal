@@ -74,4 +74,15 @@ describe("taskGovernanceBlock — per-task-type governance (深修 C)", () => {
 		// undefined falls back to coding governance
 		assert.ok(block.includes("superpowers") || block.includes("TDD") || block.includes("阶段"), `undefined should fall back to coding, got: ${block.slice(0, 200)}`);
 	});
+
+	it("research/pm/review governance 含 reviewer roleDef 聚焦规范 (教训14: 避 doom-loop)", () => {
+		for (const t of ["research", "pm", "review"] as const) {
+			const block = taskGovernanceBlock(t);
+			assert.ok(block.includes("doom-loop"), `${t} governance should warn about doom-loop (教训14), got: ${block.slice(0, 300)}`);
+			assert.ok(block.includes("report_role_result"), `${t} governance should mention report_role_result as the focused report tool, got: ${block.slice(0, 300)}`);
+			assert.ok(/maxTurns|禁探索/.test(block), `${t} governance should mention maxTurns or 禁探索性调用, got: ${block.slice(0, 300)}`);
+		}
+		// coding governance should NOT carry the reviewer-roleDef hint (no reviewer gate for coding)
+		assert.ok(!taskGovernanceBlock("coding").includes("doom-loop"), "coding governance should not carry reviewer-roleDef hint (no reviewer gate)");
+	});
 });

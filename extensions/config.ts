@@ -168,6 +168,12 @@ const CODING_GOVERNANCE =
 	"3. 未获审批（用户或 reviewer）前不得跨阶段\n" +
 	"4. 禁止的反模式：跳过设计直接写代码、先实现后补测试、跳过审查\n";
 
+/** 教训14 (§十三 v2 abort→v3 聚焦): reviewer roleDef prompt 聚焦规范避 doom-loop.
+ *  v2 (含 curl/dig URL probing + ls/find 目录探索) 触发 doom-loop detector 误报 abort;
+ *  v3 (聚焦: read 指定段 + grep + report_role_result, 无探索) completed 干净. 注入三块非 coding governance. */
+const REVIEWER_ROLEDEF_HINT =
+	"\n   ⚠️ reviewer roleDef 聚焦规范 (教训14, 避 doom-loop): 明确限定工具调用序列 (如 read 指定段 + grep + report_role_result), 禁探索性调用 (curl/dig URL probing / ls/find 目录探索会触发 doom-loop detector 误报 abort), maxTurns 适中 (15-30; 复杂审计≥25).";
+
 const RESEARCH_GOVERNANCE =
 	"\n\n## Research 模式规则 (taskType=research)\n" +
 	"调研类任务不套 superpowers coding 门（无 TDD），但 research workflow 阶段是 HARD-GATE：\n" +
@@ -180,7 +186,7 @@ const RESEARCH_GOVERNANCE =
 	"跳过交叉验证 (阶段 3) 直接综合 = 违约, reviewer 会拒 (第2条). 机器形式验: criteria>=3 +\n" +
 	"evidence 全覆盖; 实质验 (per-claim >=2 源) 靠 reviewer, 不可机器化 (根因5残余, 诚实标注).\n\n" +
 	"质量门（reviewer 检查清单 + update_goal 重跑验真伪）: 引用可溯率 (URL/路径占比 >=0.3)、来源多样性 (>=3)、置信度标注完整性、是否循环论证。\n" +
-	"禁止的反模式：自评自己写的报告（循环论证）、单源断言、拍脑袋置信度、跳过交叉验证。\n";
+	"禁止的反模式：自评自己写的报告（循环论证）、单源断言、拍脑袋置信度、跳过交叉验证。\n" + REVIEWER_ROLEDEF_HINT;
 
 const PM_GOVERNANCE =
 	"\n\n## PM 模式规则 (taskType=pm)\n" +
@@ -190,7 +196,7 @@ const PM_GOVERNANCE =
 	"3. 机会：3-5 个，每个含技术可行性/业界现状/差异化/风险\n" +
 	"4. 优先级：用户价值×可行性×差异化，MVP 边界（做/不做）+ 成功指标（领域特化）\n" +
 	"5. reviewer 验论证：完成前 spawn 独立 reviewer 审机会是否有据、优先级是否合理、假设是否标注\n\n" +
-	"禁止的反模式：纯口号式建议（如\"用 AI 做合同管理\"）、无数据支撑的判断、自评自审。\n";
+	"禁止的反模式：纯口号式建议（如\"用 AI 做合同管理\"）、无数据支撑的判断、自评自审。\n" + REVIEWER_ROLEDEF_HINT;
 
 const REVIEW_GOVERNANCE =
 	"\n\n## Review 模式规则 (taskType=review)\n" +
@@ -199,7 +205,7 @@ const REVIEW_GOVERNANCE =
 	"2. 证据：每条发现附文件行号/源码/测试输出\n" +
 	"3. 分级：critical/major/minor/nit，给修改建议\n" +
 	"4. reviewer 复核：完成前 spawn 独立 reviewer 复核审计覆盖度 + 分级合理性（reviewer ≠ 产出者）\n\n" +
-	"禁止的反模式：只夸不批、无证据的主观判断、跳过分级。\n";
+	"禁止的反模式：只夸不批、无证据的主观判断、跳过分级。\n" + REVIEWER_ROLEDEF_HINT;
 
 // ═══════════════════════════════════════════════════════════════════════
 // 深修 D: 独立 reviewer gate (非 coding goal 完成前强制 spawn reviewer)
