@@ -113,6 +113,37 @@ describe("checkCitationTraceability — 引用可溯率 (URL/路径占比)", () 
 		const r = checkCitationTraceability(text);
 		assert.ok(r >= 0.5, `quoted source excerpts should count as traceable, got ${r.toFixed(3)}`);
 	});
+
+	it("G6: full markdown table rows are stripped (shredded cells must not inflate denominator)", () => {
+		// A table row | cell | cell | with no 。 gets split into cell fragments, none
+		// carrying a URL, diluting the ratio. Table claims are re-stated in body prose,
+		// so stripping whole rows (not just separators) is safe.
+		const text = [
+			"结论1见 http://a.com 。",
+			"结论2见 http://b.com 。",
+			"",
+			"| 厂商 | 功能 | 来源 |",
+			"|---|---|---|",
+			"| Ironclad | AI Assist | http://ironclad.com |",
+			"| DocuSign | Review | http://docusign.com |",
+		].join("\n");
+		const r = checkCitationTraceability(text);
+		assert.ok(r >= 0.5, `table rows should not dilute ratio, got ${r.toFixed(3)}`);
+	});
+
+	it("G6: floor guard keeps tables when report is table-only (tables ARE its argument)", () => {
+		// A table-only report: stripping all rows would leave <10 clauses. The floor
+		// guard falls back to keeping tables so the report isn't scored as empty/0.
+		const text = [
+			"| 厂商 | 功能 | 来源 |",
+			"|---|---|---|",
+			"| Ironclad | AI Assist | http://ironclad.com |",
+			"| DocuSign | Review | http://docusign.com |",
+			"| Icertis | Playbook | http://icertis.com |",
+		].join("\n");
+		const r = checkCitationTraceability(text);
+		assert.ok(r > 0, `table-only report should not score 0 (floor guard), got ${r.toFixed(3)}`);
+	});
 });
 
 describe("checkSourceDiversity — 来源多样性 (域名/机构数)", () => {

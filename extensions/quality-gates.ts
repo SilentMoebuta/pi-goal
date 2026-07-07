@@ -26,15 +26,23 @@ export function checkCitationTraceability(text: string): number {
 	// 1 denominator unit, while 100 stacked URLs with no 。 between them collapse into
 	// 1 clause, so the ratio drops). Real reviewer report measured 0.25 with 105 source
 	// URLs appended — strictly worse than 0.27 with 45.
-	// Fix: strip structural lines before clause-splitting, and drop pure-citation index
-	// lines (lines that are only URLs/paths, optionally list-marked) from the
-	// denominator — they ARE references, not argument clauses needing a citation.
-	const stripped = text
+	// G6 (同 live 复盘续): full markdown table rows (| cell | cell |) get shredded by 。/.
+	// splitting into many tiny cell-fragments, none carrying a URL — these are structured
+	// data presentations whose claims are re-stated in body prose, not argument clauses.
+	// Strip whole table rows too, with a floor guard: if stripping leaves <10 clauses,
+	// the report is table-only and tables ARE its argument — skip stripping.
+	const stripTableRows = (t: string) => t.replace(/^\|.*\|\s*$/gm, "");
+	let strippedBase = text
 		.replace(/^```[^\n]*\n[\s\S]*?\n```\s*$/gm, "")        // fenced code blocks
 		.replace(/^---\n[\s\S]*?\n---\s*\n/gm, "")           // YAML frontmatter
-		.replace(/^\|[-:\s|]+\|\s*$/gm, "")                  // table separator rows |---|---|
-		.replace(/^#{1,6}\s+.*$/gm, "")                      // pure heading lines (not argument clauses)
-		.replace(/^\s*[-*]?\s*(https?:\/\/\S+(\s+|$))+$/gm, ""); // pure-URL index lines (- url1 url2 ...)
+		.replace(/^#{1,6}\s+.*$/gm, "")                      // pure heading lines
+		.replace(/^\s*[-*]?\s*(https?:\/\/\S+(\s+|$))+$/gm, ""); // pure-URL index lines
+	const withoutTables = stripTableRows(strippedBase);
+	// Floor guard: only strip tables if enough prose remains; otherwise keep tables
+	// (a table-only report's rows ARE its argument clauses, shred-dilution notwithstanding).
+	const stripped = withoutTables.split(/[。；;]|\.(?:\s|$)/).map((s) => s.trim()).filter((s) => s.length > 0).length >= 10
+		? withoutTables
+		: strippedBase;
 	// Split on Chinese/English sentence enders. Period only counts as a sentence end
 	// when followed by whitespace or end-of-string, so URLs (http://a.b.c) stay intact.
 	// Non-capturing group: a capturing group would inject the separator into the result
