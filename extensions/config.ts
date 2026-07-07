@@ -138,14 +138,25 @@ export function taskGovernanceBlock(goalTaskType?: string): string {
  *  - 直接调 web_search/write/edit 执行实质工作 = 违约(可被 reviewer 检测)
  *  - 违约检测靠 reviewer 事后审查 + judge turn 级评估,不靠工具 deny
  *  主张: 执行权与验收权正交 — 简单任务(single)可直执,但验收必须独立。
- *  Returns empty string for single/undefined (no constraint, backward-compat). */
-export function orchestratorConstraintBlock(executionMode?: string): string {
-	if (executionMode !== "orchestrated") return "";
-	return "\n\n## Orchestrated 模式约束 (executionMode=orchestrated)\n" +
-		"你是编排者。执行工作必须 spawn role (researcher/coder/pm/reviewer)。\n" +
-		"直接调 web_search/write/edit 执行实质工作 = 违约 (可被 reviewer 检测)。\n" +
-		"违约检测靠 reviewer 事后审查 + judge turn 级评估 — 不硬 deny 工具 (执行权与验收权正交)。\n" +
-		"例外: 读文件/跑测试等编排辅助操作可直接调 (非实质执行工作)。\n";
+ *  G7 (single 自批禁): single 模式可保留,但 singleRationale 须交 reviewer 审,
+ *  不得自给理由自过 — 在 single+非 coding 时也注入提示 (不再空串).
+ *  Returns empty string for coding/undefined (no constraint, backward-compat). */
+export function orchestratorConstraintBlock(executionMode?: string, taskType?: string, singleRationale?: string): string {
+	const nonCoding = taskType && taskType !== "coding";
+	if (!nonCoding) return ""; // coding/undefined: 无约束 (backward-compat)
+	if (executionMode === "orchestrated") {
+		return "\n\n## Orchestrated 模式约束 (executionMode=orchestrated)\n" +
+			"你是编排者。执行工作必须 spawn role (researcher/coder/pm/reviewer)。\n" +
+			"直接调 web_search/write/edit 执行实质工作 = 违约 (可被 reviewer 检测)。\n" +
+			"违约检测靠 reviewer 事后审查 + judge turn 级评估 — 不硬 deny 工具 (执行权与验收权正交)。\n" +
+			"例外: 读文件/跑测试等编排辅助操作可直接调 (非实质执行工作)。\n";
+	}
+	// G7: single 模式提示 — 可直执但理由须交 reviewer 审, 不得自批.
+	return "\n\n## Single 模式约束 (executionMode=single, taskType=" + taskType + ")\n" +
+		"你选择 single 模式 (main agent 直执)。理由已声明: " + (singleRationale ? "" + singleRationale : "(未提供)") + "\n" +
+		"该理由将由独立 reviewer 审核是否成立 — 不得自给理由自己通过 (handoff §八: 不能自己给理由自己过)。\n" +
+		"若 reviewer 认为该任务不该 single (需 spawn 交叉验证/多角度), complete 会被拒。\n" +
+		"实质执行工作尽量 spawn role; 单 agent 串行做完整个 workflow = 违约信号。\n";
 }
 
 // Governance block texts (kept as module-level consts for testability + clarity)
@@ -231,6 +242,10 @@ export interface CompletableGoal {
 	/** 第2条: 结构化验收凭证, 替代裸布尔. 非 coding goal reviewerPassed=true 时
 	 *  必须携带, canComplete 验契约满足. undefined = 未提供 (非 coding 拒, coding 忽略). */
 	reviewerVerdict?: ReviewerVerdict;
+	/** G7 (single 自批禁): single 模式的理由, 起草时声明, 交 reviewer 审核. */
+	singleRationale?: string;
+	/** 深修 A: execution mode. single = main agent 直执 (须 singleRationale); orchestrated = spawn role. */
+	executionMode?: "single" | "orchestrated";
 	/** Criteria with their collected evidence (existing field). */
 	criteria: { evidence: string[] }[];
 }
@@ -302,6 +317,10 @@ export interface ReviewerVerdict {
 	reportPath?: string;
 	/** reviewer 主观判断 (判断可信度/循环论证等不可机器验项). */
 	notes?: string;
+	/** G7 (single 自批禁): single 模式时 reviewer 须独立审核 singleRationale 是否成立.
+	 *  true = reviewer 认可该任务确可由 main agent 单独完成 (理由充分且非自批).
+	 *  缺失/false = reviewer 认为该任务不该 single (须 spawn), canComplete 拒. */
+	singleRationaleApproved?: boolean;
 }
 
 /** 第2条: validate reviewer verdict 契约. Pure + unit-testable. Returns {ok, reason?}.
@@ -312,6 +331,21 @@ export function validateReviewerVerdict(v: ReviewerVerdict): { ok: boolean; reas
 	if (!thinkingOk) return { ok: false, reason: "Reviewer thinkingLevel must be >= medium (got " + (v.thinkingLevel ?? "undefined") + ") — independent review cannot be shallow (handoff §八 root cause 2)." };
 	if (typeof v.verifiedSources !== "number" || v.verifiedSources < 3) return { ok: false, reason: "Reviewer verifiedSources must be >= 3 (got " + v.verifiedSources + ") — 验源下限, prevents rubber-stamp review." };
 	if (!v.checksPassed) return { ok: false, reason: "Reviewer checksPassed=false — machine-verifiable quality gates (citation traceability / source diversity / confidence annotation) not satisfied." };
+	return { ok: true };
+}
+
+/** G7 (single 自批禁): single 模式的 singleRationale 须由独立 reviewer 审核, 不得自批.
+ *  返回 {ok} 表示 verdict 契约满足且 (若 goal 是 single 模式) rationale 已被 reviewer 认可.
+ *  呼叫方先调 validateReviewerVerdict 验契约, 再调此函数验 singleRationaleApproved. */
+export function validateSingleRationaleApproved(goal: CompletableGoal, verdict: ReviewerVerdict): { ok: boolean; reason?: string } {
+	if (goal.taskType && goal.taskType !== "coding" && goal.executionMode === "single") {
+		if (!verdict.singleRationaleApproved) {
+			return {
+				ok: false,
+				reason: "single executionMode requires the independent reviewer to approve singleRationaleApproved=true (the reviewer must independently judge the singleRationale is sound — not self-approved). Got false/missing. Root cause (handoff §八): 不能自己给理由自己过.",
+			};
+		}
+	}
 	return { ok: true };
 }
 
@@ -386,13 +420,24 @@ export function verifyReviewerSource(
  *  executionMode 不可缺省, 必须显式选 single|orchestrated. coding/undefined 不变
  *  (backward-compat). 不硬 deny single — 执行权保留, 但逼 main agent 做这个判断.
  *  Returns {ok, reason?}. Empty input (legacy coding goal) → ok. */
-export function validateGoalProposal(input: { taskType?: string; executionMode?: string; criteria?: string[] }): { ok: boolean; reason?: string } {
+export function validateGoalProposal(input: { taskType?: string; executionMode?: string; criteria?: string[]; singleRationale?: string }): { ok: boolean; reason?: string } {
 	const nonCoding = input.taskType && input.taskType !== "coding";
 	if (nonCoding && !input.executionMode) {
 		return {
 			ok: false,
 			reason: "Non-coding taskType (" + input.taskType + ") requires an explicit executionMode (\"single\" for main-agent direct execution, or \"orchestrated\" for role-based delegation). Omitting it defaults to single — a structural bias toward treating complex tasks as simple (handoff §八). Choose explicitly.",
 		};
+	}
+	// G7 (single 自批禁): single 模式须给出可独立审核的理由, 不得 main agent 自批自过.
+	// 理由 ≠ 空话: ≥30 字且须含具体依据 (任务规模/单点性/无外部依赖等), 由 reviewer 审.
+	if (input.taskType && input.taskType !== "coding" && input.executionMode === "single") {
+		const r = (input.singleRationale ?? "").trim();
+		if (r.length < 30) {
+			return {
+				ok: false,
+				reason: "single executionMode requires a singleRationale (≥30 chars) explaining WHY this task can be done by the main agent alone without spawn — e.g. single-point lookup, trivial scope, no cross-validation needed. Empty/short rationale = self-approving without justification (handoff §八: 不能自己给理由自己过). The rationale will be independently audited by the reviewer.",
+			};
+		}
 	}
 	// 第5条: research 阶段 HARD-GATE (形式). criteria >=3 对应 plan/collect/cross-validate
 	// 阶段产物. 诚实: 形式验非实质验, per-claim 交叉验证靠 reviewer (根因5残余).
@@ -439,6 +484,10 @@ export function canComplete(goal: CompletableGoal): { ok: boolean; reason?: stri
 		}
 		const v = validateReviewerVerdict(goal.reviewerVerdict);
 		if (!v.ok) return { ok: false, reason: "Reviewer verdict contract not satisfied: " + (v.reason ?? "unknown") };
+		// G7 (single 自批禁): single 模式的 singleRationale 须由 reviewer 独立审核通过.
+		// main agent 不得自给理由自过 — 执行权与验收权正交.
+		const singleCheck = validateSingleRationaleApproved(goal, goal.reviewerVerdict);
+		if (!singleCheck.ok) return { ok: false, reason: singleCheck.reason ?? "single rationale not approved by reviewer" };
 	}
 	return { ok: true };
 }

@@ -31,18 +31,26 @@ describe("taskRoutingBlock — orchestrated 模式编排者约束 (深修 A/B)",
 });
 
 describe("orchestratorConstraintBlock (深修 B 纯函数)", () => {
-	it("returns constraint text for orchestrated", () => {
-		const block = orchestratorConstraintBlock("orchestrated");
+	it("returns constraint text for orchestrated (non-coding)", () => {
+		const block = orchestratorConstraintBlock("orchestrated", "research");
 		assert.ok(block.includes("编排者"), `orchestrated should mention 编排者, got: ${block.slice(0, 200)}`);
 		assert.ok(block.includes("spawn role"), `should mention spawn role, got: ${block.slice(0, 200)}`);
 		assert.ok(!block.includes("deny") || block.includes("不硬 deny"), `should NOT hard-deny, got: ${block.slice(0, 200)}`);
 	});
 
-	it("returns empty for single (backward-compat, no constraint)", () => {
-		assert.equal(orchestratorConstraintBlock("single"), "");
+	it("G7: returns single constraint for single+non-coding (no longer empty — rationale audit)", () => {
+		const block = orchestratorConstraintBlock("single", "research", "单点查证任务可直接检索确认");
+		assert.ok(block.includes("Single 模式约束"), `single+non-coding should inject single constraint, got: ${block.slice(0, 200)}`);
+		assert.ok(block.includes("reviewer 审"), `should mention reviewer audit, got: ${block.slice(0, 300)}`);
+		assert.ok(block.includes("不得自给理由自己通过"), `should ban self-approve, got: ${block.slice(0, 400)}`);
 	});
 
-	it("returns empty for undefined (backward-compat)", () => {
-		assert.equal(orchestratorConstraintBlock(undefined), "");
+	it("returns empty for coding (backward-compat, no constraint)", () => {
+		assert.equal(orchestratorConstraintBlock("single", "coding"), "");
+	});
+
+	it("returns empty for undefined taskType (legacy backward-compat)", () => {
+		assert.equal(orchestratorConstraintBlock(undefined, undefined), "");
+		assert.equal(orchestratorConstraintBlock("single", undefined), "");
 	});
 });

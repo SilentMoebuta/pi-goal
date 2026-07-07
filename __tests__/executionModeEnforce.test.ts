@@ -29,9 +29,21 @@ describe("validateGoalProposal — 第1条 executionMode 强制 (非 coding)", (
 		assert.match(r.reason ?? "", /executionMode/i);
 	});
 
-	it("accepts research taskType with explicit single", () => {
-		const r = validateGoalProposal({ taskType: "research", executionMode: "single" });
+	it("accepts research taskType with explicit single (with singleRationale)", () => {
+		const r = validateGoalProposal({ taskType: "research", executionMode: "single", singleRationale: "单点查证任务，无需多角度交叉验证，main agent 可直接检索官方文档确认，不涉及多源比对" });
 		assert.equal(r.ok, true);
+	});
+
+	it("G7: rejects research single without singleRationale (self-approve ban)", () => {
+		const r = validateGoalProposal({ taskType: "research", executionMode: "single" });
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /singleRationale/i);
+	});
+
+	it("G7: rejects research single with short singleRationale (<30 chars =敷衍)", () => {
+		const r = validateGoalProposal({ taskType: "research", executionMode: "single", singleRationale: "任务简单" });
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /singleRationale/i);
 	});
 
 	it("accepts research taskType with explicit orchestrated", () => {
@@ -58,12 +70,12 @@ describe("validateGoalProposal — 第1条 executionMode 强制 (非 coding)", (
 // 阶段产物), evidence 全覆盖 (现有 evidence gate). 形式验非实质验.
 describe("validateGoalProposal — 第5条 research 阶段 HARD-GATE (形式)", () => {
 	it("rejects research goal with < 3 criteria (need plan/collect/cross-validate stage artifacts)", () => {
-		const r = validateGoalProposal({ taskType: "research", executionMode: "single", criteria: ["a", "b"] });
+		const r = validateGoalProposal({ taskType: "research", executionMode: "single", criteria: ["a", "b"], singleRationale: "单点查证任务，无需多角度交叉验证，main agent 可直接检索官方文档确认，不涉及多源比对" });
 		assert.equal(r.ok, false);
 		assert.match(r.reason ?? "", /criteria|>= ?3|阶段/i);
 	});
 	it("accepts research goal with >= 3 criteria", () => {
-		const r = validateGoalProposal({ taskType: "research", executionMode: "single", criteria: ["a", "b", "c"] });
+		const r = validateGoalProposal({ taskType: "research", executionMode: "single", criteria: ["a", "b", "c"], singleRationale: "单点查证任务，无需多角度交叉验证，main agent 可直接检索官方文档确认，不涉及多源比对" });
 		assert.equal(r.ok, true);
 	});
 	it("does not enforce criteria count for coding goals (backward-compat)", () => {

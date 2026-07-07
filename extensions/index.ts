@@ -71,6 +71,8 @@ interface GoalState {
 	reviewerSessionFile?: string;
 	// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
 	executionMode?: "single" | "orchestrated";
+	// G7 (single 自批禁): single 模式的理由, 起草时声明, 交 reviewer 审核 (不得自批).
+	singleRationale?: string;
 }
 
 interface GoalSnapshot {
@@ -373,7 +375,7 @@ function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_C
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
 		(injectSuperpowersCoding(config, goal.taskType) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
 		(config.superpowersIntegration ? taskGovernanceBlock(goal.taskType) : "") +
-		orchestratorConstraintBlock(goal.executionMode) +
+		orchestratorConstraintBlock(goal.executionMode, goal.taskType, goal.singleRationale) +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -449,6 +451,8 @@ interface GoalProposal {
 	// 深修 A/D: carried from propose_goal_draft params into setGoal.
 	taskType?: "coding" | "research" | "pm" | "review";
 	executionMode?: "single" | "orchestrated";
+	// G7 (single 自批禁): single 模式须给出理由交 reviewer 审.
+	singleRationale?: string;
 }
 
 type ReviewResult = "start" | "edit" | "cancel";
@@ -624,7 +628,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	function setGoal(
 		objective: string, criteria: string[], constraints: string[],
-		opts: { tokenBudget?: number | null; taskType?: "coding" | "research" | "pm" | "review"; executionMode?: "single" | "orchestrated" }, ctx: ExtensionContext,
+		opts: { tokenBudget?: number | null; taskType?: "coding" | "research" | "pm" | "review"; executionMode?: "single" | "orchestrated"; singleRationale?: string }, ctx: ExtensionContext,
 	): GoalState {
 		const now = Date.now();
 		if (goal?.status === "active") {
@@ -1194,16 +1198,18 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			taskType: Type.Optional(StringEnum(["coding", "research", "pm", "review"] as const)),
 			// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
 			executionMode: Type.Optional(StringEnum(["single", "orchestrated"] as const)),
+			// G7 (single 自批禁): single 模式须给出可独立审核的理由 (≥30字), 交 reviewer 审核.
+			singleRationale: Type.Optional(Type.String({ description: "Required when executionMode=single AND taskType is non-coding: explain WHY this task can be done by the main agent alone (≥30 chars). Independently audited by reviewer — not self-approved." })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			// 第1条: 非 coding taskType 必须显式 executionMode (治"判简单"偏见).
-			const proposalCheck = validateGoalProposal({ taskType: params.taskType, executionMode: params.executionMode, criteria: params.criteria });
+			const proposalCheck = validateGoalProposal({ taskType: params.taskType, executionMode: params.executionMode, criteria: params.criteria, singleRationale: params.singleRationale });
 			if (!proposalCheck.ok) {
 				return { content: [{ type: "text", text: proposalCheck.reason ?? "Invalid goal proposal." }], isError: true, details: {} };
 			}
 			if (!ctx.hasUI) {
 				if (goal) return { content: [{ type: "text", text: "A goal is already set (status: " + goal.status + "). Clear it first." }], isError: true, details: {} };
-				setGoal(params.objective, params.criteria, params.constraints ?? [], { taskType: params.taskType, executionMode: params.executionMode }, ctx);
+				setGoal(params.objective, params.criteria, params.constraints ?? [], { taskType: params.taskType, executionMode: params.executionMode, singleRationale: params.singleRationale }, ctx);
 				return { content: [{ type: "text", text: "Goal created (non-interactive)." }], details: { goal: { ...goal! } } };
 			}
 			if (goal) {
@@ -1218,10 +1224,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				);
 				if (!ok) return { content: [{ type: "text", text: "Kept current goal." }], details: {} };
 			}
-			const proposal: GoalProposal = { objective: params.objective, criteria: params.criteria, constraints: params.constraints ?? [], taskType: params.taskType, executionMode: params.executionMode };
+			const proposal: GoalProposal = { objective: params.objective, criteria: params.criteria, constraints: params.constraints ?? [], taskType: params.taskType, executionMode: params.executionMode, singleRationale: params.singleRationale };
 			const choice = await showGoalReview(proposal, ctx);
 			switch (choice) {
-				case "start": { setGoal(proposal.objective, proposal.criteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode }, ctx); return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! } } }; }
+				case "start": { setGoal(proposal.objective, proposal.criteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode, singleRationale: proposal.singleRationale }, ctx); return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! } } }; }
 				case "edit": {
 					const editedObjective = await ctx.ui.editor("Edit goal objective:", proposal.objective);
 					if (!editedObjective?.trim()) return { content: [{ type: "text", text: "Cancelled (empty objective)." }], details: {} };
@@ -1229,7 +1235,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 					const editedCriteria = await ctx.ui.editor("Edit criteria (one per line):", criteriaText);
 					const newCriteria = (editedCriteria ?? criteriaText).split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
 					if (newCriteria.length === 0) return { content: [{ type: "text", text: "Cancelled (no criteria)." }], details: {} };
-					setGoal(editedObjective.trim(), newCriteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode }, ctx);
+					setGoal(editedObjective.trim(), newCriteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode, singleRationale: proposal.singleRationale }, ctx);
 					return { content: [{ type: "text", text: "Goal started after edit: " + goal!.objective }], details: { goal: { ...goal! } } };
 				}
 				default: return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
