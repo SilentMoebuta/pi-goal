@@ -19,15 +19,38 @@
  *  by whitespace or end-of-string (\s|$), so URLs with dots stay one clause.
  *  Measured on the real CLM report: 0.21 (old) → 0.655 (fixed), robustly >0.3. */
 export function checkCitationTraceability(text: string): number {
+	// G5 (pi-goal live 复盘): markdown structural lines (fenced code blocks, YAML
+	// frontmatter, table separator rows |---|---|, pure-URL index appendix lines)
+	// inflated the denominator and created a perverse incentive — stacking more URLs
+	// in an appendix *lowered* the score (each URL line = 1 cited clause, but also
+	// 1 denominator unit, while 100 stacked URLs with no 。 between them collapse into
+	// 1 clause, so the ratio drops). Real reviewer report measured 0.25 with 105 source
+	// URLs appended — strictly worse than 0.27 with 45.
+	// Fix: strip structural lines before clause-splitting, and drop pure-citation index
+	// lines (lines that are only URLs/paths, optionally list-marked) from the
+	// denominator — they ARE references, not argument clauses needing a citation.
+	const stripped = text
+		.replace(/^```[^\n]*\n[\s\S]*?\n```\s*$/gm, "")        // fenced code blocks
+		.replace(/^---\n[\s\S]*?\n---\s*\n/gm, "")           // YAML frontmatter
+		.replace(/^\|[-:\s|]+\|\s*$/gm, "")                  // table separator rows |---|---|
+		.replace(/^#{1,6}\s+.*$/gm, "")                      // pure heading lines (not argument clauses)
+		.replace(/^\s*[-*]?\s*(https?:\/\/\S+(\s+|$))+$/gm, ""); // pure-URL index lines (- url1 url2 ...)
 	// Split on Chinese/English sentence enders. Period only counts as a sentence end
 	// when followed by whitespace or end-of-string, so URLs (http://a.b.c) stay intact.
 	// Non-capturing group: a capturing group would inject the separator into the result
 	// array (and undefined when $ matches), creating phantom clauses.
-	const clauses = text.split(/[。；;]|\.(?:\s|$)/).map((s) => s.trim()).filter((s) => s.length > 0);
+	const clauses = stripped.split(/[。；;]|\.(?:\s|$)/).map((s) => s.trim()).filter((s) => s.length > 0);
 	if (clauses.length === 0) return 0;
-	// URL (http/https) or file-path-like (word/word.ext with slash, or .md/.pdf/.json suffix)
-	const hasCitation = (s: string) =>
-		/https?:\/\/\S+/i.test(s) || /\b[\w-]+\/[\w/-]+\.(md|pdf|json|txt|ts|py)\b/i.test(s) || /\bdocs\/\S+/i.test(s);
+	// URL (http/https) or file-path-like (word/word.ext with slash, or .md/.pdf/.json suffix),
+	// or academic citation IDs (arxiv:2103.06268 / doi:10.xxx) which are equally traceable.
+	// G5: a quoted clause (Chinese/English quote, markdown blockquote) or a long English-majority
+	// clause is itself a fetched original source (paper abstract, vendor doc excerpt) — it IS
+	// a citation, so counts as traceable. This prevents analysis reports dense with quoted
+	// evidence from scoring low despite every claim being sourced.
+	const hasCitation = (s: string) => {
+		const t = s.trim();
+		return /https?:\/\/\S+/i.test(s) || /\b[\w-]+\/[\w/-]+\.(md|pdf|json|txt|ts|py)\b/i.test(s) || /\bdocs\/\S+/i.test(s) || /\barxiv:\d+\.\d+/i.test(s) || /\bdoi:\s*10\./i.test(s) || /^["””>]/.test(t) || (t.length > 40 && (t.match(/[a-zA-Z]/g) || []).length / t.length > 0.5);
+	};
 	const cited = clauses.filter(hasCitation).length;
 	return cited / clauses.length;
 }

@@ -66,6 +66,53 @@ describe("checkCitationTraceability — 引用可溯率 (URL/路径占比)", () 
 		const r = checkCitationTraceability(text);
 		assert.ok(r >= 0.3, `CLM-style mixed report should pass >=0.3 with URL-intact splitter, got ${r.toFixed(3)}`);
 	});
+
+	// G5 (pi-goal live 复盘): three defects inflated the denominator and created a
+	// perverse incentive (stacking more URLs in an appendix *lowered* the score).
+	// Regression guards for each fix below.
+	it("G5: strips markdown table separator rows (|---|---|) from the denominator", () => {
+		// Table separators carry no URL but counted as clauses with bare 。/。 split.
+		// |---|---| rows must not dilute the ratio.
+		const text = "数据见 http://a.com 。\n|---|---|\n| 维度 | 内容 |\n数据2见 http://b.com 。";
+		const r = checkCitationTraceability(text);
+		assert.ok(r >= 0.5, `table separator rows should not dilute ratio, got ${r.toFixed(3)}`);
+	});
+
+	it("G5: pure-URL index appendix lines do not create a perverse incentive", () => {
+		// A reviewer report with 3 cited argument clauses + a 100-URL index appendix.
+		// With the old splitter the appendix URLs (no 。 between them) collapsed into 1
+		// clause while the analysis prose dominated the denominator, so adding URLs
+		// *lowered* the score. Fix: strip pure-URL index lines from the denominator.
+		const text = [
+			"结论1见 http://a.com 。",
+			"结论2见 http://b.com 。",
+			"结论3见 http://c.com 。",
+			"",
+			"- https://d.com https://e.com https://f.com",
+			"- https://g.com https://h.com https://i.com",
+		].join("\n");
+		const r = checkCitationTraceability(text);
+		assert.ok(r >= 0.3, `URL index appendix must not lower ratio below 0.3, got ${r.toFixed(3)}`);
+	});
+
+	it("G5: recognizes arxiv:2103.06268 and doi:10.xxx as traceable citations", () => {
+		const text = "CUAD 基准见 arxiv:2103.06268 。ContractNLI 见 doi:10.18653/v1/2021.findings-emnlp.164 。无来源句。";
+		const r = checkCitationTraceability(text);
+		assert.ok(r >= 0.6, `arxiv/doi IDs should count as citations, got ${r.toFixed(3)}`);
+	});
+
+	it("G5: quoted original source excerpts count as traceable (they ARE citations)", () => {
+		// A reviewer report dense with fetched paper abstracts (quoted English text) is
+		// highly traceable, not untraceable. Each quoted/excerpt clause counts as cited.
+		const text = [
+			"结论1通过。",
+			'"CUAD: An Expert-Annotated NLP Dataset for Legal Contract Review curated by the Atticus Project with five hundred ten contracts and forty one clause types for legal document understanding research"',
+			'"The task is to highlight salient portions of a contract that are important for a human reviewer”',
+			"结论2见 http://a.com 。",
+		].join("\n");
+		const r = checkCitationTraceability(text);
+		assert.ok(r >= 0.5, `quoted source excerpts should count as traceable, got ${r.toFixed(3)}`);
+	});
 });
 
 describe("checkSourceDiversity — 来源多样性 (域名/机构数)", () => {
