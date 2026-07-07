@@ -138,10 +138,10 @@ export function taskGovernanceBlock(goalTaskType?: string): string {
  *  - 直接调 web_search/write/edit 执行实质工作 = 违约(可被 reviewer 检测)
  *  - 违约检测靠 reviewer 事后审查 + judge turn 级评估,不靠工具 deny
  *  主张: 执行权与验收权正交 — 简单任务(single)可直执,但验收必须独立。
- *  G7 (single 自批禁): single 模式可保留,但 singleRationale 须交 reviewer 审,
+ *  G7 (single 自批禁): single 模式可保留,但 singleRationale 须交 reviewer 预审+终审,
  *  不得自给理由自过 — 在 single+非 coding 时也注入提示 (不再空串).
  *  Returns empty string for coding/undefined (no constraint, backward-compat). */
-export function orchestratorConstraintBlock(executionMode?: string, taskType?: string, singleRationale?: string): string {
+export function orchestratorConstraintBlock(executionMode?: string, taskType?: string, singleRationale?: string, singleRationaleStatus?: string): string {
 	const nonCoding = taskType && taskType !== "coding";
 	if (!nonCoding) return ""; // coding/undefined: 无约束 (backward-compat)
 	if (executionMode === "orchestrated") {
@@ -151,12 +151,27 @@ export function orchestratorConstraintBlock(executionMode?: string, taskType?: s
 			"违约检测靠 reviewer 事后审查 + judge turn 级评估 — 不硬 deny 工具 (执行权与验收权正交)。\n" +
 			"例外: 读文件/跑测试等编排辅助操作可直接调 (非实质执行工作)。\n";
 	}
-	// G7: single 模式提示 — 可直执但理由须交 reviewer 审, 不得自批.
-	return "\n\n## Single 模式约束 (executionMode=single, taskType=" + taskType + ")\n" +
+	// G7: single 模式提示 — 须执行前预审 singleRationale, 不得自批.
+	const status = singleRationaleStatus ?? "pending";
+	if (status === "approved") {
+		return "\n\n## Single 模式约束 (executionMode=single, taskType=" + taskType + ", 预审已通过)\n" +
+			"singleRationale 已预审通过: " + (singleRationale ? "" + singleRationale : "(未提供)") + "\n" +
+			"你可开始实质执行 (main agent 直执)。但终局 complete 仍须 spawn reviewer 验收, reviewer 会再次确认 singleRationaleApproved — 不得自给理由自过。\n" +
+			"若执行中发现该任务不该 single (复杂度超预期/需多角度), 降级: update_goal({ executionMode: \"orchestrated\" })。\n";
+	}
+	if (status === "rejected") {
+		return "\n\n## Single 模式约束 (executionMode=single, taskType=" + taskType + ", 预审被拒)\n" +
+			"⚠️ singleRationale 预审被 reviewer 拒绝 — 该任务不该 single, 不得开始实质执行。\n" +
+			"必须降级: 调 update_goal({ executionMode: \"orchestrated\" }) 改用 spawn role 编排重做。\n" +
+			"降级后 singleRationaleStatus/singleRationale 自动清空, 转入 orchestrated 约束。\n";
+	}
+	// pending (默认)
+	return "\n\n## Single 模式约束 (executionMode=single, taskType=" + taskType + ", 待预审)\n" +
 		"你选择 single 模式 (main agent 直执)。理由已声明: " + (singleRationale ? "" + singleRationale : "(未提供)") + "\n" +
-		"该理由将由独立 reviewer 审核是否成立 — 不得自给理由自己通过 (handoff §八: 不能自己给理由自己过)。\n" +
-		"若 reviewer 认为该任务不该 single (需 spawn 交叉验证/多角度), complete 会被拒。\n" +
-		"实质执行工作尽量 spawn role; 单 agent 串行做完整个 workflow = 违约信号。\n";
+		"⚠️ 该理由须先 spawn reviewer 预审 — 预审通过前不得开始实质执行 (防自己做完后才发现不该 single, 浪费 work)。\n" +
+		"预审流程: spawn reviewer 审 singleRationale → reviewer 返回 singleRationaleApproved → 调 update_goal({ singleRationalePreApproved: true, singleRationaleReviewer: {model, thinkingLevel} }) 写入。\n" +
+			"false → status=rejected, 须降级 orchestrated。\n" +
+		"不得自给理由自过 (handoff §八: 不能自己给理由自己过)。\n";
 }
 
 // Governance block texts (kept as module-level consts for testability + clarity)
@@ -246,6 +261,12 @@ export interface CompletableGoal {
 	singleRationale?: string;
 	/** 深修 A: execution mode. single = main agent 直执 (须 singleRationale); orchestrated = spawn role. */
 	executionMode?: "single" | "orchestrated";
+	/** G7 (执行前预审): single+非coding goal 的 singleRationale 预审进度.
+	 *  pending = 刚创建未预审 (不得开始实质执行);
+	 *  approved = 预审通过可执行 (终局仍须 reviewer 验收);
+	 *  rejected = 预审拒绝 (须降级 orchestrated, update_goal 改 executionMode).
+	 *  undefined = coding/legacy/orchestrated (无预审流程, backward-compat). */
+	singleRationaleStatus?: "pending" | "approved" | "rejected";
 	/** Criteria with their collected evidence (existing field). */
 	criteria: { evidence: string[] }[];
 }
@@ -346,6 +367,17 @@ export function validateSingleRationaleApproved(goal: CompletableGoal, verdict: 
 			};
 		}
 	}
+	return { ok: true };
+}
+
+/** G7 预审契约 (执行前预审, A): 预审 reviewer 只审 singleRationale 合理性, 无产物可验源/跑 gate.
+ *  轻量契约: model 非空 + thinkingLevel>=medium (独立审核不能浅) + singleRationaleApproved 布尔.
+ *  不要求 verifiedSources/checksPassed (预审阶段无 sources/产物 — 与终审 validateReviewerVerdict 区别). */
+export function validateSingleRationalePreApproval(r: { model?: string; thinkingLevel?: string; singleRationaleApproved?: boolean }): { ok: boolean; reason?: string } {
+	if (!r.model) return { ok: false, reason: "singleRationaleReviewer missing model — cannot confirm a real model was used." };
+	const thinkingOk = r.thinkingLevel && ["medium", "high", "xhigh"].includes(r.thinkingLevel);
+	if (!thinkingOk) return { ok: false, reason: "singleRationaleReviewer thinkingLevel must be >= medium (got " + (r.thinkingLevel ?? "undefined") + ") — independent audit cannot be shallow." };
+	if (typeof r.singleRationaleApproved !== "boolean") return { ok: false, reason: "singleRationaleReviewer.singleRationaleApproved must be a boolean (reviewer's verdict on whether the task can be single)." };
 	return { ok: true };
 }
 
@@ -488,6 +520,19 @@ export function canComplete(goal: CompletableGoal): { ok: boolean; reason?: stri
 		// main agent 不得自给理由自过 — 执行权与验收权正交.
 		const singleCheck = validateSingleRationaleApproved(goal, goal.reviewerVerdict);
 		if (!singleCheck.ok) return { ok: false, reason: singleCheck.reason ?? "single rationale not approved by reviewer" };
+	}
+	// G7 预审 gate (执行前预审, A): single+非coding 须 singleRationaleStatus=approved.
+	// pending = 未预审不得 complete (防跳过预审直接做完); rejected = 预审拒了须降级.
+	if (goal.taskType && goal.taskType !== "coding" && goal.executionMode === "single") {
+		if (goal.singleRationaleStatus !== "approved") {
+			return {
+				ok: false,
+				reason: "single executionMode requires singleRationaleStatus=\"approved\" (执行前预审通过). Got: " + (goal.singleRationaleStatus ?? "undefined/pending") + ". "+
+					(goal.singleRationaleStatus === "rejected"
+						? "预审被拒 — 须降级: update_goal({ executionMode: \"orchestrated\" }) 改用 spawn role 重做."
+						: "须先 spawn reviewer 预审 singleRationale, 通过后调 update_goal({ singleRationalePreApproved: true, singleRationaleReviewer: {...} }) 写入, 再开始执行."),
+			};
+		}
 	}
 	return { ok: true };
 }

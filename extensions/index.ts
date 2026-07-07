@@ -25,7 +25,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, verifyQualityGates, extractReviewerFindings, findingsAreNonEmpty, verifyReviewerSource, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, validateSingleRationalePreApproval, verifyQualityGates, extractReviewerFindings, findingsAreNonEmpty, verifyReviewerSource, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -73,6 +73,8 @@ interface GoalState {
 	executionMode?: "single" | "orchestrated";
 	// G7 (single 自批禁): single 模式的理由, 起草时声明, 交 reviewer 审核 (不得自批).
 	singleRationale?: string;
+	// G7 预审: single+非coding 的 singleRationale 预审进度 (pending/approved/rejected).
+	singleRationaleStatus?: "pending" | "approved" | "rejected";
 }
 
 interface GoalSnapshot {
@@ -375,7 +377,7 @@ function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_C
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
 		(injectSuperpowersCoding(config, goal.taskType) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
 		(config.superpowersIntegration ? taskGovernanceBlock(goal.taskType) : "") +
-		orchestratorConstraintBlock(goal.executionMode, goal.taskType, goal.singleRationale) +
+		orchestratorConstraintBlock(goal.executionMode, goal.taskType, goal.singleRationale, goal.singleRationaleStatus) +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -649,6 +651,9 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			taskType: opts.taskType,
 			reviewerPassed: false,
 			executionMode: opts.executionMode,
+			singleRationale: opts.singleRationale,
+			// G7 预审: single+非coding 创建时 pending (须执行前预审); 其他模式 undefined.
+			singleRationaleStatus: (opts.taskType && opts.taskType !== "coding" && opts.executionMode === "single") ? "pending" : undefined,
 		};
 		goal = newGoal;
 		userSuspended = false;
@@ -1092,12 +1097,26 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				checksPassed: Type.Boolean(),
 				reportPath: Type.Optional(Type.String()),
 				notes: Type.Optional(Type.String()),
+				// G7 (P0 fix): single 模式终审须 reviewer 表态 singleRationaleApproved. 之前 schema 漏了 → 死锁.
+				singleRationaleApproved: Type.Optional(Type.Boolean({ description: "G7: For single+non-coding goals, reviewer's verdict on whether the singleRationale holds (terminal review). true=task can be single; false=should have been orchestrated (complete rejected)." })),
 			})),
 			// G3 (教训6): verdict 来源真实性. reviewerPassed=true (非 coding) 须携 reviewerAgentId +
 			// reviewerSessionFile — handler 读该 jsonl 提取 report_role_result 的 findings, 验非空.
 			// sessionFile 由 pi-core 写 (main agent 不可伪造), 是跨 ext 唯一独立验证路径.
 			reviewerAgentId: Type.Optional(Type.String({ description: "agentId of the spawned reviewer session (from spawn_role result). Required for non-coding reviewerPassed=true (G3: verdict source authenticity)." })),
 			reviewerSessionFile: Type.Optional(Type.String({ description: "sessionFile (.jsonl) of the spawned reviewer. Handler reads it to extract the reviewer's actual report_role_result findings (G3)." })),
+			// G7 预审 (A): single+非coding 执行前预审 singleRationale. spawn reviewer 审理由 →
+			// singleRationalePreApproved=true (轻量 reviewer, 只需 model+thinkingLevel+singleRationaleApproved).
+			// true → status=approved (可执行); false → status=rejected (须降级).
+			singleRationalePreApproved: Type.Optional(Type.Boolean({ description: "G7 pre-audit: write the reviewer's pre-approval of singleRationale. true→status=approved(can execute); false→status=rejected(must downgrade to orchestrated)." })),
+			singleRationaleReviewer: Type.Optional(Type.Object({
+				model: Type.Optional(Type.String()),
+				thinkingLevel: Type.Optional(Type.String()),
+				singleRationaleApproved: Type.Boolean(),
+			})),
+			// G7 降级 (B): executionMode single→orchestrated (reviewer 拒后重做) 或重提 singleRationale.
+			executionMode: Type.Optional(StringEnum(["single", "orchestrated"] as const)),
+			singleRationale: Type.Optional(Type.String({ description: "G7: when downgrading to single, re-submit singleRationale (≥30 chars, re-audited)." })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!goal) {
@@ -1111,6 +1130,45 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				criterion.evidence.push(params.evidence);
 				updateState({ criteria: [...goal.criteria] }, ctx);
 				return { content: [{ type: "text", text: "Evidence recorded for \"" + criterion.description + "\": " + params.evidence }], details: { criterionId: criterion.id } };
+			}
+			// G7 预审 (A): single+非coding 执行前预审 singleRationale. spawn reviewer 审理由 →
+			// singleRationalePreApproved=true (轻量 reviewer) → status=approved; false → status=rejected.
+			if (params.singleRationalePreApproved !== undefined) {
+				if (!goal.taskType || goal.taskType === "coding" || goal.executionMode !== "single") {
+					return { content: [{ type: "text", text: "singleRationalePreApproved only applies to single+non-coding goals. This goal is taskType=" + (goal.taskType ?? "undefined") + " executionMode=" + (goal.executionMode ?? "undefined") + "." }], isError: true, details: {} };
+				}
+				if (goal.singleRationaleStatus !== "pending") {
+					return { content: [{ type: "text", text: "singleRationaleStatus is " + (goal.singleRationaleStatus ?? "undefined") + " — pre-audit only allowed while pending. Already audited; to re-audit after downgrade/re-submit, downgrade first (executionMode=orchestrated) then back to single to reset to pending." }], isError: true, details: {} };
+				}
+				const reviewer = params.singleRationaleReviewer;
+				if (!reviewer) {
+					return { content: [{ type: "text", text: "singleRationalePreApproved requires singleRationaleReviewer {model, thinkingLevel, singleRationaleApproved} from the spawned pre-audit reviewer." }], isError: true, details: {} };
+				}
+				const contract = validateSingleRationalePreApproval(reviewer);
+				if (!contract.ok) return { content: [{ type: "text", text: "singleRationaleReviewer contract not satisfied: " + (contract.reason ?? "unknown") }], isError: true, details: {} };
+				// 预审结果必须与 singleRationalePreApproved 一致 (防 main agent 自报 reviewer 说 true 但传 false).
+				if (reviewer.singleRationaleApproved !== params.singleRationalePreApproved) {
+					return { content: [{ type: "text", text: "singleRationaleReviewer.singleRationaleApproved (" + reviewer.singleRationaleApproved + ") ≠ singleRationalePreApproved (" + params.singleRationalePreApproved + "). Inconsistent — write the reviewer's actual verdict." }], isError: true, details: {} };
+				}
+				const newStatus = params.singleRationalePreApproved ? "approved" : "rejected";
+				updateState({ singleRationaleStatus: newStatus }, ctx);
+				return { content: [{ type: "text", text: "singleRationale pre-audit: " + (params.singleRationalePreApproved ? "APPROVED → status=approved, 可开始执行 (终局仍须 reviewer 验收)" : "REJECTED → status=rejected, 须降级 update_goal({executionMode:\"orchestrated\"})") + "." }], details: { singleRationaleStatus: newStatus } };
+			}
+			// G7 降级 (B): executionMode 改写. single→orchestrated (reviewer 拒后重做) 或重提 single.
+			if (params.executionMode !== undefined && params.executionMode !== goal.executionMode) {
+				const toSingle = params.executionMode === "single";
+				// 升级/重入 single 须重提 singleRationale (且须重新预审).
+				if (toSingle) {
+					const r = (params.singleRationale ?? "").trim();
+					if (r.length < 30) {
+						return { content: [{ type: "text", text: "Downgrade/re-enter single requires singleRationale (≥30 chars) explaining why single is appropriate — will be re-audited by reviewer (pending)." }], isError: true, details: {} };
+					}
+					updateState({ executionMode: "single", singleRationale: params.singleRationale, singleRationaleStatus: "pending", reviewerPassed: false, reviewerVerdict: undefined, reviewerAgentId: undefined, reviewerSessionFile: undefined }, ctx);
+					return { content: [{ type: "text", text: "executionMode → single. singleRationale reset to pending — must re-run pre-audit before executing." }], details: { executionMode: "single", singleRationaleStatus: "pending" } };
+				}
+			// →orchestrated: 清 single 相关状态.
+				updateState({ executionMode: "orchestrated", singleRationale: undefined, singleRationaleStatus: undefined, reviewerPassed: false, reviewerVerdict: undefined, reviewerAgentId: undefined, reviewerSessionFile: undefined }, ctx);
+				return { content: [{ type: "text", text: "executionMode → orchestrated. singleRationale cleared; switch to spawn-role orchestration. Reviewer gate still applies on complete." }], details: { executionMode: "orchestrated" } };
 			}
 			// 深修 D: reviewer APPROVE writeback — flip reviewerPassed to open the complete gate.
 			if (params.reviewerPassed !== undefined) {

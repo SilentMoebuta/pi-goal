@@ -38,11 +38,25 @@ describe("orchestratorConstraintBlock (深修 B 纯函数)", () => {
 		assert.ok(!block.includes("deny") || block.includes("不硬 deny"), `should NOT hard-deny, got: ${block.slice(0, 200)}`);
 	});
 
-	it("G7: returns single constraint for single+non-coding (no longer empty — rationale audit)", () => {
-		const block = orchestratorConstraintBlock("single", "research", "单点查证任务可直接检索确认");
+	it("G7 pending (default): single+non-coding injects pre-audit-required constraint", () => {
+		const block = orchestratorConstraintBlock("single", "research", "单点查证任务可直接检索确认", "pending");
 		assert.ok(block.includes("Single 模式约束"), `single+non-coding should inject single constraint, got: ${block.slice(0, 200)}`);
-		assert.ok(block.includes("reviewer 审"), `should mention reviewer audit, got: ${block.slice(0, 300)}`);
-		assert.ok(block.includes("不得自给理由自己通过"), `should ban self-approve, got: ${block.slice(0, 400)}`);
+		assert.ok(block.includes("待预审"), `pending should say 待预审, got: ${block.slice(0, 200)}`);
+		assert.ok(block.includes("预审"), `pending should mention pre-audit, got: ${block.slice(0, 300)}`);
+		assert.ok(block.includes("不得自给理由自过"), `should ban self-approve, got: ${block.slice(0, 400)}`);
+	});
+
+	it("G7 approved: single+non-coding injects can-execute constraint", () => {
+		const block = orchestratorConstraintBlock("single", "research", "单点查证任务可直接检索确认", "approved");
+		assert.ok(block.includes("预审已通过"), `approved should say 预审已通过, got: ${block.slice(0, 200)}`);
+		assert.ok(block.includes("可开始实质执行"), `approved should allow execution, got: ${block.slice(0, 300)}`);
+	});
+
+	it("G7 rejected: single+non-coding injects must-downgrade constraint", () => {
+		const block = orchestratorConstraintBlock("single", "research", "单点查证任务可直接检索确认", "rejected");
+		assert.ok(block.includes("预审被拒"), `rejected should say 预审被拒, got: ${block.slice(0, 200)}`);
+		assert.ok(block.includes("降级"), `rejected should tell to downgrade, got: ${block.slice(0, 300)}`);
+		assert.ok(block.includes("orchestrated"), `rejected should mention orchestrated, got: ${block.slice(0, 400)}`);
 	});
 
 	it("returns empty for coding (backward-compat, no constraint)", () => {

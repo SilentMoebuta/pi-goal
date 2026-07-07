@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { validateReviewerVerdict, validateSingleRationaleApproved, canComplete, type ReviewerVerdict, type CompletableGoal } from "../extensions/config";
+import { validateReviewerVerdict, validateSingleRationaleApproved, validateSingleRationalePreApproval, canComplete, type ReviewerVerdict, type CompletableGoal } from "../extensions/config";
 
 // 第2条: reviewer gate 严度不可控 (CLM run 复盘).
 // 根因: reviewerPassed 是裸布尔, main agent 调 update_goal({reviewerPassed:true}) 说 true 就 true,
@@ -74,6 +74,7 @@ describe("G7: single rationale reviewer-approval gate (不能自给理由自过)
 			taskType: "research",
 			executionMode: "single",
 			singleRationale: "单点查证任务，无需多角度交叉验证，main agent 可直接检索官方文档确认，不涉及多源比对",
+			singleRationaleStatus: "approved", // G7 预审已过 (canComplete 要求)
 			reviewerPassed: true,
 			reviewerVerdict: makeVerdict({ singleRationaleApproved: true }),
 			criteria: [{ evidence: ["e1"] }, { evidence: ["e2"] }, { evidence: ["e3"] }],
@@ -107,9 +108,54 @@ describe("G7: single rationale reviewer-approval gate (不能自给理由自过)
 		assert.match(r.reason ?? "", /single rationale|singleRationaleApproved|自给理由/i);
 	});
 
-	it("canComplete: accepts single+non-coding with reviewer singleRationaleApproved=true", () => {
+	it("canComplete: accepts single+non-coding with reviewer singleRationaleApproved=true AND status=approved", () => {
 		const g = makeGoal();
 		const r = canComplete(g);
 		assert.equal(r.ok, true);
+	});
+
+	it("G7 pre-audit gate: rejects single+non-coding when status=pending (not pre-audited)", () => {
+		const g = makeGoal({ singleRationaleStatus: "pending" });
+		const r = canComplete(g);
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /pending|预审/i);
+	});
+
+	it("G7 pre-audit gate: rejects single+non-coding when status=rejected (must downgrade)", () => {
+		const g = makeGoal({ singleRationaleStatus: "rejected" });
+		const r = canComplete(g);
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /rejected|降级|downgrade|orchestrated/i);
+	});
+});
+
+// G7 预审契约 (执行前预审, A): 轻量 reviewer 只审 singleRationale, 无产物不验源.
+describe("G7: validateSingleRationalePreApproval (执行前预审契约)", () => {
+	function makePreReviewer(overrides = {}) {
+		return { model: "deepseek/deepseek-v4", thinkingLevel: "medium", singleRationaleApproved: true, ...overrides };
+	}
+	it("accepts valid pre-audit reviewer verdict", () => {
+		assert.equal(validateSingleRationalePreApproval(makePreReviewer()).ok, true);
+	});
+	it("rejects missing model", () => {
+		const r = validateSingleRationalePreApproval(makePreReviewer({ model: undefined }));
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /model/i);
+	});
+	it("rejects low thinking (<medium)", () => {
+		const r = validateSingleRationalePreApproval(makePreReviewer({ thinkingLevel: "low" }));
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /thinking|medium/i);
+	});
+	it("rejects non-boolean singleRationaleApproved", () => {
+		const r = validateSingleRationalePreApproval(makePreReviewer({ singleRationaleApproved: undefined as unknown as boolean }));
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /singleRationaleApproved|boolean/i);
+	});
+	it("does NOT require verifiedSources (pre-audit has no sources — distinct from terminal validateReviewerVerdict)", () => {
+		// 预审阶段无产物可验源, 只要 model+thinking+verdict.
+		const r = validateSingleRationalePreApproval(makePreReviewer());
+		assert.equal(r.ok, true);
+		assert.ok(!((r as { reason?: string }).reason ?? "").includes("verifiedSources"));
 	});
 });
