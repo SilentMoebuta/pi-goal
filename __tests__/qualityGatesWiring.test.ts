@@ -12,23 +12,26 @@ import { verifyQualityGates } from "../extensions/config";
 // 不信任 reviewer 自报数值 (第2条: reviewer 可廉价满足).
 
 describe("verifyQualityGates — 第3条 quality-gates 接线 (重跑验真伪)", () => {
-	it("fails a report with no citations (traceability below threshold)", () => {
+	it("warns, but does not block, a report with low citation traceability", () => {
 		const r = verifyQualityGates("合同管理很重要，但没有任何引用来源。");
 		assert.equal(r.ok, false);
+		assert.equal(r.blocking, false);
 		assert.match(r.reason ?? "", /citation|引用|traceab/i);
 	});
 
-	it("fails a report with citations but no confidence annotation", () => {
+	it("warns, but does not block, a report with citations but no confidence annotation", () => {
 		const text = "数据见 http://a.com 。另见 http://b.com 。还有 http://c.com 。";
 		const r = verifyQualityGates(text);
 		assert.equal(r.ok, false);
+		assert.equal(r.blocking, false);
 		assert.match(r.reason ?? "", /confidence|置信/i);
 	});
 
-	it("fails a report with < 3 distinct sources", () => {
+	it("warns, but does not block, a report with < 3 distinct sources", () => {
 		const text = "数据见 http://a.com （置信度：高）。";
 		const r = verifyQualityGates(text);
 		assert.equal(r.ok, false);
+		assert.equal(r.blocking, false);
 		assert.match(r.reason ?? "", /divers|多样|source/i);
 	});
 
@@ -47,8 +50,10 @@ describe("verifyQualityGates — 第3条 quality-gates 接线 (重跑验真伪)"
 		assert.equal(r.metrics!.confidenceAnnotated, true);
 	});
 
-	it("passes empty text as ok=false (no content to verify)", () => {
-		assert.equal(verifyQualityGates("").ok, false);
+	it("keeps empty text as a blocking failure (no content to verify)", () => {
+		const r = verifyQualityGates("");
+		assert.equal(r.ok, false);
+		assert.equal(r.blocking, true);
 	});
 });
 

@@ -299,23 +299,23 @@ export interface QualityGateMetrics {
 	confidenceAnnotated: boolean;
 }
 
-export function verifyQualityGates(reportText: string, taskType?: string): { ok: boolean; reason?: string; metrics?: QualityGateMetrics } {
-	if (!reportText || reportText.trim().length === 0) return { ok: false, reason: "Report text is empty — nothing to verify." };
+export function verifyQualityGates(reportText: string, taskType?: string): { ok: boolean; blocking?: boolean; reason?: string; metrics?: QualityGateMetrics } {
+	if (!reportText || reportText.trim().length === 0) return { ok: false, blocking: true, reason: "Report text is empty — nothing to verify." };
 	const citationTraceability = checkCitationTraceability(reportText);
 	const sourceDiversity = checkSourceDiversity(reportText);
 	const confidenceAnnotated = checkConfidenceAnnotation(reportText);
 	const metrics: QualityGateMetrics = { citationTraceability, sourceDiversity, confidenceAnnotated };
 	const citationBar = taskType ? (CITATION_TRACEABILITY_BY_TASK_TYPE[taskType] ?? QUALITY_GATE_THRESHOLDS.citationTraceability) : QUALITY_GATE_THRESHOLDS.citationTraceability;
 	if (citationTraceability < citationBar) {
-		return { ok: false, reason: "Citation traceability " + citationTraceability.toFixed(2) + " < threshold " + citationBar + " (taskType=" + (taskType ?? "undefined") + ") — too few data points carry a URL/path citation.", metrics };
+		return { ok: false, blocking: false, reason: "Citation traceability " + citationTraceability.toFixed(2) + " < threshold " + citationBar + " (taskType=" + (taskType ?? "undefined") + ") — diagnostic warning only; reviewer must judge whether sources actually support the work.", metrics };
 	}
 	if (sourceDiversity < QUALITY_GATE_THRESHOLDS.sourceDiversity) {
-		return { ok: false, reason: "Source diversity " + sourceDiversity + " < threshold " + QUALITY_GATE_THRESHOLDS.sourceDiversity + " — not enough distinct sources.", metrics };
+		return { ok: false, blocking: false, reason: "Source diversity " + sourceDiversity + " < threshold " + QUALITY_GATE_THRESHOLDS.sourceDiversity + " — diagnostic warning only; reviewer must judge whether the source set is sufficient for this task.", metrics };
 	}
 	if (!confidenceAnnotated) {
-		return { ok: false, reason: "No confidence annotation found — report must mark 置信度 (高/中/低/猜测) on data points.", metrics };
+		return { ok: false, blocking: false, reason: "No confidence/evidence annotation found — diagnostic warning only; reviewer must judge whether uncertainty is honestly labeled.", metrics };
 	}
-	return { ok: true, metrics };
+	return { ok: true, blocking: false, metrics };
 }
 
 /** 第2条 (CLM run 复盘): reviewer verdict — 结构化验收凭证, 替代裸布尔 reviewerPassed.

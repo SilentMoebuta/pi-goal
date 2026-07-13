@@ -27,6 +27,11 @@ describe("checkCitationTraceability — 引用可溯率 (URL/路径占比)", () 
 		assert.ok(checkCitationTraceability(text) > 0, "should detect file path");
 	});
 
+	it("detects source-ledger IDs used by Phase 3-lite reports", () => {
+		const text = "CAS14 第五条支持该判断。[财务准则]+[官方来源:S1]。数据出境规则见 [网络调研:S3]。";
+		assert.ok(checkCitationTraceability(text) > 0.5, "source IDs should count as traceable citations");
+	});
+
 	it("returns ratio in [0,1]", () => {
 		const text = "数据1见 http://a.com 。数据2无来源 。数据3见 http://b.com 。";
 		const r = checkCitationTraceability(text);
@@ -177,5 +182,11 @@ describe("checkConfidenceAnnotation — 置信度标注完整性", () => {
 	it("detects high/中/low/猜测 variants", () => {
 		assert.equal(checkConfidenceAnnotation("（置信度：低）"), true);
 		assert.equal(checkConfidenceAnnotation("（置信度:猜测）"), true);
+	});
+
+	it("detects evidence labels used by PM/research reports", () => {
+		assert.equal(checkConfidenceAnnotation("[强证据] WorldCC 调研显示收入泄漏。"), true);
+		assert.equal(checkConfidenceAnnotation("[推理] 这说明流程治理是瓶颈。"), true);
+		assert.equal(checkConfidenceAnnotation("[假设] 需要后续盲评验证。"), true);
 	});
 });

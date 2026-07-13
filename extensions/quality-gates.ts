@@ -49,15 +49,15 @@ export function checkCitationTraceability(text: string): number {
 	// array (and undefined when $ matches), creating phantom clauses.
 	const clauses = stripped.split(/[。；;]|\.(?:\s|$)/).map((s) => s.trim()).filter((s) => s.length > 0);
 	if (clauses.length === 0) return 0;
-	// URL (http/https) or file-path-like (word/word.ext with slash, or .md/.pdf/.json suffix),
-	// or academic citation IDs (arxiv:2103.06268 / doi:10.xxx) which are equally traceable.
+	// URL (http/https), source-ledger IDs ([官方来源:S1]/[网络调研:S3]),
+	// file-path-like citations, or academic IDs (arxiv/doi) which are equally traceable.
 	// G5: a quoted clause (Chinese/English quote, markdown blockquote) or a long English-majority
 	// clause is itself a fetched original source (paper abstract, vendor doc excerpt) — it IS
 	// a citation, so counts as traceable. This prevents analysis reports dense with quoted
 	// evidence from scoring low despite every claim being sourced.
 	const hasCitation = (s: string) => {
 		const t = s.trim();
-		return /https?:\/\/\S+/i.test(s) || /\b[\w-]+\/[\w/-]+\.(md|pdf|json|txt|ts|py)\b/i.test(s) || /\bdocs\/\S+/i.test(s) || /\barxiv:\d+\.\d+/i.test(s) || /\bdoi:\s*10\./i.test(s) || /^["””>]/.test(t) || (t.length > 40 && (t.match(/[a-zA-Z]/g) || []).length / t.length > 0.5);
+		return /https?:\/\/\S+/i.test(s) || /\[(?:官方来源|网络调研)\s*:\s*S\d+\]/.test(s) || /\b[\w-]+\/[\w/-]+\.(md|pdf|json|txt|ts|py)\b/i.test(s) || /\bdocs\/\S+/i.test(s) || /\barxiv:\d+\.\d+/i.test(s) || /\bdoi:\s*10\./i.test(s) || /^["””>]/.test(t) || (t.length > 40 && (t.match(/[a-zA-Z]/g) || []).length / t.length > 0.5);
 	};
 	const cited = clauses.filter(hasCitation).length;
 	return cited / clauses.length;
@@ -79,6 +79,11 @@ export function checkSourceDiversity(text: string): number {
 	while ((m = instRe.exec(text)) !== null) {
 		sources.add(m[1].trim().toLowerCase());
 	}
+	// Phase 3-lite source ledger citations: [官方来源:S1] / [网络调研:S3]
+	const sourceIdRe = /\[(?:官方来源|网络调研)\s*:\s*(S\d+)\]/g;
+	while ((m = sourceIdRe.exec(text)) !== null) {
+		sources.add(m[1].trim().toLowerCase());
+	}
 	return sources.size;
 }
 
@@ -86,5 +91,5 @@ export function checkSourceDiversity(text: string): number {
  *  置信度 annotation (high/中/low/猜测 or 高/中/低/猜测). Reviewer checklist
  *  input — a research report without any confidence annotation is a red flag. */
 export function checkConfidenceAnnotation(text: string): boolean {
-	return /置信度\s*[:：]\s*(高|中|低|猜测|high|medium|low|guess)/i.test(text);
+	return /置信度\s*[:：]\s*(高|中|低|猜测|high|medium|low|guess)/i.test(text) || /\[(强证据|推理|假设|中证据|弱证据|需验证)\]/.test(text);
 }

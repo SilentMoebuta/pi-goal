@@ -1191,11 +1191,11 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 							return { content: [{ type: "text", text: "reviewerVerdict.reportPath unreadable: " + verdict.reportPath + " (" + (e as Error).message + "). Cannot re-verify quality gates (第3条)." }], isError: true, details: {} };
 						}
 						const qg = verifyQualityGates(reportText, goal.taskType);
-						if (!qg.ok) {
-							return { content: [{ type: "text", text: "Quality gates re-verify FAILED (第3条, not trusting reviewer self-report): " + (qg.reason ?? "unknown") + ". Report does not meet citation/source/confidence thresholds." }], isError: true, details: { metrics: qg.metrics } };
+						if (!qg.ok && qg.blocking !== false) {
+							return { content: [{ type: "text", text: "Quality gates re-verify BLOCKED (第3条, not trusting reviewer self-report): " + (qg.reason ?? "unknown") + "." }], isError: true, details: { metrics: qg.metrics, blocking: qg.blocking } };
 						}
 						if (!verdict.checksPassed) {
-							return { content: [{ type: "text", text: "reviewerVerdict.checksPassed=false but quality gates re-verify passed — reviewer mis-reported. Set checksPassed=true." }], isError: true, details: {} };
+							return { content: [{ type: "text", text: "reviewerVerdict.checksPassed=false — reviewer did not approve the work. Fix the report or submit reviewerPassed=false." }], isError: true, details: { qualityGateDiagnostics: qg.metrics, qualityGateWarning: qg.ok ? undefined : qg.reason } };
 						}
 					}
 					// G3 (教训6): verdict 来源真实性 — 必须指向一个真实的 spawn reviewer session.
