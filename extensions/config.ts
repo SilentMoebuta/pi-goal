@@ -482,6 +482,72 @@ export function validateGoalProposal(input: { taskType?: string; executionMode?:
 	return { ok: true };
 }
 
+/** Assess a newly submitted evidence string against a criterion's existing
+ *  evidence entries. Returns whether the new evidence is a near-duplicate of
+ *  an existing one (caller should skip recording) and/or a contradiction
+ *  warning string (caller records anyway, but warns).
+ *
+ *  Dedup rule (dedup wins over conflict): the new text is a duplicate of an
+ *  existing entry when, after lowercasing and stripping ALL whitespace:
+ *    - one normalized string is a substring of the other, OR
+ *    - the Levenshtein distance is < 10% of the shorter normalized length.
+ *  Whitespace/case-only differences and trivial typos carry no new
+ *  information, so recording them just adds noise to the evidence list.
+ *
+ *  Conflict rule: the new and an existing entry take opposing polarity on the
+ *  same outcome - one carries a positive marker (passed/success/通过/✅) and
+ *  the other a negative one (failed/not/失败/❌). This is advisory only: the
+ *  agent may legitimately be correcting an earlier claim, so we surface a
+ *  warning but do NOT block the record.
+ *
+ *  Pure + unit-testable; called from update_goal's criterionId+evidence branch. */
+export function assessEvidence(newEvidence: string, existing: string[]): { duplicate: boolean; conflict?: string } {
+	const norm = (s: string) => s.toLowerCase().replace(/\s+/g, "");
+	const a = norm(newEvidence);
+	if (existing.length === 0 || a.length === 0) return { duplicate: false };
+
+	// ponytail: classic 2-row DP Levenshtein. O(m*n) is fine for evidence strings
+	// (short prose); upgrade to a banded/Myers diff only if evidence grows huge.
+	const lev = (x: string, y: string): number => {
+		if (x === y) return 0;
+		const m = x.length, n = y.length;
+		let prev = new Array<number>(n + 1);
+		let curr = new Array<number>(n + 1);
+		for (let j = 0; j <= n; j++) prev[j] = j;
+		for (let i = 1; i <= m; i++) {
+			curr[0] = i;
+			for (let j = 1; j <= n; j++) {
+				const cost = x.charCodeAt(i - 1) === y.charCodeAt(j - 1) ? 0 : 1;
+				curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+			}
+			[prev, curr] = [curr, prev];
+		}
+		return prev[n];
+	};
+
+	for (const raw of existing) {
+		const b = norm(raw);
+		if (b.length === 0) continue;
+		// Dedup: substring either way, or Levenshtein < 10% of the shorter length.
+		const isDup = a.includes(b) || b.includes(a) || lev(a, b) < 0.1 * Math.min(a.length, b.length);
+		if (isDup) return { duplicate: true };
+	}
+
+	// Conflict: opposing polarity on the same outcome. Positive vs negative
+	// marker pairs. Advisory - does not block recording.
+	const POS = /\b(passed|succeed|success|succeeded)\b|通过|✅/i;
+	const NEG = /\b(failed|fail)\b|\bnot\b|不|失败|❌/i;
+	for (const raw of existing) {
+		const oldHasPos = POS.test(raw), oldHasNeg = NEG.test(raw);
+		const newHasPos = POS.test(newEvidence), newHasNeg = NEG.test(newEvidence);
+		const opposed = (newHasPos && oldHasNeg) || (newHasNeg && oldHasPos);
+		if (opposed) {
+			return { duplicate: false, conflict: `New evidence may contradict an earlier entry ("${raw.slice(0, 60)}"). Recording anyway.` };
+		}
+	}
+	return { duplicate: false };
+}
+
 /** Gate checked before a goal may transition to "complete". Pure + unit-
  *  testable. Called by both complete paths:
  *    1. update_goal({status:"complete"}) — index.ts update_goal handler

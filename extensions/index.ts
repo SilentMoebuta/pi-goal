@@ -25,7 +25,7 @@ import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, validateSingleRationalePreApproval, verifyQualityGates, extractReviewerFindings, findingsAreNonEmpty, verifyReviewerSource, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, validateSingleRationalePreApproval, verifyQualityGates, extractReviewerFindings, findingsAreNonEmpty, verifyReviewerSource, assessEvidence, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
 import { runVerifyCommand } from "./verify-command";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1126,6 +1126,15 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				const criterion = goal.criteria.find((c) => c.id === params.criterionId);
 				if (!criterion) {
 					return { content: [{ type: "text", text: "Criterion \"" + params.criterionId + "\" not found." }], isError: true, details: {} };
+				}
+				// Dedup + conflict check against already-recorded evidence for this criterion.
+				// Near-duplicate -> skip (no new info); contradiction -> warn but still record.
+				const assessment = assessEvidence(params.evidence, criterion.evidence);
+				if (assessment.duplicate) {
+					return { content: [{ type: "text", text: "Evidence skipped (near-duplicate of an existing entry for \"" + criterion.description + "\"): " + params.evidence }], details: { criterionId: criterion.id, skipped: true } };
+				}
+				if (assessment.conflict) {
+					console.warn("[pi-goal] evidence conflict for criterion \"" + criterion.id + "\": " + assessment.conflict);
 				}
 				criterion.evidence.push(params.evidence);
 				updateState({ criteria: [...goal.criteria] }, ctx);
