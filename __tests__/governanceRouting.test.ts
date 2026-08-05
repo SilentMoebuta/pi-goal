@@ -51,10 +51,10 @@ describe("taskGovernanceBlock — per-task-type governance (深修 C)", () => {
 		assert.ok(block.includes("superpowers") || block.includes("TDD") || block.includes("阶段"), `coding governance should mention superpowers/TDD, got: ${block.slice(0, 200)}`);
 	});
 
-	it("research → 计划→采集→交叉验证→综合→reviewer 验引用", () => {
+	it("research uses claim risk and evidence independence instead of URL counts", () => {
 		const block = taskGovernanceBlock("research");
-		assert.ok(block.includes("交叉验证"), `research governance should mention 交叉验证, got: ${block.slice(0, 200)}`);
-		assert.ok(block.includes("reviewer") || block.includes("引用"), `research governance should mention reviewer/引用, got: ${block.slice(0, 200)}`);
+		assert.ok(block.includes("independenceKey"), `research governance should explain evidence independence, got: ${block.slice(0, 300)}`);
+		assert.ok(block.includes("diagnostics"), `research governance should demote URL/source counts, got: ${block.slice(0, 300)}`);
 	});
 
 	it("pm → 盘点→痛点→机会→优先级→reviewer 验论证", () => {

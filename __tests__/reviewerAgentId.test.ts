@@ -14,6 +14,8 @@ function jsonlLine(content: any, role = "assistant"): string {
 	return JSON.stringify({ type: "message", message: { role, content } });
 }
 
+const sessionHeader = JSON.stringify({ type: "session", id: "session-child", parentSession: "/tmp/parent.jsonl" });
+
 describe("extractReviewerFindings — G3 从 session jsonl 提取 reviewer 真实 findings", () => {
 	it("extracts findings from a jsonl line containing a report_role_result toolCall", () => {
 		const line = jsonlLine([{ type: "toolCall", name: "report_role_result", arguments: { findings: ["APPROVED"], artifacts: [] } }]);
@@ -50,6 +52,7 @@ describe("extractReviewerFindings — G3 从 session jsonl 提取 reviewer 真�
 
 	it("extracts from multi-line jsonl (real sub-session has many lines, only one report_role_result)", () => {
 		const lines = [
+			sessionHeader,
 			jsonlLine([{ type: "text", text: "reviewing..." }]),
 			jsonlLine([{ type: "toolCall", name: "read", arguments: { path: "x" } }], "assistant"),
 			jsonlLine([{ type: "text", text: "result" }], "toolResult"),
@@ -58,6 +61,55 @@ describe("extractReviewerFindings — G3 从 session jsonl 提取 reviewer 真�
 		const r = extractReviewerFindings(lines);
 		assert.equal(r.found, true);
 		assert.deepEqual(r.findings, ["real-approval"]);
+		assert.equal(r.spawnedSession, true);
+		assert.equal(r.parentSession, "/tmp/parent.jsonl");
+	});
+
+	it("does not treat a report-only jsonl file as a spawned reviewer session", () => {
+		const r = extractReviewerFindings(jsonlLine([
+			{ type: "toolCall", name: "report_role_result", arguments: { findings: ["fabricated"] } },
+		]));
+		assert.equal(r.found, true);
+		assert.equal(r.spawnedSession, false);
+	});
+
+	it("binds a provenance-bearing transcript to the accepted report retry", () => {
+		const lines = [
+			sessionHeader,
+			JSON.stringify({ type: "custom", customType: "pi-roles:spawn-provenance", data: {
+				schemaVersion: 1, agentId: "sub_1_0", role: "reviewer", sessionId: "session-child",
+				parentSession: "/tmp/parent.jsonl",
+			} }),
+			jsonlLine([{ type: "toolCall", id: "bad", name: "report_role_result", arguments: { findings: ["✅ Ready but malformed"] } }]),
+			JSON.stringify({ type: "message", message: {
+				role: "toolResult", toolCallId: "bad", toolName: "report_role_result", isError: false,
+				details: { errorType: "schema_mismatch" }, content: [{ type: "text", text: "schema mismatch" }],
+			} }),
+			jsonlLine([{ type: "toolCall", id: "good", name: "report_role_result", arguments: { findings: ["❌ Not ready", "subjectId=c1 missingEvidenceKind=source"] } }]),
+			JSON.stringify({ type: "message", message: {
+				role: "toolResult", toolCallId: "good", toolName: "report_role_result", isError: false,
+				content: [{ type: "text", text: "[pi-roles] report accepted. You may now stop." }],
+			} }),
+		].join("\n");
+		const r = extractReviewerFindings(lines);
+		assert.equal(r.found, true);
+		assert.deepEqual(r.findings, ["❌ Not ready", "subjectId=c1 missingEvidenceKind=source"]);
+	});
+
+	it("fails closed when a provenance-bearing report has no accepted tool result", () => {
+		const lines = [
+			sessionHeader,
+			JSON.stringify({ type: "custom", customType: "pi-roles:spawn-provenance", data: {
+				schemaVersion: 1, agentId: "sub_1_0", role: "reviewer", sessionId: "session-child",
+				parentSession: "/tmp/parent.jsonl",
+			} }),
+			jsonlLine([{ type: "toolCall", id: "bad", name: "report_role_result", arguments: { findings: ["✅ Ready"] } }]),
+			JSON.stringify({ type: "message", message: {
+				role: "toolResult", toolCallId: "bad", toolName: "report_role_result", isError: false,
+				details: { errorType: "schema_mismatch" }, content: [{ type: "text", text: "schema mismatch" }],
+			} }),
+		].join("\n");
+		assert.equal(extractReviewerFindings(lines).found, false);
 	});
 });
 
@@ -65,30 +117,46 @@ import { verifyReviewerSource } from "../extensions/config";
 
 describe("verifyReviewerSource — G3 决策：编造 verdict 被拒 (教训6 闭合)", () => {
 	it("rejects a forged verdict with no reviewerAgentId (main agent self-constructed JSON)", () => {
-		const r = verifyReviewerSource(undefined, undefined, { found: true, findings: ["fake"] });
+		const r = verifyReviewerSource(undefined, undefined, { found: true, findings: ["fake"], spawnedSession: false });
 		assert.equal(r.ok, false);
 		assert.match(r.reason ?? "", /reviewerAgentId.*reviewerSessionFile|source authenticity/i);
 	});
 
 	it("rejects when agentId present but sessionFile missing", () => {
-		const r = verifyReviewerSource("sub_x", undefined, { found: true, findings: ["x"] });
+		const r = verifyReviewerSource("sub_1_0", undefined, { found: true, findings: ["x"], spawnedSession: true, parentSession: "parent", sessionId: "child" });
 		assert.equal(r.ok, false);
 	});
 
 	it("rejects when the session jsonl has no report_role_result (no real reviewer reported)", () => {
-		const r = verifyReviewerSource("sub_x", "/path/s.jsonl", { found: false });
+		const r = verifyReviewerSource("sub_1_0", "/path/s.jsonl", { found: false, spawnedSession: true, parentSession: "parent", sessionId: "child" });
 		assert.equal(r.ok, false);
 		assert.match(r.reason ?? "", /did not actually report|report_role_result/i);
 	});
 
 	it("rejects a rubber-stamp reviewer whose findings are empty", () => {
-		const r = verifyReviewerSource("sub_x", "/path/s.jsonl", { found: true, findings: [] });
+		const r = verifyReviewerSource("sub_1_0", "/path/s.jsonl", { found: true, findings: [], spawnedSession: true, parentSession: "parent", sessionId: "child" });
 		assert.equal(r.ok, false);
 		assert.match(r.reason ?? "", /empty|rubber-stamp|substantive/i);
 	});
 
 	it("accepts a real reviewer with agentId + sessionFile + non-empty findings", () => {
-		const r = verifyReviewerSource("sub_x", "/path/s.jsonl", { found: true, findings: ["APPROVED: G4 correct"] });
+		const r = verifyReviewerSource("sub_1_0", "/path/s.jsonl", {
+			found: true,
+			findings: ["APPROVED: G4 correct"],
+			spawnedSession: true,
+			parentSession: "/path/parent.jsonl",
+			sessionId: "child-session",
+		});
 		assert.equal(r.ok, true);
+	});
+
+	it("rejects a plausible agent id when the transcript is not a child session", () => {
+		const r = verifyReviewerSource("sub_1_0", "/path/s.jsonl", {
+			found: true,
+			findings: ["APPROVED"],
+			spawnedSession: false,
+		});
+		assert.equal(r.ok, false);
+		assert.match(r.reason ?? "", /spawned child session|parentSession/i);
 	});
 });

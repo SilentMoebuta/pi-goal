@@ -24,9 +24,50 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { randomUUID } from "node:crypto";
-import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canUpdateGoal, canResumeGoal, footerStatusText, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, orchestratorConstraintBlock, serializeGoalText, validateGoalProposal, validateReviewerVerdict, validateSingleRationalePreApproval, verifyQualityGates, extractReviewerFindings, findingsAreNonEmpty, verifyReviewerSource, assessEvidence, type GoalConfig, type GoalStatus, type ReviewerVerdict } from "./config";
-import { runVerifyCommand } from "./verify-command";
+import { createHash, randomUUID } from "node:crypto";
+import { loadGoalConfig, DEFAULT_GOAL_CONFIG, parseModelSpec, buildEscalationPrompt, isSubagentSession, canResumeGoal, taskRoutingBlock, injectSuperpowersCoding, canComplete, taskGovernanceBlock, executionDecisionBlock, validateGoalProposal, assessEvidence, extractReviewerFindings, verifyReviewerSource, downgradeEnvironmentStateGates, type GoalConfig } from "./config";
+import { runVerifyCommand, type VerifyResult } from "./verify-command";
+import {
+	createGoalSnapshotV2,
+	createGoalStateV2,
+	decodeGoalSnapshot,
+	SHADOW_COMPLETION_ADVISORY,
+	type AssuranceDecision,
+	type CompletionEvaluation,
+	type CompletionFinding,
+	type EvidenceRef,
+	type ExecutionDecision,
+	type ExecutionPreference,
+	type GateLevel,
+	type GoalSnapshotActionV2,
+	type GoalSnapshotV2,
+	type GoalStateV2,
+	type ResearchClaim,
+	type StoredGoalCriterionV2,
+	type TaskKind,
+} from "./state";
+import { ExactTurnAccounting, type TurnIdentity } from "./turn-accounting";
+import { routeExecution, type ExecutionRoutingSignals } from "./execution-router-v2";
+import { rejectionFingerprint, selectReviewerPolicy, validateCompletionPolicy } from "./completion-policy-v2";
+import { buildBoundedEvidencePacket, completionDecisionToEvaluation } from "./goal-integration-v2";
+import {
+	applyAuthoritativeCompletionEvaluation,
+	applyShadowCompletionEvaluation,
+	buildV2JudgePrompt,
+	hasPendingCompletionRequest,
+	parseV2JudgeResponse,
+	V2_JUDGE_SYSTEM_PROMPT,
+} from "./completion-runtime-v2";
+import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
+import {
+	GoalRuntimeTracker,
+	deriveGoalProgress,
+	outcomeSignature,
+	renderCompactGoalProgress,
+	renderGoalProgressLines,
+	truncateDisplay,
+	type GoalProgressSnapshot,
+} from "./progress-model";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types
@@ -38,49 +79,9 @@ const GOAL_CONTINUATION_TYPE = "pi-goal:continuation";
 const GOAL_JUDGE_TYPE = "pi-goal:judge";
 
 
-interface Criterion {
-	id: string;
-	description: string;
-	evidence: string[];
-}
-
-interface GoalState {
-	id: string;
-	objective: string;
-	status: GoalStatus;
-	criteria: Criterion[];
-	constraints: string[];
-	tokenBudget: number | null;
-	tokensUsed: number;
-	timeUsedMs: number;
-	createdAt: number;
-	updatedAt: number;
-	noProgressCount: number;
-	autoTurnCount: number;
-	pausedReason: string | null;
-	blocker: string | null;
-	completionEvidence: string | null;
-	// 深修 D/A: per-goal task type + reviewer gate. undefined = legacy (backward-compat).
-	taskType?: "coding" | "research" | "pm" | "review";
-	reviewerPassed?: boolean;
-	// 第2条: 结构化验收凭证, canComplete 验契约. 非 coding goal reviewerPassed=true 时必携.
-	reviewerVerdict?: ReviewerVerdict;
-	// G3 (教训6): verdict 来源真实性. reviewerAgentId + reviewerSessionFile 指向真实 spawn 的
-	// reviewer session (.jsonl 由 pi-core 写, 不可伪造). handler 读之提取 findings 验非空.
-	reviewerAgentId?: string;
-	reviewerSessionFile?: string;
-	// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
-	executionMode?: "single" | "orchestrated";
-	// G7 (single 自批禁): single 模式的理由, 起草时声明, 交 reviewer 审核 (不得自批).
-	singleRationale?: string;
-	// G7 预审: single+非coding 的 singleRationale 预审进度 (pending/approved/rejected).
-	singleRationaleStatus?: "pending" | "approved" | "rejected";
-}
-
-interface GoalSnapshot {
-	action: "set" | "update" | "clear" | "status" | "budget_limited";
-	goal: GoalState | null;
-}
+type GoalState = GoalStateV2;
+type Criterion = StoredGoalCriterionV2;
+type GoalSnapshot = GoalSnapshotV2;
 
 interface JudgeVerdict {
 	done: boolean;
@@ -177,6 +178,8 @@ async function runJudge(
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
 	config: GoalConfig = DEFAULT_GOAL_CONFIG,
+	precomputedVerification?: VerifyResult,
+	completeFn: typeof complete = complete,
 ): Promise<JudgeVerdict> {
 	// GG-1: deterministic command-based verification (opt-in via .pi/goal.json
 	// verifyCommand, trusted projects only — loadGoalConfig only populates the
@@ -186,7 +189,8 @@ async function runJudge(
 	// (with a note that the verify command passed). When verifyCommand is
 	// unset, behavior is UNCHANGED — LLM-judge-only (backward compatible).
 	if (config.verifyCommand) {
-		const verify = await runVerifyCommand(config.verifyCommand, config.verifyTimeoutMs ?? 120_000);
+		const verify = precomputedVerification
+			?? await runVerifyCommand(config.verifyCommand, config.verifyTimeoutMs ?? 120_000);
 		if (!verify.ok) {
 			const detail = (verify.stderr || verify.stdout).trim();
 			const exitPart = verify.exitCode === null
@@ -237,7 +241,7 @@ async function runJudge(
 
 	const startMs = Date.now();
 	try {
-		const result = await complete(
+		const result = await completeFn(
 			model,
 			{
 				systemPrompt: JUDGE_SYSTEM_PROMPT,
@@ -287,6 +291,104 @@ async function runJudge(
 	}
 }
 
+interface V2JudgeRun {
+	evaluation: CompletionEvaluation;
+	parseFailed: boolean;
+}
+
+async function runV2CompletionJudge(
+	goal: GoalState,
+	responseText: string,
+	ctx: ExtensionContext,
+	pi: ExtensionAPI,
+	config: GoalConfig,
+	verification?: VerifyResult,
+	completeFn: typeof complete = complete,
+): Promise<V2JudgeRun> {
+	const packet = buildBoundedEvidencePacket({
+		goal,
+		latestResponse: responseText,
+		...(config.verifyCommand && verification
+			? { deterministicVerification: { command: config.verifyCommand, result: verification } }
+			: {}),
+	});
+	const constraintCriteria = packet.goal.constraints.map((description, index) => ({
+		id: "$constraint:" + index,
+		description,
+		level: "blocking" as const,
+		evidenceRefs: packet.evidenceLedger.map((item) => item.id),
+	}));
+	const judgePacket = { ...packet, criteria: [...packet.criteria, ...constraintCriteria] };
+	let model = ctx.model;
+	const evaluatorSpec = config.evaluatorModel ?? config.judgeModel;
+	if (evaluatorSpec) {
+		const spec = parseModelSpec(evaluatorSpec);
+		const found = spec ? ctx.modelRegistry?.find?.(spec.provider, spec.modelId) : undefined;
+		if (found) model = found;
+		else console.warn("[pi-goal] evaluatorModel \"" + evaluatorSpec + "\" not found; falling back to the session model.");
+	}
+
+	let rawVerdict: unknown = "No evaluator model is available.";
+	let modelId: string | undefined;
+	let durationMs = 0;
+	if (model) {
+		modelId = evaluatorSpec ?? model.id;
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (auth.ok) {
+			const startedAt = Date.now();
+			try {
+				const result = await completeFn(model, {
+					systemPrompt: V2_JUDGE_SYSTEM_PROMPT,
+					messages: [{ role: "user", content: [{ type: "text", text: buildV2JudgePrompt(judgePacket) }], timestamp: Date.now() }],
+				}, {
+					apiKey: auth.apiKey,
+					headers: auth.headers,
+					temperature: 0,
+					maxTokens: 4_096,
+				});
+				durationMs = Date.now() - startedAt;
+				rawVerdict = parseV2JudgeResponse(extractTextContent(result));
+			} catch (error) {
+				durationMs = Date.now() - startedAt;
+				rawVerdict = "Evaluator error: " + (error instanceof Error ? error.message : String(error));
+			}
+		} else {
+			rawVerdict = "Evaluator authentication failed: " + auth.error;
+		}
+	}
+
+	const decision = validateCompletionPolicy({
+		criteria: [
+			...goal.criteria,
+			...goal.constraints.map((description, index) => ({
+				id: "$constraint:" + index,
+				description,
+				level: "blocking" as const,
+				evidenceRefs: goal.evidenceLedger.map((item) => item.id),
+			})),
+		],
+		claims: goal.claims,
+		evidenceLedger: goal.evidenceLedger,
+		judgeVerdict: rawVerdict,
+		assurance: goal.assurance,
+		deterministicVerification: config.verifyCommand && verification
+			? { ok: verification.ok, exitCode: verification.exitCode }
+			: null,
+	});
+	const evaluation = completionDecisionToEvaluation(decision, {
+		evaluatedAt: Date.now(),
+		evaluator: { kind: "judge", ...(modelId ? { model: modelId } : {}) },
+	});
+	pi.sendMessage({
+		customType: GOAL_JUDGE_TYPE,
+		content: "Goal V2 evaluator: " + evaluation.decision.toUpperCase() +
+			(evaluation.findings.length > 0 ? " - " + evaluation.findings.map((item) => item.reason).join("; ") : ""),
+		display: false,
+		details: { policy: "v2", evaluation, durationMs, packetTruncation: packet.truncation },
+	}, { triggerTurn: false });
+	return { evaluation, parseFailed: decision.judgeContractErrors.length > 0 };
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Prompt Generation
 // ═══════════════════════════════════════════════════════════════════════
@@ -294,10 +396,100 @@ async function runJudge(
 function buildCriteriaBlock(criteria: Criterion[]): string {
 	if (criteria.length === 0) return "";
 	const lines = criteria.map((c) => {
-		const icon = c.evidence.length > 0 ? "\u2705" : "\u23F3";
-		return `  ${icon} [${c.id}] ${c.description}${c.evidence.length > 0 ? ` (evidence: ${c.evidence.length})` : ""}`;
+		const evidenceCount = c.evidenceRefs.length;
+		const icon = evidenceCount > 0 ? "\u2705" : c.level === "advisory" ? "\u2022" : "\u23F3";
+		return `  ${icon} [${c.id}] ${c.description} [${c.level}]${evidenceCount > 0 ? ` (evidence: ${evidenceCount})` : ""}`;
 	});
 	return "\nCriteria progress:\n" + lines.join("\n");
+}
+
+function completionFeedbackBlock(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
+	// Shadow audits are deliberately non-authoritative. Legacy and V2 blocking
+	// evaluations are durable control-plane feedback and must reach the next turn.
+	if (config.completionPolicy === "shadow") return "";
+	const evaluation = goal.completion.lastEvaluation;
+	if (!evaluation || evaluation.decision === "accept") return "";
+	const findings = evaluation.findings.map((finding) =>
+		"- [" + finding.code + "] " + finding.subjectId + ": " + finding.reason,
+	).join("\n");
+	const strategy = goal.completion.rejectionCount >= 2
+		? "The same structural rejection repeated. Change verification strategy or replan; do not add more evidence of the same kind merely to increase a count."
+		: "Address only the concrete blocking gaps below.";
+	const resubmit = "\nAfter addressing the gaps, call update_goal({ action: \"request_completion\", summary }) again to trigger a fresh evaluation — the previous request was already judged and will not re-run automatically.";
+	return "\n\n<COMPLETION-FEEDBACK>\n" + strategy + "\n" + (findings || "- No structured finding was recorded.") + resubmit + "\n</COMPLETION-FEEDBACK>\n";
+}
+
+function reviewerTranscriptDecision(findings: unknown): "passed" | "failed" | null {
+	const first = Array.isArray(findings) ? findings[0] : findings;
+	const text = typeof first === "string" ? first : first && typeof first === "object" ? JSON.stringify(first) : "";
+	if (!text.trim()) return null;
+	if (/❌|⚠️|\b(?:not ready|ready with fixes|rejected|reject|failed|fail)\b/i.test(text)) return "failed";
+	if (/✅\s*ready|\bapproved\b/i.test(text)) return "passed";
+	return null;
+}
+
+function transcriptBindsFinding(transcriptFindings: unknown, finding: CompletionFinding): boolean {
+	const text = typeof transcriptFindings === "string" ? transcriptFindings : JSON.stringify(transcriptFindings);
+	if (!text.includes(finding.subjectId)) return false;
+	const evidenceBinding = finding.evidenceRefs && finding.evidenceRefs.length > 0
+		? finding.evidenceRefs.every((ref) => text.includes(ref))
+		: Boolean(finding.missingEvidenceKind && text.includes(finding.missingEvidenceKind));
+	return evidenceBinding;
+}
+
+function assuranceAfterOutcomeMutation(
+	goal: GoalState,
+	config: GoalConfig,
+	reason: string,
+	forceRequired = false,
+): AssuranceDecision {
+	const requirement = config.reviewPolicy === "never"
+		? "none"
+		: config.reviewPolicy === "always" || forceRequired ? "required" : goal.assurance.reviewRequirement;
+	const reasons = goal.assurance.reasons.includes(reason)
+		? [...goal.assurance.reasons]
+		: [...goal.assurance.reasons, reason];
+	return {
+		...goal.assurance,
+		reviewRequirement: requirement,
+		reviewStatus: requirement === "none" ? "not_required" : "pending",
+		independent: requirement !== "none",
+		depth: requirement === "required" ? "deep" : goal.assurance.depth,
+		reasons,
+		decidedAt: Date.now(),
+	};
+}
+
+function isTerminalGoalStatus(status: GoalState["status"]): boolean {
+	return status === "complete" || status === "unmet" || status === "blocked";
+}
+
+function legacyAcceptedEvaluation(goal: GoalState, reason: string, evaluatedAt: number): CompletionEvaluation {
+	return {
+		decision: "accept",
+		evaluatedAt,
+		criterionCoverage: goal.criteria.map((criterion) => ({
+			criterionId: criterion.id,
+			status: criterion.evidenceRefs.length > 0 ? "satisfied" : "unsatisfied",
+			evidenceRefs: [...criterion.evidenceRefs],
+			reason: criterion.evidenceRefs.length > 0
+				? "The legacy compatibility gate observed persisted criterion evidence."
+				: "The legacy compatibility gate did not require evidence for this advisory criterion.",
+		})),
+		claimCoverage: [],
+		findings: [],
+		advisories: ["Accepted by completionPolicy=legacy compatibility semantics; research claim coverage was not evaluated by Goal V2.", reason],
+		evaluator: { kind: "judge" },
+		fingerprint: null,
+	};
+}
+
+function reviewerTranscriptContractBlock(goal: GoalState): string {
+	if (goal.assurance.reviewRequirement === "none") return "";
+	return "\n\nReviewer transcript contract:\n" +
+		"- report_role_result.findings[0] must be exactly `✅ Ready` or `❌ Not ready`.\n" +
+		"- Every blocking finding must then name code, subjectId (criterion, claim, or $constraint:n), and either evidenceRefs or missingEvidenceKind.\n" +
+		"- Submit those same identifiers through update_goal action=record_review; unbound or contradictory verdicts are rejected.\n";
 }
 
 // continuationPrompt — uses string concatenation (no template literals with backticks)
@@ -343,12 +535,12 @@ function superpowersDisciplineBlock(): string {
 		"      The user is not present. You make the call.\\n\\n" +
 		"      GOAL: <copy objective from above>\\n" +
 		"      REVIEWING: <the design, plan, or code being evaluated>\\n\\n" +
-		"      Evaluate on THREE dimensions, return one word: APPROVED or REJECTED:\\n" +
+			"      Evaluate on THREE dimensions, then call report_role_result. findings[0] must be exactly ✅ Ready or ❌ Not ready:\\n" +
 		"      1. PROCESS - was the superpowers process followed?\\n" +
 		"      2. TECHNICAL - does it work? Are there placeholders?\\n" +
 		"      3. USER VALUE - does this deliver what the goal requires?\\n\\n" +
 		"      APPROVE if sound. REJECT if broken, skipped steps, or placeholders.\\n" +
-		'      Rejection MUST include specific, actionable feedback."\n' +
+			'      Rejection MUST include specific, actionable feedback with code, subjectId, and evidenceRefs or missingEvidenceKind."\n' +
 		"    })\n\n" +
 		"    // ponytail: foreground (default mode) is correct for an approval gate — the\n" +
 		"    // approver blocks until the reviewer reports. background mode is Phase 5.\n\n" +
@@ -370,14 +562,16 @@ function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_C
 		: "- No token budget set";
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const criteriaInstruction = goal.criteria.length > 0
-		? "\n3. Submit evidence per criterion:\n   Call update_goal({ criterionId: \"<id>\", evidence: \"<detail>\" }) for each completed criterion.\n4. When ALL criteria show \u2705, call update_goal({ status: \"complete\", evidence: \"<summary>\" }).\n5. The system will reject complete if any criterion lacks evidence."
+		? "\n3. Record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence: {...} }).\n4. Maintain research claims with action: \"upsert_claim\" when applicable.\n5. When blocking outcomes are satisfied, call update_goal({ action: \"request_completion\", summary })."
 		: "";
 
 	return (
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
-		(injectSuperpowersCoding(config, goal.taskType) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
-		(config.superpowersIntegration ? taskGovernanceBlock(goal.taskType) : "") +
-		orchestratorConstraintBlock(goal.executionMode, goal.taskType, goal.singleRationale, goal.singleRationaleStatus) +
+		(injectSuperpowersCoding(config, goal.taskKind) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
+			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind) : "") +
+			executionDecisionBlock(goal.execution) +
+			reviewerTranscriptContractBlock(goal) +
+			completionFeedbackBlock(goal, config) +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -394,9 +588,9 @@ function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_C
 		"   - Inspect relevant files, command output, test results\n" +
 		"   - Verify every criterion has been met with concrete evidence\n" +
 		"   - Do not accept proxy signals or partial progress as completion\n" +
-		"2. An independent judge will also evaluate completion after each turn.\n" +
+			"2. Completion is evaluated from the persisted evidence ledger after an explicit request. Advisory gaps never reject completion.\n" +
 		criteriaInstruction + "\n" +
-		"3. Do not mark complete merely because budget is nearly exhausted."
+			"6. Do not request completion merely because budget is nearly exhausted."
 	);
 }
 
@@ -435,29 +629,35 @@ function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CON
 		budgetInfo + "\n" +
 		criteriaBlock + "\n\n" +
 		"Use get_goal to check the current state.\n" +
-		"Use update_goal({ criterionId, evidence }) to submit evidence per criterion.\n" +
-		'When ALL criteria are satisfied, call update_goal({ status: "complete", evidence: "..." }).\n' +
-		"An independent judge will evaluate completion after each turn." +
+		"Use update_goal action=record_evidence to add evidence to the ledger.\n" +
+		'When blocking outcomes are satisfied, call update_goal({ action: "request_completion", summary: "..." }).\n' +
+		"The completion evaluator uses the persisted ledger, claims, deterministic verification, and the latest response." +
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
-		(config.superpowersIntegration ? taskGovernanceBlock(goal.taskType) : "");
+			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind) : "") +
+			executionDecisionBlock(goal.execution) + reviewerTranscriptContractBlock(goal) + completionFeedbackBlock(goal, config);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Goal Draft Review UI
 // ═══════════════════════════════════════════════════════════════════════
 
-interface GoalProposal {
-	objective: string;
-	criteria: string[];
-	constraints: string[];
-	// 深修 A/D: carried from propose_goal_draft params into setGoal.
-	taskType?: "coding" | "research" | "pm" | "review";
-	executionMode?: "single" | "orchestrated";
-	// G7 (single 自批禁): single 模式须给出理由交 reviewer 审.
-	singleRationale?: string;
+interface GoalCriterionDraft {
+	description: string;
+	level: GateLevel;
 }
 
-type ReviewResult = "start" | "edit" | "cancel";
+interface GoalProposal {
+	objective: string;
+	criteria: GoalCriterionDraft[];
+	constraints: string[];
+	taskKind: TaskKind;
+	executionPreference: ExecutionPreference;
+	execution: ExecutionDecision;
+	assurance: AssuranceDecision;
+	claims: ResearchClaim[];
+}
+
+type ReviewResult = "start" | "edit" | "execution" | "cancel";
 
 async function showGoalReview(
 	proposal: GoalProposal,
@@ -466,6 +666,7 @@ async function showGoalReview(
 	const items: SelectItem[] = [
 		{ value: "start", label: "Start — begin working toward this goal" },
 		{ value: "edit", label: "Edit — modify the objective or criteria" },
+		{ value: "execution", label: "Execution — change auto/direct/specialist/team" },
 		{ value: "cancel", label: "Cancel — discard this draft" },
 	];
 
@@ -478,11 +679,18 @@ async function showGoalReview(
 		container.addChild(new Text(theme.fg("accent", theme.bold("Objective:"))));
 		container.addChild(new Text(theme.fg("text", "  " + proposal.objective)));
 		container.addChild(new Text(""));
+		container.addChild(new Text(theme.fg("accent", theme.bold("Route:"))));
+		container.addChild(new Text(theme.fg("text", "  " + proposal.taskKind + " · " + proposal.execution.selected + (proposal.execution.role ? " · " + proposal.execution.role : ""))));
+		for (const reason of proposal.execution.reasons) container.addChild(new Text(theme.fg("dim", "  " + reason)));
+		container.addChild(new Text(theme.fg("accent", theme.bold("Assurance:"))));
+		container.addChild(new Text(theme.fg("text", "  " + proposal.assurance.reviewRequirement + " · " + proposal.assurance.depth)));
+		for (const reason of proposal.assurance.reasons) container.addChild(new Text(theme.fg("dim", "  " + reason)));
+		container.addChild(new Text(""));
 
 		if (proposal.criteria.length > 0) {
 			container.addChild(new Text(theme.fg("accent", theme.bold("Acceptance Criteria:"))));
 			for (const c of proposal.criteria) {
-				container.addChild(new Text(theme.fg("dim", "  \u2610 " + c)));
+				container.addChild(new Text(theme.fg("dim", "  \u2610 [" + c.level + "] " + c.description)));
 			}
 			container.addChild(new Text(""));
 		}
@@ -490,6 +698,13 @@ async function showGoalReview(
 			container.addChild(new Text(theme.fg("accent", theme.bold("Constraints:"))));
 			for (const c of proposal.constraints) {
 				container.addChild(new Text(theme.fg("dim", "  \u2022 " + c)));
+			}
+			container.addChild(new Text(""));
+		}
+		if (proposal.claims.length > 0) {
+			container.addChild(new Text(theme.fg("accent", theme.bold("Research Claims:"))));
+			for (const claim of proposal.claims) {
+				container.addChild(new Text(theme.fg("dim", "  " + claim.id + " [" + claim.materiality + (claim.risk ? " · " + claim.risk : "") + "] " + claim.text)));
 			}
 			container.addChild(new Text(""));
 		}
@@ -522,7 +737,16 @@ async function showGoalReview(
 // Main Extension
 // ═══════════════════════════════════════════════════════════════════════
 
-export default function piGoalExtension(pi: ExtensionAPI) {
+interface PiGoalRuntimeDependencies {
+	complete: typeof complete;
+	minContinueIntervalMs: number;
+	now: () => number;
+	setInterval: (callback: () => void, ms: number) => ReturnType<typeof setInterval>;
+	clearInterval: (timer: ReturnType<typeof setInterval>) => void;
+}
+
+function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDependencies) {
+	const nowMs = dependencies.now;
 	let goal: GoalState | null = null;
 	let goalConfig: GoalConfig = DEFAULT_GOAL_CONFIG;
 	let judgeParseFailures = 0;
@@ -531,8 +755,12 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	// Set by session_shutdown so the queued sendContinuation microtask can
 	// short-circuit before calling pi.sendMessage on a torn-down session.
 	let shuttingDown = false;
-	let turnStartedAt: number | null = null;
-	let turnGoalId: string | null = null;
+	let snapshotRevision = 0;
+	let reconstructionError: string | null = null;
+	const turnAccounting = new ExactTurnAccounting();
+	const progressRuntime = new GoalRuntimeTracker();
+	let currentTurn: TurnIdentity | null = null;
+	let lastOutcomeSignature: string | null = null;
 	let lastAssistantText = "";
 	// Last judge verdict, surfaced in the goal card / /goal status so the user
 	// can see why the goal is still running (CONTINUE) or was deemed done.
@@ -543,9 +771,15 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	// cleared by sendContinuation.
 	let stuckSuggestion: string | null = null;
 	let continuationTimer: ReturnType<typeof setTimeout> | null = null;
+	let footerTicker: ReturnType<typeof setInterval> | null = null;
+	let observedRoleCatalog: string[] | null = null;
 
 	function clearTimer() {
 		if (continuationTimer) { clearTimeout(continuationTimer); continuationTimer = null; }
+	}
+
+	function clearFooterTicker() {
+		if (footerTicker) { dependencies.clearInterval(footerTicker); footerTicker = null; }
 	}
 
 	function isTrusted(ctx: ExtensionContext): boolean {
@@ -565,8 +799,14 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	function persist(action: GoalSnapshot["action"]) {
-		pi.appendEntry<GoalSnapshot>(GOAL_STORAGE_TYPE, { action, goal: goal ? { ...goal } : null });
+	function persist(action: GoalSnapshotActionV2) {
+		const snapshot = createGoalSnapshotV2({
+			revision: ++snapshotRevision,
+			savedAt: nowMs(),
+			action,
+			goal,
+		});
+		pi.appendEntry<GoalSnapshot>(GOAL_STORAGE_TYPE, snapshot);
 	}
 
 	const GOAL_TOOLS = ["get_goal", "update_goal", "propose_goal_draft"];
@@ -586,80 +826,200 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		if (changed) pi.setActiveTools(Array.from(active));
 	}
 
+	function liveActiveMs(state: GoalState, now: number): number {
+		return state === goal && state.status === "active" && currentTurn
+			? turnAccounting.effectiveElapsedMs(state.timeUsedMs, currentTurn, now)
+			: state.timeUsedMs;
+	}
+
+	function progressFor(state: GoalState, now = nowMs()): GoalProgressSnapshot {
+		return deriveGoalProgress(
+			state,
+			state === goal ? progressRuntime.snapshot() : null,
+			{ now, activeMs: liveActiveMs(state, now) },
+		);
+	}
+
+	function refreshOutcomeProgress(now: number, evaluationChanged: boolean, preserveFreshEvaluation = false): void {
+		if (!goal) {
+			lastOutcomeSignature = null;
+			return;
+		}
+		const nextSignature = outcomeSignature(goal);
+		if (lastOutcomeSignature !== null && nextSignature !== lastOutcomeSignature) {
+			const evaluationWasFresh = goal.progress.lastEvaluatedOutcomeRevision === goal.progress.outcomeRevision;
+			const nextRevision = goal.progress.outcomeRevision + 1;
+			goal.progress = {
+				outcomeRevision: nextRevision,
+				lastOutcomeDeltaAt: now,
+				lastEvaluatedOutcomeRevision: evaluationChanged || (preserveFreshEvaluation && evaluationWasFresh)
+					? nextRevision
+					: goal.progress.lastEvaluatedOutcomeRevision,
+			};
+			progressRuntime.markOutcomeDelta(now);
+		} else if (evaluationChanged) {
+			goal.progress.lastEvaluatedOutcomeRevision = goal.progress.outcomeRevision;
+		}
+		lastOutcomeSignature = outcomeSignature(goal);
+	}
+
 	function updateFooter(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
 		if (!goal) {
 			ctx.ui.setStatus("pi-goal", undefined);
 			return;
 		}
-		const theme = ctx.ui.theme;
-		// P1-1/P1-2: surface pause reason + blocker. P1-3: keep complete/unmet
-		// visible (don't clear) so the user sees the outcome without scrolling.
-		const usage = goal.tokenBudget != null
-			? formatTokens(goal.tokensUsed) + "/" + formatTokens(goal.tokenBudget)
-			: formatDuration(goal.timeUsedMs);
-		const text = footerStatusText(goal.status, { usage, pausedReason: goal.pausedReason, blocker: goal.blocker }, theme as { fg: (color: string, text: string) => string } | undefined);
-		ctx.ui.setStatus("pi-goal", text || undefined);
+		const now = nowMs();
+		ctx.ui.setStatus("pi-goal", renderCompactGoalProgress(progressFor(goal, now), 120));
 	}
 
-	function updateState(patch: Partial<GoalState>, ctx: ExtensionContext) {
+	function syncFooterTicker(ctx: ExtensionContext) {
+		if (!ctx.hasUI || !goal || goal.status !== "active") {
+			clearFooterTicker();
+			return;
+		}
+		if (!footerTicker) footerTicker = dependencies.setInterval(() => updateFooter(ctx), 1_000);
+	}
+
+	function settleCurrentTurnTime(now = nowMs()): boolean {
+		if (!goal || !currentTurn || currentTurn.goalId !== goal.id) return false;
+		const settled = turnAccounting.settleTime(currentTurn, now);
+		if (!settled.applied) return false;
+		goal.timeUsedMs += settled.elapsedMs;
+		goal.updatedAt = now;
+		return true;
+	}
+
+	function updateState(patch: Partial<GoalState>, ctx: ExtensionContext, options: { preserveFreshEvaluation?: boolean } = {}) {
 		if (!goal) return;
-		Object.assign(goal, patch, { updatedAt: Date.now() });
+		const now = nowMs();
+		const previousEvaluation = JSON.stringify(goal.completion.lastEvaluation);
+		if (patch.status && patch.status !== "active") {
+			settleCurrentTurnTime(now);
+			progressRuntime.turnEnded(now);
+		}
+		Object.assign(goal, patch, { updatedAt: now });
+		if (patch.status) {
+			goal.endedAt = patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked" ? now : null;
+		}
+		refreshOutcomeProgress(
+			now,
+			previousEvaluation !== JSON.stringify(goal.completion.lastEvaluation),
+			options.preserveFreshEvaluation === true,
+		);
 		persist("update");
 		updateFooter(ctx);
+		syncFooterTicker(ctx);
 		syncTools();
+	}
+
+	function reassessGoalExecution(
+		signals: ExecutionRoutingSignals,
+		trigger: "scope_expanded" | "new_workstream" | "conflict" | "stalled",
+	): { execution: ExecutionDecision | null; blockedReason: string | null } {
+		if (!goal || !goal.execution.reassessOn.includes(trigger)) return { execution: null, blockedReason: null };
+		const activeTools = new Set(pi.getActiveTools());
+		const availableModes: Array<"direct" | "specialist" | "team"> = ["direct"];
+		if (goal.execution.role && activeTools.has("spawn_role")) availableModes.push("specialist");
+		if (activeTools.has("dag_execute")) availableModes.push("team");
+		const routed = routeExecution({
+			signals,
+			availableModes,
+			currentDecision: {
+				mode: goal.execution.selected,
+				status: "ready",
+				source: goal.execution.source === "user" ? "user" : "auto",
+				locked: goal.execution.source === "user",
+				reasons: goal.execution.reasons,
+				shouldReassess: goal.execution.source !== "user",
+			},
+		});
+		if (routed.status === "blocked") return { execution: null, blockedReason: routed.reasons.join(" ") };
+		if (routed.mode === goal.execution.selected) return { execution: null, blockedReason: null };
+		return {
+			execution: {
+				...goal.execution,
+				selected: routed.mode,
+				...(routed.mode === "specialist" && goal.execution.role ? { role: goal.execution.role } : { role: undefined }),
+				source: goal.execution.source === "user" ? "user" : "auto",
+				confidence: Math.max(0.5, Math.min(0.9, goal.execution.confidence)),
+				reasons: ["Runtime reassessment trigger: " + trigger + ".", ...routed.reasons],
+			},
+			blockedReason: null,
+		};
 	}
 
 	function reconstruct(ctx: ExtensionContext) {
 		goal = null;
+		progressRuntime.reset(nowMs());
+		lastOutcomeSignature = null;
 		clearTimer();
-		turnStartedAt = null;
-		turnGoalId = null;
+		clearFooterTicker();
+		currentTurn = null;
+		snapshotRevision = 0;
+		reconstructionError = null;
 		lastAssistantText = "";
 		wasGoalDriven = false;
 		continuationQueued = false;
 		userSuspended = false;
 		judgeParseFailures = 0;
 		lastJudgeVerdict = null;
-		for (const entry of ctx.sessionManager.getBranch()) {
+		const branch = ctx.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
 			if (entry.type !== "custom" || entry.customType !== GOAL_STORAGE_TYPE) continue;
-			const data = (entry as { data?: Partial<GoalSnapshot> }).data;
-			if (data?.goal !== undefined) goal = data.goal ? { ...data.goal } as GoalState : null;
+			const entryTimestampValue = (entry as unknown as { timestamp?: unknown }).timestamp;
+			const entryTimestamp = typeof entryTimestampValue === "number"
+				? entryTimestampValue
+				: typeof entryTimestampValue === "string" ? Date.parse(entryTimestampValue) : undefined;
+			const decoded = decodeGoalSnapshot((entry as { data?: unknown }).data, {
+				entryTimestamp: entryTimestamp !== undefined && Number.isFinite(entryTimestamp) ? entryTimestamp : undefined,
+				legacyRevision: index + 1,
+			});
+			if (!decoded.ok) {
+				reconstructionError = decoded.message;
+				ctx.ui?.notify?.("Goal state could not be restored safely: " + decoded.message, "error");
+				return;
+			}
+				snapshotRevision = decoded.snapshot.revision;
+				goal = decoded.snapshot.goal;
+				if (goal) {
+					progressRuntime.reset(nowMs(), goal.progress.lastOutcomeDeltaAt);
+					lastOutcomeSignature = outcomeSignature(goal);
+				}
+				return;
 		}
 	}
 
 	function setGoal(
-		objective: string, criteria: string[], constraints: string[],
-		opts: { tokenBudget?: number | null; taskType?: "coding" | "research" | "pm" | "review"; executionMode?: "single" | "orchestrated"; singleRationale?: string }, ctx: ExtensionContext,
+		proposal: GoalProposal,
+		opts: { tokenBudget?: number | null }, ctx: ExtensionContext,
 	): GoalState {
-		const now = Date.now();
+		const now = nowMs();
 		if (goal?.status === "active") {
-			goal.status = "blocked";
-			goal.blocker = "Replaced by new goal";
-			goal.updatedAt = now;
+			updateState({ status: "blocked", blocker: "Replaced by new goal" }, ctx);
 		}
-		const criteriaStates: Criterion[] = criteria.map((desc) => ({
-			id: "c" + randomUUID().slice(0, 6),
-			description: desc,
-			evidence: [],
-		}));
-		const newGoal: GoalState = {
-			id: randomUUID(), objective, status: "active", criteria: criteriaStates, constraints,
-			tokenBudget: opts.tokenBudget ?? null, tokensUsed: 0, timeUsedMs: 0,
-			createdAt: now, updatedAt: now, noProgressCount: 0, autoTurnCount: 0,
-			pausedReason: null, blocker: null, completionEvidence: null,
-			taskType: opts.taskType,
-			reviewerPassed: false,
-			executionMode: opts.executionMode,
-			singleRationale: opts.singleRationale,
-			// G7 预审: single+非coding 创建时 pending (须执行前预审); 其他模式 undefined.
-			singleRationaleStatus: (opts.taskType && opts.taskType !== "coding" && opts.executionMode === "single") ? "pending" : undefined,
-		};
+		const newGoal = createGoalStateV2({
+			id: randomUUID(),
+			objective: proposal.objective,
+			criteria: proposal.criteria.map((criterion) => ({ id: "c" + randomUUID().slice(0, 6), ...criterion })),
+			constraints: proposal.constraints,
+			taskKind: proposal.taskKind,
+			execution: proposal.execution,
+			assurance: proposal.assurance,
+			tokenBudget: opts.tokenBudget,
+			now,
+		});
+		newGoal.claims = proposal.claims.map((claim) => ({ ...claim, evidenceRefs: [...claim.evidenceRefs] }));
 		goal = newGoal;
+		progressRuntime.reset(now, newGoal.progress.lastOutcomeDeltaAt);
+		lastOutcomeSignature = outcomeSignature(newGoal);
+		currentTurn = null;
 		userSuspended = false;
 		continuationQueued = false;
 		persist("set");
 		updateFooter(ctx);
+		syncFooterTicker(ctx);
 		syncTools();
 		sendContinuation(ctx);
 		return newGoal;
@@ -671,7 +1031,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		clearTimer();
 		userSuspended = true;
 		pi.sendMessage(
-			{ customType: GOAL_EVENT_TYPE, content: "Goal paused: " + reason + "\n\nObjective: " + goal.objective, display: true, details: { kind: "paused", goal: { ...goal } } },
+			{ customType: GOAL_EVENT_TYPE, content: "Goal paused: " + reason + "\n\nObjective: " + goal.objective, display: true, details: { kind: "paused", goal: { ...goal }, progress: progressFor(goal) } },
 			{ triggerTurn: false },
 		);
 		return true;
@@ -687,7 +1047,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		// maxAutoTurns is now per-resume-cycle; no-progress remains the lifetime backstop.
 		updateState({ status: "active", noProgressCount: 0, autoTurnCount: 0, pausedReason: null }, ctx);
 		pi.sendMessage(
-			{ customType: GOAL_EVENT_TYPE, content: "Goal resumed.\n\nObjective: " + goal.objective, display: true, details: { kind: "resumed", goal: { ...goal } } },
+			{ customType: GOAL_EVENT_TYPE, content: "Goal resumed.\n\nObjective: " + goal.objective, display: true, details: { kind: "resumed", goal: { ...goal }, progress: progressFor(goal) } },
 			{ triggerTurn: false },
 		);
 		sendContinuation(ctx);
@@ -696,16 +1056,22 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	function clearGoal(ctx: ExtensionContext): boolean {
 		if (!goal) return false;
+		settleCurrentTurnTime();
 		clearTimer();
+		clearFooterTicker();
 		const oldGoal = goal;
+		const oldProgress = progressFor(oldGoal);
 		goal = null;
+		progressRuntime.reset(nowMs());
+		lastOutcomeSignature = null;
+		currentTurn = null;
 		userSuspended = false;
 		continuationQueued = false;
 		persist("clear");
 		updateFooter(ctx);
 		syncTools();
 		pi.sendMessage(
-			{ customType: GOAL_EVENT_TYPE, content: "Goal cleared.", display: true, details: { kind: "cleared", goal: oldGoal } },
+			{ customType: GOAL_EVENT_TYPE, content: "Goal cleared.", display: true, details: { kind: "cleared", goal: oldGoal, progress: oldProgress } },
 			{ triggerTurn: false },
 		);
 		return true;
@@ -790,9 +1156,9 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				return;
 			}
 			const criteriaSummary = goal.criteria.map((c) => "  " + (c.evidence.length > 0 ? "✅" : "⏳") + " [" + c.id + "] " + c.description).join("\n");
-			const result = await complete(model, {
+			const result = await dependencies.complete(model, {
 				systemPrompt: "You are a senior engineer unblocking a stalled autonomous agent. Reply with ONE concrete next step.",
-				messages: [{ role: "user", content: [{ type: "text", text: buildEscalationPrompt({ objective: goal.objective, criteriaSummary }) }], timestamp: Date.now() }],
+				messages: [{ role: "user", content: [{ type: "text", text: buildEscalationPrompt({ objective: goal.objective, criteriaSummary }) }], timestamp: nowMs() }],
 			}, { apiKey: auth.apiKey, headers: auth.headers, temperature: 0.4, maxTokens: 512, timeoutMs: CONFIG.escalateTimeoutMs });
 			const suggestion = extractTextContent(result).trim();
 			if (!suggestion) {
@@ -814,6 +1180,23 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		if (!goal || goal.status !== "active") { diag(ctx, "scheduleContinuation: skip (goal=" + (goal ? goal.status : "null") + ")"); return; }
 		if (!ctx.isIdle() || ctx.hasPendingMessages()) { diag(ctx, "scheduleContinuation: skip (not idle / pending messages)"); return; }
 		if (goal.noProgressCount >= CONFIG.maxNoProgressTurns) {
+			const reroute = reassessGoalExecution({
+				uncertainty: "high",
+				coupling: "medium",
+				risk: "low",
+				specialistNeed: goal.execution.role ? "helpful" : "none",
+				independentWorkstreams: goal.execution.selected === "team" ? 2 : 1,
+				heterogeneousSkills: goal.execution.selected === "team",
+				effort: "medium",
+				repeatedFailureCount: goal.noProgressCount,
+				remainingWorkstreams: goal.execution.selected === "team" ? 2 : 1,
+			}, "stalled");
+			if (reroute.execution) {
+				updateState({ execution: reroute.execution, noProgressCount: 0 }, ctx);
+				ctx.ui?.notify?.("Goal route changed to " + reroute.execution.selected + " after repeated stalled turns.", "info");
+				sendContinuation(ctx);
+				return;
+			}
 			// GG-3: if a stuckEscalateModel is configured, escalate to it for a fresh
 			// next step instead of pausing (fire-and-forget; it pauses on failure).
 			if (goalConfig.stuckEscalateModel) {
@@ -837,7 +1220,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			if (!goal || goal.status !== "active") return;
 			if (userSuspended) return;
 			sendContinuation(ctx);
-		}, CONFIG.minContinueIntervalMs);
+		}, dependencies.minContinueIntervalMs);
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
@@ -852,27 +1235,39 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		// Short-circuit: leave the parent's closure untouched. The subagent runs
 		// its own goal-less context.
 		if (isSubagentSession(ctx)) return;
+		shuttingDown = false;
+		observedRoleCatalog = null;
 		// Load project-local config (opt out of superpowers integration).
 		goalConfig = loadGoalConfig(ctx.cwd, isTrusted(ctx));
 		reconstruct(ctx);
 		syncTools();
 		if (goal?.status === "active") {
-			goal = { ...goal, status: "paused", pausedReason: "session reload", updatedAt: Date.now() };
-			persist("status");
+			updateState({ status: "paused", pausedReason: "session reload" }, ctx);
 			ctx.ui.notify("\u23F8 Goal paused (session reload): " + goal.objective.slice(0, 80) + "\u2026\nUse /goal resume to continue.", "info");
 		} else if (goal) {
 			ctx.ui.notify("\uD83C\uDFAF Goal restored: " + goal.objective.slice(0, 80) + "\u2026 (" + goal.status + ")", "info");
 		}
 		updateFooter(ctx);
+		syncFooterTicker(ctx);
 	});
 
-	pi.on("session_tree", async (_event, ctx) => { if (isSubagentSession(ctx)) return; reconstruct(ctx); syncTools(); updateFooter(ctx); });
-	pi.on("session_shutdown", async () => { shuttingDown = true; clearTimer(); turnStartedAt = null; turnGoalId = null; });
+	pi.on("session_tree", async (_event, ctx) => { if (isSubagentSession(ctx)) return; reconstruct(ctx); syncTools(); updateFooter(ctx); syncFooterTicker(ctx); });
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (isSubagentSession(ctx)) return;
+		shuttingDown = true;
+		clearTimer();
+		clearFooterTicker();
+		if (settleCurrentTurnTime() && goal) persist("usage");
+		currentTurn = null;
+		progressRuntime.turnEnded(nowMs());
+		updateFooter(ctx);
+	});
 
 	// Provider rate-limit / server errors → usage_limited (distinct from a
 	// user-set token budget). Pause so the user can /goal resume once the
 	// provider recovers; do not auto-resume (mirrors budget_limited).
 	pi.on("after_provider_response", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
 		if (!goal || goal.status !== "active") return;
 		if (event.status !== 429 && event.status < 500) return;
 		const retryAfter = event.headers?.["retry-after"] ?? event.headers?.["Retry-After"];
@@ -883,18 +1278,61 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		clearTimer();
 		userSuspended = true;
 		pi.sendMessage(
-			{ customType: GOAL_EVENT_TYPE, content: "Goal usage-limited: " + reason + "\n\nObjective: " + goal.objective + "\nUse /goal resume to continue once the provider recovers.", display: true, details: { kind: "usage_limited", goal: { ...goal } } },
+			{ customType: GOAL_EVENT_TYPE, content: "Goal usage-limited: " + reason + "\n\nObjective: " + goal.objective + "\nUse /goal resume to continue once the provider recovers.", display: true, details: { kind: "usage_limited", goal: { ...goal }, progress: progressFor(goal) } },
 			{ triggerTurn: false },
 		);
 		if (ctx.hasUI) ctx.ui.notify("\u26A0\uFE0F Goal paused (usage limited): " + reason, "warning");
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("tool_result", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
+		if (event.toolName !== "list_roles" || event.isError) return;
+		const details = event.details && typeof event.details === "object"
+			? event.details as { roles?: unknown }
+			: null;
+		let roles = details?.roles;
+		if (!Array.isArray(roles)) {
+			const text = event.content.find((item) => item.type === "text")?.text;
+			if (text) {
+				try { roles = (JSON.parse(text) as { roles?: unknown }).roles; } catch { roles = undefined; }
+			}
+		}
+		if (!Array.isArray(roles)) return;
+		const names = roles
+			.map((item) => item && typeof item === "object" ? (item as { name?: unknown }).name : undefined)
+			.filter((name): name is string => typeof name === "string" && Boolean(name.trim()))
+			.map((name) => name.trim());
+		observedRoleCatalog = [...new Set(names)].sort();
+	});
+
+	pi.on("tool_execution_start", (event, ctx) => {
+		if (!goal || goal.status !== "active" || isSubagentSession(ctx)) return;
+		// Reading the projection must not make the projection report itself as work.
+		if (event.toolName === "get_goal") return;
+		progressRuntime.toolStarted(event.toolCallId, event.toolName, event.args, nowMs());
+		updateFooter(ctx);
+	});
+
+	pi.on("tool_execution_update", (event, ctx) => {
+		if (!goal || goal.status !== "active" || isSubagentSession(ctx)) return;
+		progressRuntime.toolUpdated(event.toolCallId, event.toolName, event.partialResult, nowMs());
+		updateFooter(ctx);
+	});
+
+	pi.on("tool_execution_end", (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
+		progressRuntime.toolEnded(event.toolCallId, event.result, event.isError, nowMs());
+		if (goal) updateFooter(ctx);
+	});
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
 		if (!goal || goal.status !== "active") return;
 		return { systemPrompt: event.systemPrompt + "\n\n" + goalSystemPrompt(goal, goalConfig) };
 	});
 
-	pi.on("context", async (event) => {
+	pi.on("context", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
 		if (!goal) return;
 		let lastContinuationIdx = -1;
 		const messages = event.messages as Array<{ customType?: string; details?: { goalId?: string } }>;
@@ -913,21 +1351,32 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("turn_start", async () => {
-		if (goal?.status === "active") { turnStartedAt = Date.now(); turnGoalId = goal.id; }
+	pi.on("turn_start", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
+		if (!goal || goal.status !== "active") return;
+		const turnId = goal.id + ":" + event.turnIndex + ":" + event.timestamp;
+		currentTurn = { turnId, goalId: goal.id };
+		turnAccounting.beginTurn({ ...currentTurn, startedAtMs: event.timestamp });
+		progressRuntime.turnStarted(event.timestamp);
+		updateFooter(ctx);
+		syncFooterTicker(ctx);
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
-		if (!goal || goal.status !== "active" || turnGoalId !== goal.id) return;
-		const elapsed = turnStartedAt ? Date.now() - turnStartedAt : 0;
+		if (isSubagentSession(ctx)) return;
+		if (!goal || !currentTurn || currentTurn.goalId !== goal.id) return;
+		const identity = currentTurn;
 		const outputTokens = extractOutputTokens(event);
-		turnStartedAt = null; turnGoalId = null;
-		goal.timeUsedMs += elapsed;
-		goal.tokensUsed += outputTokens;
+		const settlement = turnAccounting.settleTurn(identity, nowMs(), outputTokens);
+		currentTurn = null;
+		progressRuntime.turnEnded(nowMs());
+		if (settlement.time.applied) goal.timeUsedMs += settlement.time.elapsedMs;
+		if (settlement.tokens.applied) goal.tokensUsed += settlement.tokens.outputTokens;
+		turnAccounting.release(identity.turnId);
 		// Only count no-progress on goal-driven turns. A user-driven turn (an
 		// interrupt with guidance) is engagement, not stagnation — it must not
 		// trip the no-progress auto-pause.
-		if (wasGoalDriven) {
+		if (wasGoalDriven && goal.status === "active") {
 			// A turn that executed tool calls made forward progress even when the
 			// final assistant message had <threshold output tokens (e.g. a turn
 			// that ended on a tool-result message). Reset no-progress in that
@@ -937,21 +1386,66 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			else goal.noProgressCount = 0;
 			goal.autoTurnCount += 1;
 		}
-		if (goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) {
-			goal.status = "budget_limited"; goal.updatedAt = Date.now();
-			goal.noProgressCount = 0;
-			persist("budget_limited"); updateFooter(ctx); syncTools();
+		if (isAssistantMessage(event.message)) lastAssistantText = extractTextContent(event.message);
+			if (goal.status === "active" && goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) {
+				const completionPolicy = goalConfig.completionPolicy ?? "v2";
+				const pendingV2Request = completionPolicy === "v2" && hasPendingCompletionRequest(goal);
+				if (pendingV2Request) {
+					// UX finding: the reviewer accepted, the agent requested completion,
+					// then the budget gate fired before the authoritative judge ran —
+					// finished work was stranded at budget_limited. Evaluate once before
+					// closing the goal; a revise still falls through to budget_limited.
+					// A pure tool-call turn has no text: judge from the evidence packet.
+					const verification = goalConfig.verifyCommand
+						? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
+						: undefined;
+					progressRuntime.evaluationStarted(nowMs());
+					const v2Run = await runV2CompletionJudge(goal, lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)", ctx, pi, goalConfig, verification, dependencies.complete);
+					progressRuntime.evaluationEnded(nowMs());
+					updateFooter(ctx);
+					const transition = applyAuthoritativeCompletionEvaluation(goal, v2Run.evaluation);
+					if (transition.status === "complete") {
+						updateState({ status: "complete", completion: transition.completion, noProgressCount: 0 }, ctx);
+						pi.sendMessage({
+							customType: GOAL_EVENT_TYPE,
+							content: "Goal achieved! \u2705\n\nObjective: " + goal.objective +
+								"\nEvaluator: Goal V2 accepted the persisted evidence packet (evaluated at budget limit)." +
+								"\nTokens: " + formatTokens(goal.tokensUsed) + "\nTime: " + formatDuration(goal.timeUsedMs),
+							display: true,
+							details: { kind: "complete", goal: { ...goal, status: "complete" }, progress: progressFor(goal) },
+						}, { triggerTurn: false });
+						return;
+					}
+					if (transition.status === "paused") {
+						updateState({
+							status: "paused",
+							completion: transition.completion,
+							pausedReason: transition.pausedReason,
+							noProgressCount: 0,
+						}, ctx);
+						clearTimer();
+						userSuspended = true;
+						ctx.ui?.notify?.("Goal paused after the same completion rejection repeated three times.", "warning");
+						return;
+					}
+					updateState({ completion: transition.completion, noProgressCount: 0 }, ctx);
+				}
+				updateState({ status: "budget_limited", noProgressCount: 0 }, ctx);
+				clearTimer();
+				userSuspended = true;
 			pi.sendMessage(
-				{ customType: GOAL_EVENT_TYPE, content: budgetLimitPrompt(goal), display: true, details: { kind: "budget_limited", goal: { ...goal } } },
+				{ customType: GOAL_EVENT_TYPE, content: budgetLimitPrompt(goal), display: true, details: { kind: "budget_limited", goal: { ...goal }, progress: progressFor(goal) } },
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
 			return;
 		}
-		if (isAssistantMessage(event.message)) lastAssistantText = extractTextContent(event.message);
-		persist("update"); updateFooter(ctx);
+		if (settlement.time.applied || settlement.tokens.applied) persist("usage");
+		updateFooter(ctx);
+		syncFooterTicker(ctx);
 	});
 
-	pi.on("input", async (event) => {
+	pi.on("input", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
 		// A user typed something. Cancel any pending auto-continuation so the
 		// user's message is processed first — but do NOT permanently suspend the
 		// goal. An interrupt (steer/followUp) injects guidance; the user expects
@@ -967,17 +1461,80 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
 		const goalDriven = wasGoalDriven;
 		wasGoalDriven = false;
 		if (!goal || goal.status !== "active") return;
 		if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
 		if (ctx.hasPendingMessages()) return;
 
-		// Judge + completion check only on goal-driven turns. A user-driven turn
-		// (an interrupt with guidance/clarification) is not goal-progress
-		// evidence, so we skip the judge and simply resume the goal below.
-		if (goalDriven && lastAssistantText.trim()) {
-			const verdict = await runJudge(goal, lastAssistantText, ctx, pi, goalConfig);
+		// Completion checks only consume goal-driven turns. V2 evaluates exactly
+		// once per explicit request; legacy remains turn-based for compatibility.
+		// A pending request must be judged even when the turn ended on a pure
+		// tool call with no assistant text (UX finding: lastAssistantText stayed
+		// empty, so neither the judge nor scheduleContinuation ever ran).
+		const responseText = lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)";
+		if (goalDriven) {
+				const completionPolicy = goalConfig.completionPolicy ?? "v2";
+			const pendingV2Request = completionPolicy !== "legacy" && hasPendingCompletionRequest(goal);
+			if (pendingV2Request) {
+				progressRuntime.evaluationStarted(nowMs());
+				updateFooter(ctx);
+			}
+			const verification = pendingV2Request && goalConfig.verifyCommand
+				? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
+				: undefined;
+
+			if (pendingV2Request) {
+					const v2Run = await runV2CompletionJudge(goal, responseText, ctx, pi, goalConfig, verification, dependencies.complete);
+				progressRuntime.evaluationEnded(nowMs());
+				updateFooter(ctx);
+				if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
+				if (completionPolicy === "shadow") {
+					updateState({ completion: applyShadowCompletionEvaluation(goal, v2Run.evaluation) }, ctx);
+				} else {
+					const transition = applyAuthoritativeCompletionEvaluation(goal, v2Run.evaluation);
+					if (transition.status === "complete") {
+						updateState({ status: "complete", completion: transition.completion, noProgressCount: 0 }, ctx);
+						pi.sendMessage({
+							customType: GOAL_EVENT_TYPE,
+							content: "Goal achieved! \u2705\n\nObjective: " + goal.objective +
+								"\nEvaluator: Goal V2 accepted the persisted evidence packet." +
+								"\nTokens: " + formatTokens(goal.tokensUsed) + "\nTime: " + formatDuration(goal.timeUsedMs),
+							display: true,
+							details: { kind: "complete", goal: { ...goal, status: "complete" }, progress: progressFor(goal) },
+						}, { triggerTurn: false });
+						return;
+					}
+					if (transition.status === "paused") {
+						updateState({
+							status: "paused",
+							completion: transition.completion,
+							pausedReason: transition.pausedReason,
+							noProgressCount: 0,
+						}, ctx);
+						clearTimer();
+						userSuspended = true;
+						ctx.ui?.notify?.("Goal paused after the same completion rejection repeated three times.", "warning");
+						return;
+					}
+					updateState({ completion: transition.completion, noProgressCount: 0 }, ctx);
+					if (transition.rejectionAction === "replan") {
+						ctx.ui?.notify?.("Completion was rejected again; the next turn must change verification strategy or replan.", "warning");
+					}
+				}
+			}
+
+			if (completionPolicy === "v2") {
+				scheduleContinuation(ctx);
+				return;
+			}
+
+			progressRuntime.evaluationStarted(nowMs());
+			updateFooter(ctx);
+			const verdict = await runJudge(goal, responseText, ctx, pi, goalConfig, verification, dependencies.complete);
+			progressRuntime.evaluationEnded(nowMs());
+			updateFooter(ctx);
 			lastJudgeVerdict = verdict;
 			// runJudge's LLM call is not abort-wired, so an ESC during the judge
 			// call is only observable now. Do not apply a verdict (e.g. mark the
@@ -993,15 +1550,72 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				}
 			} else { judgeParseFailures = 0; }
 
+			if (completionPolicy === "legacy" && !verdict.done) {
+				const findings = [{
+					code: "external_blocker" as const,
+					subjectId: "$goal",
+					reason: verdict.reason,
+				}];
+				const evaluation: CompletionEvaluation = {
+					decision: "revise",
+					evaluatedAt: nowMs(),
+					criterionCoverage: [],
+					claimCoverage: [],
+					findings,
+					advisories: [],
+					evaluator: { kind: "judge" },
+					fingerprint: rejectionFingerprint(findings),
+				};
+				updateState({ completion: { ...goal.completion, lastEvaluation: evaluation } }, ctx);
+			}
+
 			if (verdict.done) {
 				// 深修 D: route through canComplete gate (evidence + reviewer for non-coding).
-				const gate = canComplete(goal);
+					const gate = canComplete({
+						criteria: goal.criteria
+							.filter((criterion) => criterion.level === "blocking")
+							.map((criterion) => ({ evidence: criterion.evidence.map((item) => item.summary) })),
+						reviewRequired: goal.assurance.reviewRequirement === "required",
+						reviewerPassed: goal.assurance.reviewStatus === "passed",
+						reviewerVerdict: goal.assurance.reviewStatus === "passed" ? {} : undefined,
+					});
 				if (!gate.ok) {
 					ctx.ui.notify("\u26A0\uFE0F Judge says done, but " + gate.reason + ". Continuing...", "warning");
-				} else {
-					updateState({ status: "complete", completionEvidence: verdict.reason, noProgressCount: 0 }, ctx);
+					const uncovered = goal.criteria.filter((criterion) => criterion.level === "blocking" && criterion.evidenceRefs.length === 0);
+					const findings = uncovered.length > 0
+						? uncovered.map((criterion) => ({
+							code: "blocking_requirement_unsatisfied" as const,
+							subjectId: criterion.id,
+							reason: "The legacy completion gate has no persisted evidence for this blocking criterion.",
+							missingEvidenceKind: "observation" as const,
+						}))
+						: [{ code: "external_blocker" as const, subjectId: "$goal", reason: gate.reason ?? "Legacy completion gate rejected the goal." }];
+					const evaluation: CompletionEvaluation = {
+						decision: "revise",
+						evaluatedAt: nowMs(),
+						criterionCoverage: [],
+						claimCoverage: [],
+						findings,
+						advisories: [],
+						evaluator: { kind: "judge" },
+						fingerprint: rejectionFingerprint(findings),
+					};
+					updateState({ completion: { ...goal.completion, lastEvaluation: evaluation } }, ctx);
+					} else {
+						const requestedAt = goal.completion.requestedAt ?? nowMs();
+						const evaluatedAt = Math.max(nowMs(), requestedAt, (goal.completion.lastEvaluation?.evaluatedAt ?? -1) + 1);
+						const keepShadowAudit = completionPolicy === "shadow"
+							&& goal.completion.lastEvaluation?.advisories.includes(SHADOW_COMPLETION_ADVISORY);
+						const lastEvaluation = keepShadowAudit
+							? goal.completion.lastEvaluation
+							: legacyAcceptedEvaluation(goal, verdict.reason, evaluatedAt);
+						updateState({
+							status: "complete",
+							completion: { ...goal.completion, summary: verdict.reason, requestedAt, lastEvaluation },
+							noProgressCount: 0,
+						}, ctx, { preserveFreshEvaluation: keepShadowAudit });
 					pi.sendMessage(
-						{ customType: GOAL_EVENT_TYPE, content: "Goal achieved! \u2705\n\nObjective: " + goal.objective + "\nJudge: " + verdict.reason + "\nTokens: " + formatTokens(goal.tokensUsed) + "\nTime: " + formatDuration(goal.timeUsedMs), display: true, details: { kind: "complete", goal: { ...goal, status: "complete" } } },
+						{ customType: GOAL_EVENT_TYPE, content: "Goal achieved! \u2705\n\nObjective: " + goal.objective + "\nJudge: " + verdict.reason + "\nTokens: " + formatTokens(goal.tokensUsed) + "\nTime: " + formatDuration(goal.timeUsedMs), display: true, details: { kind: "complete", goal: { ...goal, status: "complete" }, progress: progressFor(goal) } },
 						{ triggerTurn: false },
 					);
 					return;
@@ -1018,42 +1632,27 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 	// ═══════════════════════════════════════════════════════════════════
 
 	pi.registerMessageRenderer(GOAL_EVENT_TYPE, (message, options, theme) => {
-		const details = message.details as { kind?: string; goal?: GoalState | null; judgeVerdict?: JudgeVerdict | null } | undefined;
-		const kind = details?.kind ?? "event";
+		const details = message.details as { kind?: string; goal?: GoalState | null; progress?: GoalProgressSnapshot; judgeVerdict?: JudgeVerdict | null } | undefined;
 		const state = details?.goal ?? null;
 		const judge = details?.judgeVerdict ?? null;
-		const labels: Record<string, (t: typeof theme) => string> = {
-			active: (t) => t.fg("accent", "active"), continuing: (t) => t.fg("muted", "continuing"),
-			paused: (t) => t.fg("warning", "paused"), resumed: (t) => t.fg("accent", "resumed"),
-			cleared: (t) => t.fg("dim", "cleared"), budget_limited: (t) => t.fg("warning", "budget reached"),
-			usage_limited: (t) => t.fg("warning", "usage limited"), blocked: (t) => t.fg("error", "blocked"),
-			status: (t) => t.fg("accent", "status"),
-			complete: (t) => t.fg("success", "achieved"), unmet: (t) => t.fg("error", "unmet"),
-		};
+		// Older events did not embed a progress snapshot. Freeze their fallback at
+		// the event-owned state timestamp so a historical paused card cannot keep
+		// accumulating wall time whenever the session is rendered again.
+		const progress = details?.progress ?? (state ? progressFor(state, state.endedAt ?? state.updatedAt) : null);
 		return {
-			render: () => {
-				const lines: string[] = [];
-				const prefix = theme.fg("accent", theme.bold("Goal"));
-				const label = (labels[kind] ?? ((t: typeof theme) => t.fg("text", kind)))(theme);
-				lines.push(prefix + " " + label + (!options.expanded ? " " + theme.fg("dim", "(ctrl+o)") : ""));
-				if (options.expanded && state) {
-					lines.push(theme.fg("dim", "  Objective: ") + theme.fg("text", state.objective));
-					if (state.criteria?.length) {
-						for (const c of state.criteria) {
-							const icon = c.evidence?.length > 0 ? "\u2705" : "\u23F3";
-							lines.push(theme.fg("dim", "  " + icon + " ") + theme.fg("text", c.description));
-						}
-					}
-					const usage = state.tokenBudget
-						? formatTokens(state.tokensUsed) + "/" + formatTokens(state.tokenBudget)
-						: formatDuration(state.timeUsedMs);
-					lines.push(theme.fg("dim", "  Usage: ") + theme.fg("text", usage));
-					if (judge && !judge.parseFailed) {
-						const jl = judge.done ? theme.fg("success", "DONE") : theme.fg("muted", "CONTINUE");
-						lines.push(theme.fg("dim", "  Judge: ") + jl + theme.fg("dim", " — ") + theme.fg("text", judge.reason));
-					}
+			render: (width: number) => {
+				if (!progress) return [theme.fg("dim", "Goal event")];
+				if (!options.expanded) {
+					const color = progress.health.state === "blocked" ? "error"
+						: progress.health.state === "attention" ? "warning"
+						: progress.status === "complete" ? "success" : "accent";
+					return [theme.fg(color, renderCompactGoalProgress(progress, width))];
 				}
-				return lines;
+				const lines = renderGoalProgressLines(progress, width);
+				if (judge && !judge.parseFailed) {
+					lines.push(truncateDisplay("  Legacy judge: " + (judge.done ? "DONE" : "CONTINUE") + " | " + judge.reason, width));
+				}
+				return lines.map((line, index) => theme.fg(index === 0 ? "accent" : "text", line));
 			},
 			invalidate: () => {},
 		};
@@ -1065,36 +1664,143 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "get_goal", label: "Get Goal",
-		description: "Read the current active goal: objective, status, criteria, token usage, and budget.",
+		description: "Read the current Goal V2 public view, including execution, assurance, evidence coverage, and live usage.",
 		parameters: Type.Object({}),
-		async execute() {
-			if (!goal) return { content: [{ type: "text", text: "No goal is currently set." }], details: {} as { goal?: GoalState } };
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			if (!goal) {
+				const text = reconstructionError ? "Goal state is unavailable: " + reconstructionError : "No goal is currently set.";
+				return { content: [{ type: "text", text }], isError: Boolean(reconstructionError), details: { reconstructionError } };
+			}
+			const now = nowMs();
+			const progress = progressFor(goal, now);
+			const publicEvaluation = goal.completion.lastEvaluation ? {
+				...goal.completion.lastEvaluation,
+				evaluator: {
+					kind: goal.completion.lastEvaluation.evaluator.kind,
+					model: goal.completion.lastEvaluation.evaluator.model,
+					agentId: goal.completion.lastEvaluation.evaluator.agentId,
+					sessionId: goal.completion.lastEvaluation.evaluator.sessionId,
+					reportDigest: goal.completion.lastEvaluation.evaluator.reportDigest,
+				},
+			} : null;
+			const view = {
+				apiVersion: 2,
+				id: goal.id,
+				objective: goal.objective,
+					status: goal.status,
+					pausedReason: goal.pausedReason,
+					blocker: goal.blocker,
+				taskKind: goal.taskKind,
+				criteria: goal.criteria.map(({ id, description, level, evidenceRefs }) => ({ id, description, level, evidenceRefs })),
+				constraints: goal.constraints,
+				execution: goal.execution,
+				assurance: goal.assurance,
+				claims: goal.claims,
+				evidenceLedger: goal.evidenceLedger,
+				completion: { ...goal.completion, lastEvaluation: publicEvaluation },
+				progress,
+				usage: progress.resources,
+			};
 			return {
-				content: [{ type: "text", text: serializeGoalText(goal) }],
-				details: { goal },
+				content: [{ type: "text", text: JSON.stringify(view, null, 2) }],
+				details: { goal: view },
 			};
 		},
 	});
 
 	pi.registerTool({
 		name: "update_goal", label: "Update Goal",
-		description: "Update the active goal. Submit evidence per criterion, or mark goal complete/unmet.",
+		description: "Apply exactly one Goal V2 action. Legacy flat arguments remain accepted for one compatibility cycle.",
 		parameters: Type.Object({
+			action: Type.Optional(StringEnum(["record_evidence", "upsert_claim", "request_completion", "record_review", "change_execution", "mark_unmet"] as const)),
 			status: Type.Optional(StringEnum(["complete", "unmet"] as const)),
-			evidence: Type.Optional(Type.String({ description: "Required for complete." })),
-			blocker: Type.Optional(Type.String({ description: "Required for unmet." })),
-			criterionId: Type.Optional(Type.String({ description: "ID of criterion for per-criterion evidence." })),
-			// 深修 D: reviewer APPROVE writeback. Set true after an independent reviewer
-			// (subagent ≠ producer) approves — opens the complete gate for non-coding goals.
-			reviewerPassed: Type.Optional(Type.Boolean({ description: "Set true after independent reviewer APPROVE (opens complete gate for non-coding goals)." })),
-			// 第2条: 结构化验收凭证. reviewerPassed=true (非 coding) 必携. 含 model/thinkingLevel/
-			// verifiedSources/checksPassed/reportPath. handler 读 reportPath 重跑 verifyQualityGates
-			// 验 checksPassed 真伪 (第3条), 防 reviewer 自报假数值.
+				evidence: Type.Optional(Type.Union([Type.String(), Type.Object({
+				id: Type.Optional(Type.String()),
+				kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text"] as const),
+				summary: Type.String(),
+				locator: Type.Optional(Type.String()),
+				excerpt: Type.Optional(Type.String()),
+				sourceKind: Type.Optional(StringEnum(["primary", "secondary", "workspace", "user"] as const)),
+				independenceKey: Type.Optional(Type.String()),
+				origin: Type.Optional(StringEnum(["tool", "agent", "user", "legacy"] as const)),
+				verification: Type.Optional(StringEnum(["unverified", "verified", "rejected"] as const)),
+				})])),
+				evidenceId: Type.Optional(Type.String({ description: "Reuse an existing ledger entry by ID when evidence is omitted." })),
+				blocker: Type.Optional(Type.String({ description: "Required for unmet." })),
+				criterionId: Type.Optional(Type.String({ description: "ID of criterion for per-criterion evidence." })),
+				criterionIds: Type.Optional(Type.Array(Type.String())),
+				claimId: Type.Optional(Type.String()),
+				claimIds: Type.Optional(Type.Array(Type.String())),
+			claim: Type.Optional(Type.Object({
+				id: Type.String(), text: Type.String(),
+				materiality: StringEnum(["material", "supporting"] as const),
+				risk: Type.Optional(StringEnum(["ordinary", "high"] as const)),
+				evidenceRefs: Type.Optional(Type.Array(Type.String())),
+			})),
+			summary: Type.Optional(Type.String()),
+			decision: Type.Optional(StringEnum(["accept", "revise", "blocked"] as const)),
+			findings: Type.Optional(Type.Array(Type.Object({
+				code: Type.String(), subjectId: Type.String(), reason: Type.String(),
+				evidenceRefs: Type.Optional(Type.Array(Type.String())),
+				missingEvidenceKind: Type.Optional(StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text"] as const)),
+			}))),
+				advisories: Type.Optional(Type.Array(Type.String())),
+				review: Type.Optional(Type.Object({
+					status: StringEnum(["passed", "failed"] as const),
+					reason: Type.String(),
+					evaluator: Type.Object({
+						kind: StringEnum(["reviewer"] as const),
+						model: Type.Optional(Type.String()),
+						agentId: Type.String(),
+						sessionId: Type.Optional(Type.String()),
+						reportDigest: Type.Optional(Type.String()),
+						legacySessionFile: Type.Optional(Type.String()),
+					}),
+					sessionFile: Type.String({ description: "Readable sessionFile returned by spawn_role." }),
+					findings: Type.Optional(Type.Array(Type.Object({
+						code: Type.String(), subjectId: Type.String(), reason: Type.String(),
+						evidenceRefs: Type.Optional(Type.Array(Type.String())),
+						missingEvidenceKind: Type.Optional(StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text"] as const)),
+					}))),
+					advisories: Type.Optional(Type.Array(Type.String())),
+				})),
+				reviewerSessionId: Type.Optional(Type.String()),
+					execution: Type.Optional(Type.Object({
+					preference: StringEnum(["auto", "direct", "specialist", "team"] as const),
+					selected: StringEnum(["direct", "specialist", "team"] as const),
+					role: Type.Optional(Type.String()),
+					source: StringEnum(["auto", "user", "legacy"] as const),
+					confidence: Type.Number({ minimum: 0, maximum: 1 }),
+					reasons: Type.Array(Type.String()),
+					minimum: Type.Optional(StringEnum(["specialist"] as const)),
+						reassessOn: Type.Array(StringEnum(["scope_expanded", "new_workstream", "conflict", "stalled"] as const)),
+					})),
+					routing: Type.Optional(Type.Object({
+						uncertainty: StringEnum(["low", "medium", "high"] as const),
+						coupling: StringEnum(["low", "medium", "high"] as const),
+						risk: StringEnum(["low", "medium", "high"] as const),
+						specialistNeed: StringEnum(["none", "helpful", "required"] as const),
+						independentWorkstreams: Type.Number({ minimum: 0 }),
+						heterogeneousSkills: Type.Boolean(),
+					effort: StringEnum(["small", "medium", "large"] as const),
+					confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+					repeatedFailureCount: Type.Optional(Type.Number({ minimum: 0 })),
+						remainingWorkstreams: Type.Optional(Type.Number({ minimum: 0 })),
+						coordinationOverheadHigh: Type.Optional(Type.Boolean()),
+					})),
+					reassessTrigger: Type.Optional(StringEnum(["scope_expanded", "new_workstream", "conflict", "stalled"] as const)),
+			preference: Type.Optional(StringEnum(["auto", "direct", "specialist", "team"] as const)),
+			selected: Type.Optional(StringEnum(["direct", "specialist", "team"] as const)),
+			role: Type.Optional(Type.String()),
+			confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+			reasons: Type.Optional(Type.Array(Type.String())),
+			// Deprecated flat reviewer fields remain parseable for one compatibility cycle.
+			reviewerPassed: Type.Optional(Type.Boolean({ description: "Legacy reviewer decision; use action=record_review for Goal V2." })),
 			reviewerVerdict: Type.Optional(Type.Object({
 				model: Type.Optional(Type.String()),
 				thinkingLevel: Type.Optional(Type.String()),
-				verifiedSources: Type.Number(),
-				checksPassed: Type.Boolean(),
+				verifiedSources: Type.Optional(Type.Number({ minimum: 0 })),
+				checksPassed: Type.Optional(Type.Boolean()),
 				reportPath: Type.Optional(Type.String()),
 				notes: Type.Optional(Type.String()),
 				// G7 (P0 fix): single 模式终审须 reviewer 表态 singleRationaleApproved. 之前 schema 漏了 → 死锁.
@@ -1122,6 +1828,270 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 			if (!goal) {
 				return { content: [{ type: "text", text: "No goal to update." }], isError: true, details: {} };
 			}
+				const normalized = normalizeUpdateGoalAction(params, { now: nowMs() });
+				if (!normalized.ok) {
+					return { content: [{ type: "text", text: normalized.reason }], isError: true, details: { kind: normalized.kind } };
+				}
+				for (const warning of normalized.warnings) console.warn("[pi-goal] " + warning);
+					const action = normalized.action;
+					if (isTerminalGoalStatus(goal.status)) {
+						return {
+							content: [{ type: "text", text: "Goal is terminal (" + goal.status + "); clear or replace it before recording new state." }],
+							isError: true,
+							details: { status: goal.status },
+						};
+					}
+					if (action.action === "request_completion" && goal.status !== "active") {
+						return {
+							content: [{ type: "text", text: "Completion can only be requested while the goal is active; resume it first." }],
+							isError: true,
+							details: { status: goal.status },
+						};
+					}
+
+				if (action.action === "record_evidence") {
+					if (action.criterionIds.length + action.claimIds.length === 0 && action.evidence === null) {
+						return { content: [{ type: "text", text: "Reusing evidence requires at least one criterionId or claimId target." }], isError: true, details: {} };
+					}
+					const unknownCriteria = action.criterionIds.filter((id) => !goal!.criteria.some((item) => item.id === id));
+					const unknownClaims = action.claimIds.filter((id) => !goal!.claims.some((item) => item.id === id));
+					if (unknownCriteria.length + unknownClaims.length > 0) {
+						return { content: [{ type: "text", text: "Evidence targets do not exist: " + [...unknownCriteria, ...unknownClaims].join(", ") }], isError: true, details: {} };
+					}
+					const existing = goal.evidenceLedger.find((item) => item.id === action.evidenceId);
+					if (!action.evidence && !existing) {
+						return { content: [{ type: "text", text: "Evidence " + action.evidenceId + " does not exist in the ledger." }], isError: true, details: {} };
+					}
+					if (existing && action.evidence) {
+						const comparable = (item: EvidenceRef) => ({ ...item, recordedAt: 0 });
+						if (JSON.stringify(comparable(existing)) !== JSON.stringify(comparable(action.evidence))) {
+							return { content: [{ type: "text", text: "Evidence id \"" + action.evidenceId + "\" already exists with different content." }], isError: true, details: {} };
+						}
+						}
+						const record = existing ?? action.evidence!;
+						let outcomeChanged = !existing;
+						if (!existing) goal.evidenceLedger.push(record);
+					const conflicts: string[] = [];
+					for (const criterionId of action.criterionIds) {
+						const criterion = goal.criteria.find((item) => item.id === criterionId)!;
+						const assessment = assessEvidence(record.summary, criterion.evidence.map((item) => item.summary));
+						if (assessment.conflict) conflicts.push(assessment.conflict);
+							if (!criterion.evidenceRefs.includes(record.id)) {
+								outcomeChanged = true;
+							criterion.evidenceRefs.push(record.id);
+							criterion.evidence.push({
+								id: record.id,
+								kind: record.kind === "command" ? "tool_result" : record.kind,
+								summary: record.summary,
+								...(record.locator === undefined ? {} : { locator: record.locator }),
+								...(record.sourceKind === undefined ? {} : { sourceKind: record.sourceKind }),
+								...(record.independenceKey === undefined ? {} : { independenceKey: record.independenceKey }),
+								origin: record.origin,
+								recordedAt: record.recordedAt,
+								verification: record.verification,
+							});
+						}
+					}
+					for (const claimId of action.claimIds) {
+						const claim = goal.claims.find((item) => item.id === claimId)!;
+						const claimEvidence = claim.evidenceRefs
+							.map((id) => goal!.evidenceLedger.find((item) => item.id === id)?.summary)
+							.filter((summary): summary is string => Boolean(summary));
+						const assessment = assessEvidence(record.summary, claimEvidence);
+						if (assessment.conflict) conflicts.push(assessment.conflict);
+							if (!claim.evidenceRefs.includes(record.id)) {
+								outcomeChanged = true;
+								claim.evidenceRefs.push(record.id);
+							}
+						}
+							let conflictExecution: ExecutionDecision | null = null;
+							let nextAssurance = outcomeChanged
+								? assuranceAfterOutcomeMutation(goal, goalConfig, "Outcome evidence changed after the prior assurance decision.")
+								: goal.assurance;
+							if (conflicts.length > 0) {
+							conflictExecution = reassessGoalExecution({
+								uncertainty: "high", coupling: "medium", risk: "high",
+								specialistNeed: goal.execution.role ? "helpful" : "none",
+								independentWorkstreams: 1, heterogeneousSkills: false, effort: "medium",
+							}, "conflict").execution;
+								nextAssurance = assuranceAfterOutcomeMutation(
+									goal,
+									goalConfig,
+									"Conflicting evidence requires independent review.",
+									true,
+								);
+							}
+							updateState({
+								evidenceLedger: [...goal.evidenceLedger], criteria: [...goal.criteria], claims: [...goal.claims],
+								...(conflictExecution ? { execution: conflictExecution } : {}),
+								...(nextAssurance !== goal.assurance ? { assurance: nextAssurance } : {}),
+						}, ctx);
+					return {
+						content: [{ type: "text", text: "Evidence recorded: " + record.id + (conflicts.length > 0 ? " (conflict diagnostics recorded)" : "") }],
+						details: { evidenceId: record.id, criterionIds: action.criterionIds, claimIds: action.claimIds, conflicts },
+					};
+				}
+
+					if (action.action === "upsert_claim") {
+					const missing = action.claim.evidenceRefs.filter((ref) => !goal!.evidenceLedger.some((evidence) => evidence.id === ref));
+					if (missing.length > 0) return { content: [{ type: "text", text: "Claim references unknown evidence: " + missing.join(", ") }], isError: true, details: {} };
+						const index = goal.claims.findIndex((item) => item.id === action.claim.id);
+						const changed = index < 0 || JSON.stringify(goal.claims[index]) !== JSON.stringify(action.claim);
+						if (index >= 0) goal.claims[index] = action.claim; else goal.claims.push(action.claim);
+						const highRiskMaterial = action.claim.materiality === "material" && action.claim.risk === "high";
+						const assurance = changed
+							? assuranceAfterOutcomeMutation(
+								goal,
+								goalConfig,
+								highRiskMaterial ? "A high-risk material claim requires fresh assurance." : "Research claims changed after the prior assurance decision.",
+								highRiskMaterial,
+							)
+							: goal.assurance;
+						updateState({ claims: [...goal.claims], ...(assurance !== goal.assurance ? { assurance } : {}) }, ctx);
+					return { content: [{ type: "text", text: "Claim saved: " + action.claim.id }], details: { claim: action.claim } };
+				}
+
+				if (action.action === "request_completion") {
+					const requestedAt = Math.max(
+						nowMs(),
+						(goal.completion.requestedAt ?? -1) + 1,
+						(goal.completion.lastEvaluation?.evaluatedAt ?? -1) + 1,
+					);
+					updateState({ completion: { ...goal.completion, summary: action.summary, requestedAt } }, ctx);
+					return { content: [{ type: "text", text: "Completion evaluation requested." }], details: { requestedAt } };
+				}
+
+				if (action.action === "record_review") {
+					let transcript: string;
+					try { transcript = fs.readFileSync(action.review.sessionFile, "utf8"); }
+					catch (error) {
+						return { content: [{ type: "text", text: "Reviewer session is unreadable: " + (error instanceof Error ? error.message : String(error)) }], isError: true, details: {} };
+						}
+						const extracted = extractReviewerFindings(transcript);
+						const parentSession = ctx.sessionManager.getSessionFile?.();
+						if (!parentSession) {
+							return { content: [{ type: "text", text: "Current goal session has no stable session file for reviewer provenance." }], isError: true, details: {} };
+						}
+						const verified = verifyReviewerSource(
+							action.review.evaluator.agentId,
+							action.review.sessionFile,
+							extracted,
+							{ parentSession, role: "reviewer", sessionId: action.review.evaluator.sessionId },
+						);
+						if (!verified.ok) return { content: [{ type: "text", text: verified.reason ?? "Reviewer source verification failed." }], isError: true, details: {} };
+						const transcriptDecision = reviewerTranscriptDecision(extracted.findings);
+						if (transcriptDecision === null) {
+							return { content: [{ type: "text", text: "Reviewer findings[0] must declare an explicit Ready/Approved or Not ready/Rejected verdict." }], isError: true, details: {} };
+						}
+						if (transcriptDecision !== action.review.status) {
+							return { content: [{ type: "text", text: "Submitted review status contradicts the reviewer transcript verdict." }], isError: true, details: {} };
+						}
+						if (action.review.status === "failed" && action.review.findings.length === 0) {
+							return { content: [{ type: "text", text: "A failed review must include structured blocking findings." }], isError: true, details: {} };
+						}
+						if (action.review.status === "passed" && action.review.findings.length > 0) {
+							return { content: [{ type: "text", text: "A passed review cannot carry blocking findings; record them as advisories or mark the review failed." }], isError: true, details: {} };
+						}
+					for (const finding of action.review.findings) {
+						const constraintMatch = finding.subjectId.match(/^\$constraint:(\d+)$/);
+						const knownConstraint = Boolean(constraintMatch && Number(constraintMatch[1]) < goal.constraints.length);
+						const known = finding.subjectId === "$goal"
+							|| knownConstraint
+							|| goal.criteria.some((item) => item.id === finding.subjectId)
+							|| goal.claims.some((item) => item.id === finding.subjectId);
+						if (!known) return { content: [{ type: "text", text: "Review finding references unknown subject " + finding.subjectId }], isError: true, details: {} };
+						const unknownEvidence = (finding.evidenceRefs ?? []).filter((id) => !goal!.evidenceLedger.some((item) => item.id === id));
+						if (unknownEvidence.length > 0) {
+							return { content: [{ type: "text", text: "Review finding references unknown evidence: " + unknownEvidence.join(", ") }], isError: true, details: {} };
+						}
+							if ((finding.evidenceRefs ?? []).length === 0 && !finding.missingEvidenceKind) {
+								return { content: [{ type: "text", text: "A review finding must cite evidenceRefs or declare missingEvidenceKind." }], isError: true, details: {} };
+							}
+							if (!transcriptBindsFinding(extracted.findings, finding)) {
+								return { content: [{ type: "text", text: "Structured review finding " + finding.subjectId + " is not bound to the reviewer transcript and its evidence/missing-evidence key." }], isError: true, details: {} };
+							}
+					}
+					const fingerprint = action.review.status === "passed" ? null : createHash("sha256").update(JSON.stringify({
+						policy: "goal_completion_policy_v2",
+						failures: action.review.findings.map((item) => ({ code: item.code, subjectId: item.subjectId, missingEvidenceKind: item.missingEvidenceKind ?? null }))
+							.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+					})).digest("hex");
+					const evaluation: CompletionEvaluation = {
+						decision: action.review.status === "passed" ? "accept" : "revise",
+						evaluatedAt: nowMs(), criterionCoverage: [], claimCoverage: [],
+						findings: action.review.findings, advisories: action.review.advisories,
+							evaluator: {
+								kind: "reviewer",
+								agentId: extracted.provenance!.agentId,
+								sessionId: extracted.sessionId,
+								reportDigest: createHash("sha256").update(transcript).digest("hex"),
+							legacySessionFile: action.review.sessionFile,
+						},
+						fingerprint,
+					};
+					if (action.review.status === "failed") {
+						const transition = applyAuthoritativeCompletionEvaluation(goal, evaluation);
+						updateState({
+							assurance: { ...goal.assurance, reviewStatus: "failed" },
+							completion: transition.completion,
+							...(transition.status === "paused" ? { status: "paused", pausedReason: transition.pausedReason } : {}),
+						}, ctx);
+						if (transition.status === "paused") {
+							clearTimer();
+							userSuspended = true;
+						}
+						return {
+							content: [{ type: "text", text: "Independent review recorded: failed (" + transition.rejectionAction + ")" }],
+							details: { evaluation, rejectionAction: transition.rejectionAction },
+						};
+					}
+					updateState({
+						assurance: { ...goal.assurance, reviewStatus: "passed" },
+						completion: { ...goal.completion, lastEvaluation: evaluation, rejectionCount: 0 },
+					}, ctx);
+					return { content: [{ type: "text", text: "Independent review recorded: passed" }], details: { evaluation } };
+				}
+
+						if (action.action === "change_execution") {
+							if (goal.execution.source === "user") {
+								return { content: [{ type: "text", text: "Execution preference is user-locked and cannot be changed by an agent tool call." }], isError: true, details: { execution: goal.execution } };
+							}
+							if (action.routing) {
+							const rerouted = reassessGoalExecution(action.routing.signals, action.routing.trigger);
+							if (rerouted.blockedReason) return { content: [{ type: "text", text: rerouted.blockedReason }], isError: true, details: {} };
+							if (!rerouted.execution) return { content: [{ type: "text", text: "Execution remains " + goal.execution.selected + "." }], details: { execution: goal.execution } };
+							updateState({ execution: rerouted.execution }, ctx);
+							return { content: [{ type: "text", text: "Execution reassessed to " + rerouted.execution.selected + "." }], details: { execution: rerouted.execution } };
+						}
+							const requested = action.execution!;
+							const activeTools = new Set(pi.getActiveTools());
+							if (requested.selected === "team" && !activeTools.has("dag_execute")) {
+								return { content: [{ type: "text", text: "team execution requires the active dag_execute tool." }], isError: true, details: {} };
+							}
+							if (requested.selected === "specialist" && activeTools.has("list_roles") && observedRoleCatalog === null) {
+								return { content: [{ type: "text", text: "Call list_roles before changing to specialist execution." }], isError: true, details: { requiredTool: "list_roles" } };
+							}
+							if (requested.selected === "specialist" && (!requested.role
+								|| !activeTools.has("spawn_role")
+								|| observedRoleCatalog === null
+								|| !observedRoleCatalog.includes(requested.role))) {
+								return { content: [{ type: "text", text: "specialist execution requires an active spawn_role tool and a role from the observed list_roles catalog." }], isError: true, details: { availableRoles: observedRoleCatalog ?? [] } };
+							}
+							const execution: ExecutionDecision = {
+								...requested,
+								source: requested.source === "legacy" ? "legacy" : "auto",
+							};
+							if (execution.selected === "specialist" && !execution.role) {
+							return { content: [{ type: "text", text: "specialist execution requires a registered role." }], isError: true, details: {} };
+						}
+						updateState({ execution }, ctx);
+						return { content: [{ type: "text", text: "Execution changed to " + execution.selected + "." }], details: { execution } };
+				}
+
+				updateState({ status: "unmet", blocker: action.blocker, noProgressCount: 0 }, ctx);
+				return { content: [{ type: "text", text: "Goal marked unmet: " + action.blocker }], details: { status: "unmet" } };
+
+			/* LEGACY V1 HANDLER RETIRED: preserved below for one release as source-level migration documentation.
 			if (params.criterionId && params.evidence) {
 				const criterion = goal.criteria.find((c) => c.id === params.criterionId);
 				if (!criterion) {
@@ -1185,7 +2155,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				if (params.reviewerPassed && goal.taskType && goal.taskType !== "coding") {
 					const verdict = params.reviewerVerdict;
 					if (!verdict) {
-						return { content: [{ type: "text", text: "reviewerPassed=true for non-coding goal requires reviewerVerdict (model/thinkingLevel>=medium/verifiedSources>=3/checksPassed/reportPath). A bare boolean is no longer sufficient (第2条: prevents rubber-stamp review)." }], isError: true, details: {} };
+						return { content: [{ type: "text", text: "reviewerPassed=true requires structured reviewer audit data and a spawned-session transcript; model, thinking level, and source counts are diagnostics only." }], isError: true, details: {} };
 					}
 					const contract = validateReviewerVerdict(verdict);
 					if (!contract.ok) {
@@ -1239,7 +2209,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				}
 				updateState({ status: "complete", completionEvidence: params.evidence, noProgressCount: 0 }, ctx);
 				pi.sendMessage(
-					{ customType: GOAL_EVENT_TYPE, content: "Goal achieved! \u2705\n\nObjective: " + goal.objective + "\nEvidence: " + params.evidence, display: true, details: { kind: "complete", goal: { ...goal, status: "complete" } } },
+					{ customType: GOAL_EVENT_TYPE, content: "Goal achieved! \u2705\n\nObjective: " + goal.objective + "\nEvidence: " + params.evidence, display: true, details: { kind: "complete", goal: { ...goal, status: "complete" }, progress: progressFor(goal) } },
 					{ triggerTurn: false },
 				);
 				return { content: [{ type: "text", text: "Goal complete: " + goal.objective }], details: { goal: { ...goal, status: "complete" } } };
@@ -1250,33 +2220,183 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "Goal unmet: " + params.blocker }], details: { goal: { ...goal, status: "unmet" } } };
 			}
 			return { content: [{ type: "text", text: "Use criterionId+evidence or status:complete|unmet." }], isError: true, details: {} };
+			*/
 		},
 	});
 
 	pi.registerTool({
 		name: "propose_goal_draft", label: "Propose Goal Draft",
-		description: "Propose a goal draft for user review. The user will see the objective and criteria, then choose Start, Edit, or Cancel.",
+		description: "Propose a Goal V2 draft after calling list_roles when available. Includes adaptive execution and risk-based assurance decisions.",
 		parameters: Type.Object({
 			objective: Type.String({ description: "Concise 1-2 sentence objective." }),
-			criteria: Type.Array(Type.String(), { description: "3-7 verifiable criteria." }),
+			criteria: Type.Array(Type.Union([
+				Type.String(),
+				Type.Object({ description: Type.String(), level: Type.Optional(StringEnum(["blocking", "advisory"] as const)) }),
+			]), { minItems: 1, description: "One or more genuine outcome criteria; do not add workflow/source-count criteria to meet a quota." }),
 			constraints: Type.Optional(Type.Array(Type.String())),
-			// 深修 A/D: per-goal task type. undefined = legacy (coding default, backward-compat).
-			// Non-coding (research/pm/review) triggers the reviewer gate on complete (深修 D).
+			taskKind: Type.Optional(StringEnum(["general", "coding", "research", "pm", "review"] as const)),
+			executionPreference: Type.Optional(StringEnum(["auto", "direct", "specialist", "team"] as const)),
+			role: Type.Optional(Type.String({ description: "Registered specialist role selected from list_roles." })),
+			availableRoles: Type.Optional(Type.Array(Type.String({ description: "Role names returned by list_roles." }))),
+			roleCatalogAvailable: Type.Optional(Type.Boolean()),
+				routing: Type.Optional(Type.Object({
+				uncertainty: StringEnum(["low", "medium", "high"] as const),
+				coupling: StringEnum(["low", "medium", "high"] as const),
+				risk: StringEnum(["low", "medium", "high"] as const),
+				specialistNeed: StringEnum(["none", "helpful", "required"] as const),
+				independentWorkstreams: Type.Number({ minimum: 0 }),
+				heterogeneousSkills: Type.Boolean(),
+				effort: StringEnum(["small", "medium", "large"] as const),
+				confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+				})),
+			assurance: Type.Optional(Type.Object({
+				risk: StringEnum(["low", "medium", "high"] as const),
+				hasHighRiskClaims: Type.Optional(Type.Boolean()),
+				hasEvidenceConflict: Type.Optional(Type.Boolean()),
+				irreversibleExternalAction: Type.Optional(Type.Boolean()),
+				userRequiresReviewer: Type.Optional(Type.Boolean()),
+			})),
+			researchClaims: Type.Optional(Type.Array(Type.Object({
+				id: Type.String(), text: Type.String(),
+				materiality: StringEnum(["material", "supporting"] as const),
+				risk: Type.Optional(StringEnum(["ordinary", "high"] as const)),
+				evidenceRefs: Type.Optional(Type.Array(Type.String())),
+			}))),
+			tokenBudget: Type.Optional(Type.Number({ minimum: 1 })),
+			// Deprecated aliases.
 			taskType: Type.Optional(StringEnum(["coding", "research", "pm", "review"] as const)),
-			// 深修 A: execution mode. single (default) = main agent 直执; orchestrated = spawn role 编排.
 			executionMode: Type.Optional(StringEnum(["single", "orchestrated"] as const)),
-			// G7 (single 自批禁): single 模式须给出可独立审核的理由 (≥30字), 交 reviewer 审核.
-			singleRationale: Type.Optional(Type.String({ description: "Required when executionMode=single AND taskType is non-coding: explain WHY this task can be done by the main agent alone (≥30 chars). Independently audited by reviewer — not self-approved." })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			// 第1条: 非 coding taskType 必须显式 executionMode (治"判简单"偏见).
-			const proposalCheck = validateGoalProposal({ taskType: params.taskType, executionMode: params.executionMode, criteria: params.criteria, singleRationale: params.singleRationale });
+			const raw = params as Record<string, any>;
+			if (raw.executionPreference && raw.executionMode) return { content: [{ type: "text", text: "Use executionPreference or legacy executionMode, not both." }], isError: true, details: {} };
+			const objective = raw.objective.trim();
+			let criteria: GoalCriterionDraft[] = raw.criteria.map((criterion: string | { description: string; level?: GateLevel }) =>
+				typeof criterion === "string"
+					? { description: criterion.trim(), level: "blocking" }
+					: { description: criterion.description.trim(), level: criterion.level ?? "blocking" },
+			);
+			// UX finding: the draft writer keeps adding environment-state gates
+			// ("git status must be clean", "tracked changes must be zero") that are
+			// unrelated to the outcome and unsatisfiable on a dirty worktree.
+			// Downgrade them to advisory so they cannot block completion.
+			const { criteria: gatedCriteria, downgraded } = downgradeEnvironmentStateGates(criteria, objective);
+			criteria = gatedCriteria;
+			if (downgraded.length > 0 && ctx.hasUI) {
+				ctx.ui.notify("Downgraded " + downgraded.length + " environment-state gate(s) to advisory (repo/worktree state is not a task outcome):\n" + downgraded.join("\n"), "info");
+			}
+			const constraints: string[] | undefined = raw.constraints?.map((constraint: string) => constraint.trim());
+			const claims: ResearchClaim[] = (raw.researchClaims ?? []).map((claim: ResearchClaim) => ({
+				...claim,
+				id: claim.id.trim(),
+				text: claim.text.trim(),
+				evidenceRefs: (claim.evidenceRefs ?? []).map((ref) => ref.trim()),
+			}));
+			const proposalCheck = validateGoalProposal({
+				objective,
+				taskType: raw.taskKind ?? raw.taskType,
+				executionMode: raw.executionMode,
+				executionPreference: raw.executionPreference,
+				criteria,
+				constraints,
+				researchClaims: claims,
+			});
 			if (!proposalCheck.ok) {
 				return { content: [{ type: "text", text: proposalCheck.reason ?? "Invalid goal proposal." }], isError: true, details: {} };
 			}
+			const taskKind = (raw.taskKind ?? raw.taskType ?? "general") as TaskKind;
+			const signals: ExecutionRoutingSignals = raw.routing ?? {
+				uncertainty: "medium", coupling: "medium", risk: raw.assurance?.risk ?? "low",
+				specialistNeed: raw.role ? "helpful" : "none", independentWorkstreams: 1,
+				heterogeneousSkills: false, effort: criteria.length >= 4 ? "large" : "medium",
+			};
+			const activeTools = new Set(pi.getActiveTools());
+			if (activeTools.has("list_roles") && observedRoleCatalog === null) {
+				return {
+					content: [{ type: "text", text: "Call list_roles before propose_goal_draft so routing uses the real registered role catalog." }],
+					isError: true,
+					details: { requiredTool: "list_roles" },
+				};
+			}
+			const rawAvailableRoles: unknown[] = observedRoleCatalog ?? (Array.isArray(raw.availableRoles) ? raw.availableRoles : []);
+			const availableRoles: string[] = [...new Set(rawAvailableRoles
+				.filter((role): role is string => typeof role === "string")
+				.map((role) => role.trim())
+				.filter(Boolean))];
+			const roleCatalogAvailable = observedRoleCatalog !== null || raw.roleCatalogAvailable === true || raw.availableRoles !== undefined;
+			const registeredRole = typeof raw.role === "string" ? raw.role.trim() : "";
+			const roleIsRegistered = Boolean(registeredRole && availableRoles.includes(registeredRole));
+			const roleExecutionAvailable = roleCatalogAvailable && availableRoles.length > 0;
+			const availableModes: Array<"direct" | "specialist" | "team"> = ["direct"];
+			if (roleExecutionAvailable && activeTools.has("spawn_role")) availableModes.push("specialist");
+			if (roleExecutionAvailable && activeTools.has("dag_execute")) availableModes.push("team");
+			const preference: ExecutionPreference = raw.executionPreference
+					?? (raw.executionMode === "single" ? "direct" : raw.executionMode === "orchestrated" ? "auto" : undefined)
+					?? goalConfig.defaultExecution
+					?? "auto";
+			const preferredMode = raw.executionMode === "orchestrated"
+				? "specialist" as const
+				: preference === "auto" ? undefined : preference;
+			if ((preference === "specialist" || raw.executionMode === "orchestrated")
+				&& (!roleIsRegistered || !availableModes.includes("specialist"))) {
+				return {
+					content: [{ type: "text", text: "The specialist route requires an active spawn_role tool and a matching registered role from list_roles." }],
+					isError: true,
+					details: { availableRoles },
+				};
+			}
+			let routed = routeExecution({
+				signals,
+				availableModes,
+				...(preferredMode ? { preferredMode } : {}),
+			});
+			if (routed.status === "blocked") return { content: [{ type: "text", text: routed.reasons.join(" ") }], isError: true, details: { route: routed } };
+			if (routed.mode === "specialist" && !roleIsRegistered) {
+				if (preference === "specialist" || raw.executionMode === "orchestrated") {
+					return { content: [{ type: "text", text: "The specialist route requires a matching registered role from list_roles." }], isError: true, details: { availableRoles } };
+				}
+				const fallback = routeExecution({ signals, availableModes: availableModes.filter((mode) => mode !== "specialist") });
+				if (fallback.status === "blocked") return { content: [{ type: "text", text: fallback.reasons.join(" ") }], isError: true, details: { route: fallback } };
+				routed = {
+					...fallback,
+					reasons: [...routed.reasons, "No matching registered specialist role is available; falling back to direct and retaining reassessment triggers.", ...fallback.reasons],
+					shouldReassess: true,
+				};
+			}
+			const execution: ExecutionDecision = {
+				preference,
+				selected: routed.mode,
+				...(routed.mode === "specialist" ? { role: registeredRole } : {}),
+				source: raw.executionMode ? "legacy" : "auto",
+				confidence: raw.routing?.confidence ?? (raw.routing ? 0.75 : 0.5),
+				reasons: routed.reasons,
+				...(raw.executionMode === "orchestrated" ? { minimum: "specialist" as const } : {}),
+				reassessOn: ["scope_expanded", "new_workstream", "conflict", "stalled"],
+			};
+			const assuranceInput = {
+				...(raw.assurance ?? { risk: "low" }),
+					hasHighRiskClaims: Boolean(raw.assurance?.hasHighRiskClaims)
+						|| claims.some((claim) => claim.materiality === "material" && claim.risk === "high"),
+			};
+			const reviewer = selectReviewerPolicy({ ...assuranceInput, taskType: taskKind, deterministicVerificationAvailable: Boolean(goalConfig.verifyCommand) });
+			const requirement = goalConfig.reviewPolicy === "always" ? "required" : goalConfig.reviewPolicy === "never" ? "none" : reviewer.mode;
+			const assurance: AssuranceDecision = {
+				reviewRequirement: requirement,
+				reviewStatus: requirement === "none" ? "not_required" : "pending",
+				independent: requirement !== "none",
+				depth: requirement === "required" ? "deep" : reviewer.depth,
+				source: raw.assurance?.userRequiresReviewer ? "user" : "auto",
+				reasons: goalConfig.reviewPolicy === "always" ? ["reviewPolicy=always"] : goalConfig.reviewPolicy === "never" ? ["reviewPolicy=never"] : reviewer.reasons,
+				decidedAt: nowMs(),
+			};
+			const proposal: GoalProposal = {
+				objective, criteria, constraints: constraints ?? [], taskKind,
+				executionPreference: preference, execution, assurance,
+				claims,
+			};
 			if (!ctx.hasUI) {
 				if (goal) return { content: [{ type: "text", text: "A goal is already set (status: " + goal.status + "). Clear it first." }], isError: true, details: {} };
-				setGoal(params.objective, params.criteria, params.constraints ?? [], { taskType: params.taskType, executionMode: params.executionMode, singleRationale: params.singleRationale }, ctx);
+				setGoal(proposal, { tokenBudget: raw.tokenBudget }, ctx);
 				return { content: [{ type: "text", text: "Goal created (non-interactive)." }], details: { goal: { ...goal! } } };
 			}
 			if (goal) {
@@ -1291,18 +2411,38 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				);
 				if (!ok) return { content: [{ type: "text", text: "Kept current goal." }], details: {} };
 			}
-			const proposal: GoalProposal = { objective: params.objective, criteria: params.criteria, constraints: params.constraints ?? [], taskType: params.taskType, executionMode: params.executionMode, singleRationale: params.singleRationale };
-			const choice = await showGoalReview(proposal, ctx);
+			let choice = await showGoalReview(proposal, ctx);
+			if (choice === "execution") {
+				const selected = await ctx.ui.select("Execution preference", ["auto", "direct", "specialist", "team"]);
+				if (!selected) return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
+				const rerouted = routeExecution({ signals, availableModes, ...(selected === "auto" ? {} : { userSelection: { mode: selected as "direct" | "specialist" | "team", locked: true } }) });
+				if (rerouted.status === "blocked" || (rerouted.mode === "specialist" && !roleIsRegistered)) {
+					return { content: [{ type: "text", text: rerouted.status === "blocked" ? rerouted.reasons.join(" ") : "Choose a registered role before selecting specialist." }], isError: true, details: {} };
+				}
+				proposal.executionPreference = selected as ExecutionPreference;
+				const { role: _previousRole, ...executionWithoutRole } = proposal.execution;
+				proposal.execution = {
+					...executionWithoutRole,
+					preference: proposal.executionPreference,
+					selected: rerouted.mode,
+					...(rerouted.mode === "specialist" ? { role: registeredRole } : {}),
+					source: "user",
+					confidence: 1,
+					reasons: rerouted.reasons,
+				};
+				choice = await showGoalReview(proposal, ctx);
+			}
 			switch (choice) {
-				case "start": { setGoal(proposal.objective, proposal.criteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode, singleRationale: proposal.singleRationale }, ctx); return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! } } }; }
+				case "start": { setGoal(proposal, { tokenBudget: raw.tokenBudget }, ctx); return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! } } }; }
 				case "edit": {
 					const editedObjective = await ctx.ui.editor("Edit goal objective:", proposal.objective);
 					if (!editedObjective?.trim()) return { content: [{ type: "text", text: "Cancelled (empty objective)." }], details: {} };
-					const criteriaText = proposal.criteria.join("\n");
+					const criteriaText = proposal.criteria.map((criterion) => criterion.description).join("\n");
 					const editedCriteria = await ctx.ui.editor("Edit criteria (one per line):", criteriaText);
-					const newCriteria = (editedCriteria ?? criteriaText).split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+					const newCriteria = (editedCriteria ?? criteriaText).split("\n").map((line) => line.trim()).filter(Boolean)
+						.map((description, index) => ({ description, level: proposal.criteria[index]?.level ?? "blocking" as const }));
 					if (newCriteria.length === 0) return { content: [{ type: "text", text: "Cancelled (no criteria)." }], details: {} };
-					setGoal(editedObjective.trim(), newCriteria, proposal.constraints, { taskType: proposal.taskType, executionMode: proposal.executionMode, singleRationale: proposal.singleRationale }, ctx);
+					setGoal({ ...proposal, objective: editedObjective.trim(), criteria: newCriteria }, { tokenBudget: raw.tokenBudget }, ctx);
 					return { content: [{ type: "text", text: "Goal started after edit: " + goal!.objective }], details: { goal: { ...goal! } } };
 				}
 				default: return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
@@ -1343,8 +2483,14 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				}
 				// Inject a persistent, collapsible goal card into the conversation
 				// (ctrl+o to expand) instead of a transient notify toast.
+				const now = nowMs();
+				const progress = progressFor(goal, now);
+				const displayGoal = {
+					...goal,
+					timeUsedMs: progress.resources.activeMs,
+				};
 				pi.sendMessage(
-					{ customType: GOAL_EVENT_TYPE, content: "Goal status: " + goal.objective, display: true, details: { kind: "status", goal: { ...goal }, judgeVerdict: lastJudgeVerdict } },
+					{ customType: GOAL_EVENT_TYPE, content: "Goal status: " + goal.objective, display: true, details: { kind: "status", goal: displayGoal, progress, judgeVerdict: lastJudgeVerdict } },
 					{ triggerTurn: false },
 				);
 				return;
@@ -1367,8 +2513,26 @@ export default function piGoalExtension(pi: ExtensionAPI) {
 				);
 				if (!ok) { ctx.ui.notify("Kept current goal.", "info"); return; }
 			}
-			const proposeMsg = "Draft a formal goal for the following task using the pi-goal-writer skill. Call propose_goal_draft with a concise objective and 3-7 concrete, independently verifiable acceptance criteria.\n\n<untrusted_task>\n" + objective + "\n</untrusted_task>\n\nToken budget: " + (tokenBudget ? formatTokens(tokenBudget) : "none");
+				const proposeMsg = "Draft a formal goal for the following task using the pi-goal-writer skill. Call list_roles first when available, then call propose_goal_draft with a concise objective and at least one genuine, independently verifiable outcome criterion. Do not add criteria merely to meet a count.\n\n<untrusted_task>\n" + objective + "\n</untrusted_task>\n\n" + (tokenBudget
+					? "Token budget: " + formatTokens(tokenBudget) + ". You MUST pass this exact token count into propose_goal_draft's tokenBudget parameter (a missing tokenBudget is a drafting error)."
+					: "Token budget: none");
 			pi.sendUserMessage(proposeMsg);
 		},
 	});
 }
+
+export function createPiGoalExtension(
+	dependencies: Partial<PiGoalRuntimeDependencies> = {},
+): (pi: ExtensionAPI) => void {
+	const runtime: PiGoalRuntimeDependencies = {
+		complete,
+		minContinueIntervalMs: CONFIG.minContinueIntervalMs,
+		now: Date.now,
+		setInterval,
+		clearInterval,
+		...dependencies,
+	};
+	return (pi) => registerPiGoalExtension(pi, runtime);
+}
+
+export default createPiGoalExtension();

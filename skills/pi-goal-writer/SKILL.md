@@ -28,8 +28,11 @@ Good:
 - "Refactor the auth module to use JWT with proper error handling, keeping all 47 existing tests passing"
 - "Migrate the billing service from Stripe v1 to Stripe v2 API, verified by the integration test suite"
 
-### 2. Acceptance Criteria (recommended)
-3-7 concrete, verifiable conditions. Each criterion must be independently checkable against real evidence (files, tests, command output, build status).
+### 2. Acceptance Criteria (required)
+Use the smallest set of genuine outcome conditions. A simple goal may have one criterion.
+Each blocking criterion must be independently checkable against real evidence (files, tests,
+command output, primary sources, or user confirmation). Do not create workflow-stage or
+source-count criteria merely to reach a quota.
 
 Format each as: `- [ ] specific verifiable condition`
 
@@ -55,10 +58,21 @@ Ask clarifying questions only if the user's request is genuinely ambiguous. If t
 
 ### Step 2: Draft the Goal
 
+Call `list_roles` first when it is available. Then choose the cheapest sufficient topology:
+
+- `direct`: one clear workstream
+- `specialist`: one dominant capability or a low-confidence probe
+- `team`: at least two independent workstreams or genuine separation-of-duties value
+
+Risk does not by itself justify a team. Completion assurance is selected separately.
+
 Call the `propose_goal_draft` tool with:
 - `objective`: concise 1-2 sentence outcome statement
-- `criteria`: 3-7 concrete, independently verifiable success criteria
+- `criteria`: one or more concrete outcome criteria, each with blocking/advisory level when needed
 - `constraints`: any boundaries or invariants (optional)
+- `taskKind`: general, coding, research, pm, or review
+- `executionPreference`: auto unless the user explicitly selected a topology
+- `researchClaims`: material claims and their risk when the goal is research-heavy
 
 The tool will open a review UI for the user. Wait for the user's decision:
 - **Start**: Goal is created and work begins immediately
@@ -181,11 +195,20 @@ DECISION RULES:
 BIAS TOWARD ACTION: A working solution now beats a perfect design never started.
 But — a broken solution is worse than nothing. Distinguish "good enough" from
 "actually broken."
+
+REPORT CONTRACT:
+- Finish by calling `report_role_result`.
+- `findings[0]` must be exactly `✅ Ready` or `❌ Not ready`.
+- For each blocking rejection, add a finding that names `code`, the exact goal
+  `subjectId` (criterion ID, claim ID, or `$constraint:n`), and either the exact
+  `evidenceRefs` inspected or a `missingEvidenceKind`.
+- The parent must submit the same identifiers with `update_goal` action
+  `record_review`; Goal V2 rejects a status or finding not bound to the transcript.
 ```
 
 ### When NOT to Dispatch the Approver
 
-Pause the goal (update_goal status: "unmet") when:
+Pause the goal (`update_goal({ action: "mark_unmet", blocker: "..." })`) when:
 - The decision requires knowledge ONLY the user has (API keys, credentials, business priorities)
 - The approver has rejected 3 times for the same gate (something is fundamentally wrong with the approach)
 - A breaking change to public API or user-facing behavior is proposed
@@ -212,15 +235,20 @@ Per-turn workflow:
 2. If applicable, load the relevant superpowers skill for this turn's work
 3. When a superpowers skill hits an approval gate → dispatch a reviewer subagent to approve
 4. Choose the next concrete action that moves toward the objective
-5. Call `update_goal({ criterionId, evidence })` as criteria are met
-6. When ALL criteria have evidence: perform a strict completion audit, then call `update_goal({ status: "complete", evidence: "..." })`
+5. Call `update_goal({ action: "record_evidence", ... })` as evidence is produced
+6. For research, maintain material claims with `action: "upsert_claim"`
+7. When blocking outcomes are satisfied, call `update_goal({ action: "request_completion", summary: "..." })`
 
 ## Completion Audit Rules
 
 Before marking a goal complete:
 - Restate each criterion as a specific claim
 - For each claim, find concrete evidence (file content, test output, command result)
-- If any criterion lacks evidence → keep working, do not call update_goal complete
+- If any blocking criterion lacks evidence, keep working
+- Treat advisory gaps as follow-up advice, never as a completion rejection
+- One authoritative primary source can support an ordinary material claim
+- Require independent corroboration only for high-risk, disputed, or conflicting material claims
+- Never add low-quality URLs to satisfy a source-count target
 - Do not accept proxy signals (passing existing tests, build success) as evidence unless they directly prove the criterion
 - The Judge will independently verify completion — be honest about what is and isn't done
 

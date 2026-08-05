@@ -1,6 +1,7 @@
 {
 	"name": "pi-goal",
 	"version": "1.0.0",
+	"type": "module",
 	"description": "Persistent autonomous goals for Pi Agent — LLM judge evaluation, criteria tracking, no-progress detection, and token budgets. Inspired by Claude Code /goal.",
 	"keywords": [
 		"pi-package"

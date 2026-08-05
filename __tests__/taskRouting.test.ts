@@ -43,42 +43,23 @@ describe("injectSuperpowersCoding (rollback cleanliness)", () => {
 });
 
 describe("taskRoutingBlock", () => {
-	it("contains routing entries for all 4 task types (coding/research/pm/review)", () => {
+	it("contains all three adaptive execution topologies", () => {
 		const block = taskRoutingBlock(DEFAULT_GOAL_CONFIG);
-		assert.ok(block.includes("coding"), "missing coding row");
-		assert.ok(block.includes("research"), "missing research row");
-		assert.ok(block.includes("pm") || block.includes("PM"), "missing PM row");
-		assert.ok(block.includes("review"), "missing review row");
+		assert.ok(block.includes("direct"));
+		assert.ok(block.includes("specialist"));
+		assert.ok(block.includes("team"));
 	});
 
-	it("contains the multi-match tiebreak rule (orchestrator > executor roles)", () => {
+	it("selects the least expensive sufficient topology and keeps risk orthogonal", () => {
 		const block = taskRoutingBlock(DEFAULT_GOAL_CONFIG);
-		// tiebreak: 编排型 (PM/reviewer) > 执行型 (researcher/coder)
-		assert.ok(
-			block.includes("编排") && block.includes("执行"),
-			"tiebreak rule missing orchestrator/executor distinction",
-		);
-		assert.ok(
-			block.includes("PM") || block.includes("pm"),
-			"tiebreak should name PM as orchestrator",
-		);
-		assert.ok(
-			block.includes("researcher") || block.includes("coder"),
-			"tiebreak should name researcher/coder as executor",
-		);
+		assert.match(block, /least expensive|成本最低/i);
+		assert.match(block, /Risk alone never requires a team/i);
 	});
 
-	it("instructs on-miss dynamic workflow generation (DAGSpec → dag_execute)", () => {
+	it("admits a DAG only when graph structure is useful", () => {
 		const block = taskRoutingBlock(DEFAULT_GOAL_CONFIG);
 		assert.ok(block.includes("dag_execute"), "missing dag_execute instruction");
-		assert.ok(
-			block.toLowerCase().includes("dag") || block.includes("DAGSpec"),
-			"missing DAGSpec reference",
-		);
-		assert.ok(
-			block.includes("无匹配") || block.toLowerCase().includes("no match") || block.includes("未匹配"),
-			"missing on-miss trigger wording",
-		);
+		assert.match(block, /dependencies|parallel|branching|职责|依赖/i);
 	});
 
 	it("states superpowers is coding-only (non-coding skips coding gates)", () => {

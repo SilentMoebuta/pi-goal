@@ -2,7 +2,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { checkCitationTraceability, checkSourceDiversity, checkConfidenceAnnotation } from "./quality-gates";
 
+export type TaskKind = "general" | "coding" | "research" | "pm" | "review";
+export type ExecutionPreference = "auto" | "direct" | "specialist" | "team";
+export type ReviewPolicy = "risk_based" | "always" | "never";
+export type CompletionPolicy = "legacy" | "shadow" | "v2";
+
 export interface GoalConfig {
+	/** Config schema. Omitted means the legacy flat schema. */
+	schemaVersion?: 2;
+
 	/** Inject superpowers workflow discipline (skill mapping, HARD-GATE,
 	 *  reviewer-subagent template) into the goal continuation prompt and the
 	 *  per-turn system prompt. Default true: pi-goal is designed to pair with
@@ -16,6 +24,9 @@ export interface GoalConfig {
 	 *  burning the main model every turn. Falls back to ctx.model when unset or
 	 *  unresolvable. Default undefined = backward-compatible (uses ctx.model). */
 	judgeModel?: string;
+
+	/** V2 name for judgeModel. When both are present evaluatorModel wins. */
+	evaluatorModel?: string;
 
 	/** GG-1: a shell command run via child_process as a DETERMINISTIC
 	 *  verification gate before the LLM judge (trusted projects only, via
@@ -46,9 +57,30 @@ export interface GoalConfig {
 	 *  "review" | undefined. Default undefined = LLM auto-judges via the
 	 *  routing清单. Trusted projects only (read from .pi/goal.json). */
 	forceTaskType?: string;
+
+	/** Independent assurance is selected by risk, unless explicitly overridden. */
+	reviewPolicy?: ReviewPolicy;
+
+	/** Topology preference for newly drafted goals. */
+	defaultExecution?: ExecutionPreference;
+
+	/** Controls whether the legacy or V2 evaluator may change goal state. */
+	completionPolicy?: CompletionPolicy;
 }
 
-export const DEFAULT_GOAL_CONFIG: GoalConfig = { superpowersIntegration: true, judgeModel: undefined, verifyCommand: undefined, stuckEscalateModel: undefined, verifyTimeoutMs: undefined, forceTaskType: undefined };
+export const DEFAULT_GOAL_CONFIG: GoalConfig = {
+	schemaVersion: 2,
+	superpowersIntegration: true,
+	judgeModel: undefined,
+	evaluatorModel: undefined,
+	verifyCommand: undefined,
+	stuckEscalateModel: undefined,
+	verifyTimeoutMs: undefined,
+	forceTaskType: undefined,
+	reviewPolicy: "risk_based",
+	defaultExecution: "auto",
+	completionPolicy: "v2",
+};
 
 /** Whether to inject the superpowers coding-flow blocks (superpowersAdaptation
  *  + superpowersDiscipline + GOAL_GOVERNANCE). True when superpowersIntegration
@@ -84,21 +116,15 @@ export function taskRoutingBlock(config: GoalConfig = DEFAULT_GOAL_CONFIG): stri
 		: "";
 	return (
 		"<TASK-ROUTING>\n" +
-		"Judge the task type from the goal objective, then route to the matching workflow.\n" +
-		"This清单 is fallback guidance — you (the LLM) judge, no hard classifier.\n\n" +
+		"Classify the task, then choose the least expensive topology that is sufficient.\n" +
+		"Execution topology and completion assurance are separate decisions. Risk alone never requires a team.\n\n" +
 		overrideNote +
-		"| task 特征 | workflow | role | 触发词 |\n" +
-		"|---|---|---|---|\n" +
-		"| 写代码/改代码/修 bug/重构 | superpowers (coding) | coder | 实现/修复/重构/测试 |\n" +
-		"| 调研/对比/现状/可行性 | research (5-Phase) | researcher | 调研/了解/对比/现状 |\n" +
-		"| 产品方向/机会/规划/PRD | pm-discovery (PM SOP) | pm | 机会/规划/方向/PRD |\n" +
-		"| 审查/审计/评估 | review | reviewer | 审查/审计/评估 |\n" +
-		"| 无匹配 | 现场生成 (MUST, 不纯自由发挥) | 按需 spawn | — |\n\n" +
-		"多匹配 tiebreak: 编排型 role (PM/reviewer) > 执行型 role (researcher/coder)。\n" +
-		"例: \"调研 X 痛点并识别产品机会\" 同时匹配 research(调研)+PM(机会) → PM 胜出, PM 在 workflow 内 spawn researcher 做调研。\n" +
-		"理由: 编排型 role 能调度执行型 role, 反之不能。\n\n" +
-		"无匹配时 (MUST): 生成 DAGSpec (多 role 协作探索) → 调 dag_execute (inline spec, 不落盘) → 各 node spawn role 跑 per-role workflow。\n" +
-		"跑通后可建议固化为新 preset (Phase 2, 可选)。\n\n" +
+		"direct: one clear workstream that the main agent can complete.\n" +
+		"specialist: one dominant specialist capability or a low-confidence probe; use one registered foreground role.\n" +
+		"team: at least two genuinely independent workstreams or useful separation of duties.\n" +
+		"Use dag_execute only when real dependencies, parallel work, branching, or responsibility isolation justify a graph.\n" +
+		"If a specialist role is unavailable, fall back to direct and reassess on scope expansion.\n" +
+		"A new independent workstream may upgrade the route; convergence to one path may downgrade it unless the user locked a preference.\n\n" +
 		"重要: superpowers (brainstorm→plan→TDD→review) 是 coding 专用流程。\n" +
 		"非 coding 任务 (research/pm/review) 不要套 superpowers 的 coding 门 (如强制 TDD) — 按对应 workflow 走。\n" +
 		"</TASK-ROUTING>\n"
@@ -174,6 +200,22 @@ export function orchestratorConstraintBlock(executionMode?: string, taskType?: s
 		"不得自给理由自过 (handoff §八: 不能自己给理由自己过)。\n";
 }
 
+export function executionDecisionBlock(execution: {
+	selected: "direct" | "specialist" | "team";
+	role?: string;
+	source: "auto" | "user" | "legacy";
+	reasons: string[];
+}): string {
+	const reason = execution.reasons.length > 0 ? execution.reasons.join("; ") : "No route rationale recorded.";
+	if (execution.selected === "direct") {
+		return "\n\n## Execution route: direct\nWork in the main session. Reassess if scope expands, a new independent workstream appears, evidence conflicts, or progress stalls.\nReason: " + reason + "\n";
+	}
+	if (execution.selected === "specialist") {
+		return "\n\n## Execution route: specialist\nUse one foreground spawn_role" + (execution.role ? " with registered role `" + execution.role + "`" : " after selecting a registered role") + ". Do not silently use an unknown/default full-tool role.\nReason: " + reason + "\n";
+	}
+	return "\n\n## Execution route: team\nUse dag_execute only for real dependencies, parallel work, conditional branches, or responsibility isolation. Nodes must name independent outputs and consumers; avoid setup-only and text-stitching nodes.\nReason: " + reason + "\n";
+}
+
 // Governance block texts (kept as module-level consts for testability + clarity)
 const CODING_GOVERNANCE =
 	"\n\n## Goal 模式规则\n" +
@@ -198,21 +240,15 @@ const CODING_GOVERNANCE =
  *  v2 (含 curl/dig URL probing + ls/find 目录探索) 触发 doom-loop detector 误报 abort;
  *  v3 (聚焦: read 指定段 + grep + report_role_result, 无探索) completed 干净. 注入三块非 coding governance. */
 const REVIEWER_ROLEDEF_HINT =
-	"\n   ⚠️ reviewer roleDef 聚焦规范 (教训14, 避 doom-loop): 明确限定工具调用序列 (如 read 指定段 + grep + report_role_result), 禁探索性调用 (curl/dig URL probing / ls/find 目录探索会触发 doom-loop detector 误报 abort), maxTurns 适中 (15-30; 复杂审计≥25).";
+	"\n   ⚠️ reviewer roleDef 聚焦规范 (教训14, 避 doom-loop): 明确限定工具调用序列 (如 read 指定段 + grep + report_role_result), 禁探索性调用 (curl/dig URL probing / ls/find 目录探索会触发 doom-loop detector 误报 abort), maxTurns 适中 (15-30; 复杂审计≥25). report_role_result.findings[0] 必须精确写 `✅ Ready` 或 `❌ Not ready`; 每条阻塞发现还必须在后续 finding 中写出 code、criterion/claim/constraint subjectId，以及 evidenceRefs 或 missingEvidenceKind，供 Goal V2 绑定审计。";
 
 const RESEARCH_GOVERNANCE =
 	"\n\n## Research 模式规则 (taskType=research)\n" +
-	"调研类任务不套 superpowers coding 门（无 TDD），但 research workflow 阶段是 HARD-GATE：\n" +
-	"1. 计划：列出 ≥3 个独立研究角度（多角度并发，单 agent 串行 = 偷懒信号）\n" +
-	"2. 采集：每条数据标注来源（URL/文件路径）+ 置信度（高/中/低/猜测）\n" +
-	"3. 交叉验证：关键数据用 ≥2 个独立来源佐证，二手编译数据追源头 — 跳过此阶段=违约\n" +
-	"4. 综合：诚实标注数据/推理/假设的边界\n" +
-	"5. reviewer 验引用：完成前 spawn 独立 reviewer 审引用可溯率 + 判断可信度（reviewer ≠ 产出者）\n\n" +
-	"⚠️ 阶段 HARD-GATE: criteria 对应阶段产物, evidence 必须分阶段提交 (criterionId 标记阶段).\n" +
-	"跳过交叉验证 (阶段 3) 直接综合 = 违约, reviewer 会拒 (第2条). 机器形式验: criteria>=3 +\n" +
-	"evidence 全覆盖; 实质验 (per-claim >=2 源) 靠 reviewer, 不可机器化 (根因5残余, 诚实标注).\n\n" +
-	"质量门（reviewer 检查清单 + update_goal 重跑验真伪）: 引用可溯率 (URL/路径占比 >=0.3)、来源多样性 (>=3)、置信度标注完整性、是否循环论证。\n" +
-	"禁止的反模式：自评自己写的报告（循环论证）、单源断言、拍脑袋置信度、跳过交叉验证。\n" + REVIEWER_ROLEDEF_HINT;
+	"调研类任务不套 superpowers coding 门（无 TDD）。先识别会影响结论的 material claims，再为每条 claim 记录可定位证据。\n" +
+	"普通 claim 可由一个权威 primary source 支持；只有 high-risk、争议、冲突 claim 才要求不同 independenceKey 的独立佐证。\n" +
+	"supporting claim 的证据缺口只产生 advisory，不得阻塞完成。URL 数、引用率和来源数仅是 diagnostics，禁止为凑数量补低质量来源。\n" +
+	"综合时明确区分事实、推断和未知项。只有风险策略触发或用户明确要求时才 spawn 独立 reviewer。\n" +
+	"禁止的反模式：用来源数量代替证据质量、忽略冲突证据、把 advisory 当完成门禁。\n" + REVIEWER_ROLEDEF_HINT;
 
 const PM_GOVERNANCE =
 	"\n\n## PM 模式规则 (taskType=pm)\n" +
@@ -221,7 +257,7 @@ const PM_GOVERNANCE =
 	"2. 痛点：用数据说话（来源+置信度），区分 AI 能解 vs 流程/治理问题\n" +
 	"3. 机会：3-5 个，每个含技术可行性/业界现状/差异化/风险\n" +
 	"4. 优先级：用户价值×可行性×差异化，MVP 边界（做/不做）+ 成功指标（领域特化）\n" +
-	"5. reviewer 验论证：完成前 spawn 独立 reviewer 审机会是否有据、优先级是否合理、假设是否标注\n\n" +
+	"5. assurance：风险策略触发时由独立 reviewer 审机会是否有据、优先级是否合理、假设是否标注\n\n" +
 	"禁止的反模式：纯口号式建议（如\"用 AI 做合同管理\"）、无数据支撑的判断、自评自审。\n" + REVIEWER_ROLEDEF_HINT;
 
 const REVIEW_GOVERNANCE =
@@ -230,7 +266,7 @@ const REVIEW_GOVERNANCE =
 	"1. 审计清单：按正确性/安全/可维护/迁移风险维度逐项查\n" +
 	"2. 证据：每条发现附文件行号/源码/测试输出\n" +
 	"3. 分级：critical/major/minor/nit，给修改建议\n" +
-	"4. reviewer 复核：完成前 spawn 独立 reviewer 复核审计覆盖度 + 分级合理性（reviewer ≠ 产出者）\n\n" +
+	"4. assurance：风险策略触发或用户要求时由独立 reviewer 复核覆盖度与分级\n\n" +
 	"禁止的反模式：只夸不批、无证据的主观判断、跳过分级。\n" + REVIEWER_ROLEDEF_HINT;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -251,9 +287,10 @@ export interface CompletableGoal {
 	/** Per-goal task type declared at propose_goal_draft time (深修 A).
 	 *  undefined = legacy goal (backward-compat: treated as coding, no gate). */
 	taskType?: "coding" | "research" | "pm" | "review";
-	/** True only after an independent reviewer (subagent ≠ producer) has
-	 *  APPROVED. Non-coding goals require this to complete. */
+	/** Legacy reviewer result. V2 consults it only when assurance selected required review. */
 	reviewerPassed?: boolean;
+	/** V2 assurance decision. Reviewer is a gate only when this is true. */
+	reviewRequired?: boolean;
 	/** 第2条: 结构化验收凭证, 替代裸布尔. 非 coding goal reviewerPassed=true 时
 	 *  必须携带, canComplete 验契约满足. undefined = 未提供 (非 coding 拒, coding 忽略). */
 	reviewerVerdict?: ReviewerVerdict;
@@ -271,14 +308,8 @@ export interface CompletableGoal {
 	criteria: { evidence: string[] }[];
 }
 
-/** 第3条 (CLM run 复盘): verifyQualityGates — 接线 quality-gates.ts 三个死函数.
- *  Root cause: checkCitationTraceability/checkSourceDiversity/checkConfidenceAnnotation
- *  定义了但无人调 (handoff §八 根因5 残余). Fix: 此纯函数调它们, update_goal handler
- *  在 reviewerPassed=true 时读 reportPath 重跑, 验 reviewer 自报 checksPassed 真伪.
- *  不信任 reviewer 自报 (第2条: reviewer 可廉价满足). 阈值: traceability>=0.3,
- *  diversity>=3, confidenceAnnotated=true. 阈值依据: 本次 CLM 报告实测 (15 URL,
- *  多源) 刚好过线; 过松=形同虚设, 过紧=误杀. 可调 (常量集中此处).
- *  Returns {ok, reason?, metrics?}. metrics 供 handler 写回 verdict 供审计. */
+/** Legacy report diagnostics. These metrics remain visible for audit but never
+ * reject a non-empty report. Empty content is still a real blocking failure. */
 export const QUALITY_GATE_THRESHOLDS = { citationTraceability: 0.3, sourceDiversity: 3 } as const;
 
 // G4 (CLM 二次 live 测试复盘): citation-traceability bar graded by taskType.
@@ -318,22 +349,18 @@ export function verifyQualityGates(reportText: string, taskType?: string): { ok:
 	return { ok: true, blocking: false, metrics };
 }
 
-/** 第2条 (CLM run 复盘): reviewer verdict — 结构化验收凭证, 替代裸布尔 reviewerPassed.
- *  Root cause: reviewerPassed 是裸布尔, main agent 说 true 就 true, 框架不知 reviewer 用了
- *  什么配置/验了多少源——reviewer 可被廉价满足 (浅模型+low thinking+不验源, 读结构 APPROVE).
- *  handoff §八 根因2. Fix: reviewerPassed=true 须携带此 verdict, canComplete 验契约满足.
- *  契约: thinking≥medium (独立验收要够思考), verifiedSources≥3 (验源下限), model 非空,
- *  checksPassed=true (第3条 quality-gates 机器项). notes=reviewer 主观判断 (不可机器验项).
- *  软约束: verdict 由 reviewer LLM 填, 但 update_goal handler 重跑 quality-gates 验真伪 (第3条). */
+/** Legacy structured reviewer audit. Model, thinking level, source count, and
+ * report checks are diagnostics rather than completion quotas. Authenticity
+ * comes from the spawned-session transcript. */
 export interface ReviewerVerdict {
-	/** reviewer 用的模型 (provider/model-id 或 bare id). 非空=声明用了真模型. */
+	/** Diagnostic reviewer model. */
 	model?: string;
-	/** thinking level: low/medium/high/xhigh. <medium 拒 (独立验收不能浅思考). */
+	/** Diagnostic thinking level. */
 	thinkingLevel?: string;
-	/** reviewer 实际独立验源的 URL/路径数. <3 拒 (验源下限). */
-	verifiedSources: number;
-	/** quality-gates 机器项是否全过 (第3条). reviewer 报, handler 重跑验真伪. */
-	checksPassed: boolean;
+	/** Diagnostic count of sources inspected. */
+	verifiedSources?: number;
+	/** Legacy report-diagnostic result. */
+	checksPassed?: boolean;
 	/** 报告产物路径, update_goal handler 读它重跑 quality-gates 验 checksPassed 真伪. */
 	reportPath?: string;
 	/** reviewer 主观判断 (判断可信度/循环论证等不可机器验项). */
@@ -347,11 +374,10 @@ export interface ReviewerVerdict {
 /** 第2条: validate reviewer verdict 契约. Pure + unit-testable. Returns {ok, reason?}.
  *  Empty/undefined verdict → ok=false (caller 区分 "未传" vs "传了但不达标"). */
 export function validateReviewerVerdict(v: ReviewerVerdict): { ok: boolean; reason?: string } {
-	if (!v.model) return { ok: false, reason: "Reviewer verdict missing model — cannot confirm a real model was used." };
-	const thinkingOk = v.thinkingLevel && ["medium", "high", "xhigh"].includes(v.thinkingLevel);
-	if (!thinkingOk) return { ok: false, reason: "Reviewer thinkingLevel must be >= medium (got " + (v.thinkingLevel ?? "undefined") + ") — independent review cannot be shallow (handoff §八 root cause 2)." };
-	if (typeof v.verifiedSources !== "number" || v.verifiedSources < 3) return { ok: false, reason: "Reviewer verifiedSources must be >= 3 (got " + v.verifiedSources + ") — 验源下限, prevents rubber-stamp review." };
-	if (!v.checksPassed) return { ok: false, reason: "Reviewer checksPassed=false — machine-verifiable quality gates (citation traceability / source diversity / confidence annotation) not satisfied." };
+	if (!v || typeof v !== "object") return { ok: false, reason: "Reviewer verdict must be an object." };
+	if (v.verifiedSources !== undefined && (!Number.isFinite(v.verifiedSources) || v.verifiedSources < 0)) {
+		return { ok: false, reason: "Reviewer verifiedSources is diagnostic and must be a non-negative number when supplied." };
+	}
 	return { ok: true };
 }
 
@@ -371,47 +397,115 @@ export function validateSingleRationaleApproved(goal: CompletableGoal, verdict: 
 }
 
 /** G7 预审契约 (执行前预审, A): 预审 reviewer 只审 singleRationale 合理性, 无产物可验源/跑 gate.
- *  轻量契约: model 非空 + thinkingLevel>=medium (独立审核不能浅) + singleRationaleApproved 布尔.
+ *  Compatibility contract: only the actual decision is structural. Model and
+ *  thinking level remain diagnostics and never decide whether review counts.
  *  不要求 verifiedSources/checksPassed (预审阶段无 sources/产物 — 与终审 validateReviewerVerdict 区别). */
 export function validateSingleRationalePreApproval(r: { model?: string; thinkingLevel?: string; singleRationaleApproved?: boolean }): { ok: boolean; reason?: string } {
-	if (!r.model) return { ok: false, reason: "singleRationaleReviewer missing model — cannot confirm a real model was used." };
-	const thinkingOk = r.thinkingLevel && ["medium", "high", "xhigh"].includes(r.thinkingLevel);
-	if (!thinkingOk) return { ok: false, reason: "singleRationaleReviewer thinkingLevel must be >= medium (got " + (r.thinkingLevel ?? "undefined") + ") — independent audit cannot be shallow." };
 	if (typeof r.singleRationaleApproved !== "boolean") return { ok: false, reason: "singleRationaleReviewer.singleRationaleApproved must be a boolean (reviewer's verdict on whether the task can be single)." };
 	return { ok: true };
 }
 
-/** G3 (CLM 二次 live 测试复盘 / 教训6): extract the reviewer's actual report_role_result
- *  findings from a sub-session's .jsonl transcript. The sub-session jsonl is written by
- *  pi-core (not forgeable by the main agent) and contains ONLY that reviewer's turns,
- *  so finding a report_role_result toolCall with non-empty findings proves a real
- *  reviewer session existed and reported substantively — closing the "fabricated
- *  verdict with no real reviewer" gap that reviewerVerdict (结构合规) + reportPath
- *  re-run (报告内容真伪) alone could not close.
+/** Extract the reviewer's accepted report_role_result from its child-session transcript.
+ *  New pi-roles sessions carry spawn provenance and a matching accepted tool result;
+ *  schema-mismatched/rejected calls are ignored. Old transcripts without provenance
+ *  retain the call-only fallback for one compatibility cycle.
  *
  *  Cross-extension reality: pi-goal cannot read pi-roles' in-memory ReportState, so
- *  the sessionFile is the only independent ground-truth bridge. Pure + unit-testable
+ *  the runtime-persisted sessionFile is the available audit bridge. Pure + unit-testable
  *  (no fs); the handler does the file read and calls this. Returns {found, findings?}:
- *  found=true means a report_role_result toolCall was parsed; findings may still be
- *  empty (handler rejects empty findings even when found). */
-export function extractReviewerFindings(jsonlText: string): { found: boolean; findings?: unknown } {
-	if (!jsonlText || jsonlText.trim().length === 0) return { found: false };
+ *  found=true means an accepted report was bound, or the legacy fallback parsed one. */
+export interface ReviewerTranscriptEvidence {
+	found: boolean;
+	findings?: unknown;
+	spawnedSession: boolean;
+	parentSession?: string;
+	sessionId?: string;
+	provenance?: {
+		schemaVersion: 1;
+		agentId: string;
+		role: string;
+		sessionId: string;
+		parentSession: string | null;
+	};
+}
+
+export interface ReviewerSourceExpectation {
+	parentSession: string;
+	role: "reviewer";
+	sessionId?: string;
+}
+
+export function extractReviewerFindings(jsonlText: string): ReviewerTranscriptEvidence {
+	if (!jsonlText || jsonlText.trim().length === 0) return { found: false, spawnedSession: false };
 	const lines = jsonlText.split("\n");
+	const reportCalls: Array<{ id?: string; findings: unknown }> = [];
+	const acceptedCallIds = new Set<string>();
+	let reportResultObserved = false;
+	let parentSession: string | undefined;
+	let sessionId: string | undefined;
+	let provenance: ReviewerTranscriptEvidence["provenance"];
 	for (const line of lines) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
 		let parsed: any;
 		try { parsed = JSON.parse(trimmed); } catch { continue; } // skip malformed lines
-		const msg = parsed && typeof parsed === "object" ? parsed.message : undefined;
-		if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-		for (const c of msg.content) {
-			if (c && typeof c === "object" && c.type === "toolCall" && c.name === "report_role_result") {
-				const args = c.arguments && typeof c.arguments === "object" ? c.arguments : {};
-				return { found: true, findings: args.findings };
+		if (parsed?.type === "session") {
+			if (typeof parsed.parentSession === "string" && parsed.parentSession.trim()) parentSession = parsed.parentSession.trim();
+			if (typeof parsed.id === "string" && parsed.id.trim()) sessionId = parsed.id.trim();
+		}
+		if (parsed?.type === "custom" && parsed.customType === "pi-roles:spawn-provenance") {
+			const data = parsed.data;
+			if (data?.schemaVersion === 1
+				&& typeof data.agentId === "string" && data.agentId.trim()
+				&& typeof data.role === "string" && data.role.trim()
+				&& typeof data.sessionId === "string" && data.sessionId.trim()
+				&& (data.parentSession === null || (typeof data.parentSession === "string" && data.parentSession.trim()))) {
+				provenance = {
+					schemaVersion: 1,
+					agentId: data.agentId.trim(),
+					role: data.role.trim(),
+					sessionId: data.sessionId.trim(),
+					parentSession: typeof data.parentSession === "string" ? data.parentSession.trim() : null,
+				};
 			}
 		}
+		const msg = parsed && typeof parsed === "object" ? parsed.message : undefined;
+		if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+			for (const c of msg.content) {
+				if (c && typeof c === "object" && c.type === "toolCall" && c.name === "report_role_result") {
+					const args = c.arguments && typeof c.arguments === "object" ? c.arguments : {};
+					const callId = c.id ?? c.toolCallId;
+					reportCalls.push({
+						...(typeof callId === "string" ? { id: callId } : {}),
+						findings: args.findings,
+					});
+				}
+			}
+			continue;
+		}
+		if (msg?.role === "toolResult" && msg.toolName === "report_role_result") {
+			reportResultObserved = true;
+			const accepted = msg.isError !== true
+				&& msg.details?.errorType === undefined
+				&& Array.isArray(msg.content)
+				&& msg.content.some((part: any) => part?.type === "text"
+					&& typeof part.text === "string"
+					&& part.text.includes("[pi-roles] report accepted"));
+			if (accepted && typeof msg.toolCallId === "string") acceptedCallIds.add(msg.toolCallId);
+		}
 	}
-	return { found: false };
+	const selected = reportResultObserved
+		? reportCalls.find((call) => call.id !== undefined && acceptedCallIds.has(call.id))
+		: provenance ? undefined : reportCalls.at(-1);
+	const found = selected !== undefined;
+	return {
+		found,
+		...(found ? { findings: selected.findings } : {}),
+		spawnedSession: Boolean(parentSession && sessionId),
+		...(parentSession ? { parentSession } : {}),
+		...(sessionId ? { sessionId } : {}),
+		...(provenance ? { provenance } : {}),
+	};
 }
 
 /** G3 helper: are the extracted findings non-empty? (array with items, or non-empty
@@ -431,13 +525,40 @@ export function findingsAreNonEmpty(findings: unknown): boolean {
 export function verifyReviewerSource(
 	agentId: string | undefined,
 	sessionFile: string | undefined,
-	extracted: { found: boolean; findings?: unknown },
+	extracted: ReviewerTranscriptEvidence,
+	expected?: ReviewerSourceExpectation,
 ): { ok: boolean; reason?: string } {
 	if (!agentId || !sessionFile) {
 		return { ok: false, reason: "reviewerPassed=true for non-coding goal requires reviewerAgentId + reviewerSessionFile (G3: verdict source authenticity). The verdict must come from a real spawned reviewer session, not a self-constructed JSON. Re-spawn a reviewer and pass its agentId + sessionFile." };
 	}
+	if (!/^sub_\d+_\d+$/.test(agentId)) {
+		return { ok: false, reason: "reviewerAgentId does not match a pi-roles spawned-session id." };
+	}
+	if (!extracted.spawnedSession || !extracted.parentSession || !extracted.sessionId) {
+		return { ok: false, reason: "reviewerSessionFile is not a spawned child session: its session header must include id and parentSession." };
+	}
+	if (expected) {
+		const provenance = extracted.provenance;
+		if (!provenance) {
+			return { ok: false, reason: "Reviewer session has no pi-roles spawn provenance; spawn a fresh registered reviewer with the current pi-roles extension." };
+		}
+		if (provenance.agentId !== agentId) {
+			return { ok: false, reason: "Reviewer agentId does not match the trusted child-session provenance." };
+		}
+		if (provenance.role !== expected.role) {
+			return { ok: false, reason: "The supplied child session was spawned as role '" + provenance.role + "', not reviewer." };
+		}
+		if (provenance.sessionId !== extracted.sessionId || (expected.sessionId && expected.sessionId !== extracted.sessionId)) {
+			return { ok: false, reason: "Reviewer sessionId does not match its header/provenance." };
+		}
+		if (extracted.parentSession !== expected.parentSession || provenance.parentSession !== expected.parentSession) {
+			return { ok: false, reason: "Reviewer session is not a child of the current goal session." };
+		}
+	}
 	if (!extracted.found) {
-		return { ok: false, reason: "No report_role_result found in reviewerSessionFile (G3: the referenced session did not actually report — verdict not sourced from a real reviewer). Re-spawn and ensure the reviewer calls report_role_result." };
+		return { ok: false, reason: extracted.provenance
+			? "No accepted report_role_result found in reviewerSessionFile; schema-mismatched or rejected calls cannot authorize a review verdict. Re-spawn or let the reviewer retry successfully."
+			: "No report_role_result found in reviewerSessionFile (G3: the referenced session did not actually report — verdict not sourced from a real reviewer). Re-spawn and ensure the reviewer calls report_role_result." };
 	}
 	if (!findingsAreNonEmpty(extracted.findings)) {
 		return { ok: false, reason: "reviewerSessionFile contains report_role_result but findings are empty (G3: a rubber-stamp reviewer with no substantive report). Re-spawn a reviewer that reports substantive findings." };
@@ -452,34 +573,107 @@ export function verifyReviewerSource(
  *  executionMode 不可缺省, 必须显式选 single|orchestrated. coding/undefined 不变
  *  (backward-compat). 不硬 deny single — 执行权保留, 但逼 main agent 做这个判断.
  *  Returns {ok, reason?}. Empty input (legacy coding goal) → ok. */
-export function validateGoalProposal(input: { taskType?: string; executionMode?: string; criteria?: string[]; singleRationale?: string }): { ok: boolean; reason?: string } {
-	const nonCoding = input.taskType && input.taskType !== "coding";
-	if (nonCoding && !input.executionMode) {
-		return {
-			ok: false,
-			reason: "Non-coding taskType (" + input.taskType + ") requires an explicit executionMode (\"single\" for main-agent direct execution, or \"orchestrated\" for role-based delegation). Omitting it defaults to single — a structural bias toward treating complex tasks as simple (handoff §八). Choose explicitly.",
-		};
+export interface GoalProposalValidationInput {
+	objective?: string;
+	taskType?: string;
+	executionMode?: string;
+	executionPreference?: string;
+	criteria?: Array<string | { description: string; level?: "blocking" | "advisory" }>;
+	constraints?: string[];
+	researchClaims?: Array<{ id: string; text?: string; evidenceRefs?: string[] }>;
+	singleRationale?: string;
+}
+
+export function validateGoalProposal(input: GoalProposalValidationInput): { ok: boolean; reason?: string } {
+	if (input.objective !== undefined && input.objective.trim().length === 0) {
+		return { ok: false, reason: "Goal objective must not be empty or blank." };
 	}
-	// G7 (single 自批禁): single 模式须给出可独立审核的理由, 不得 main agent 自批自过.
-	// 理由 ≠ 空话: ≥30 字且须含具体依据 (任务规模/单点性/无外部依赖等), 由 reviewer 审.
-	if (input.taskType && input.taskType !== "coding" && input.executionMode === "single") {
-		const r = (input.singleRationale ?? "").trim();
-		if (r.length < 30) {
+	if (input.criteria && input.criteria.length === 0) return { ok: false, reason: "At least one outcome criterion is required." };
+	const criteria = input.criteria?.map((criterion) => typeof criterion === "string"
+		? { description: criterion, level: "blocking" as const }
+		: { description: criterion.description, level: criterion.level ?? "blocking" as const });
+	if (criteria?.some((criterion) => criterion.description.trim().length === 0)) return { ok: false, reason: "Outcome criteria must not be blank." };
+	if (criteria && !criteria.some((criterion) => criterion.level === "blocking")) {
+		return { ok: false, reason: "At least one blocking outcome criterion is required; advisory criteria cannot define success by themselves." };
+	}
+	if (input.constraints !== undefined && input.constraints.length === 0) {
+		return { ok: false, reason: "Omit constraints when there are none; a provided constraints array must not be empty." };
+	}
+	if (input.constraints?.some((constraint) => constraint.trim().length === 0)) {
+		return { ok: false, reason: "Goal constraints must not contain empty or blank values." };
+	}
+	const claimIds = new Set<string>();
+	for (const [index, claim] of (input.researchClaims ?? []).entries()) {
+		const normalizedId = claim.id.trim();
+		if (!normalizedId) return { ok: false, reason: `researchClaims[${index}].id must not be empty or blank.` };
+		if (claim.text !== undefined && !claim.text.trim()) {
+			return { ok: false, reason: `researchClaims[${index}].text must not be empty or blank.` };
+		}
+		if (claimIds.has(normalizedId)) {
+			return { ok: false, reason: `researchClaims contains duplicate claim id: ${normalizedId || "<blank>"}.` };
+		}
+		claimIds.add(normalizedId);
+		const evidenceRefs = claim.evidenceRefs ?? [];
+		if (evidenceRefs.length > 0) {
+			const refs = evidenceRefs.map((ref) => ref.trim() || "<blank>");
 			return {
 				ok: false,
-				reason: "single executionMode requires a singleRationale (≥30 chars) explaining WHY this task can be done by the main agent alone without spawn — e.g. single-point lookup, trivial scope, no cross-validation needed. Empty/short rationale = self-approving without justification (handoff §八: 不能自己给理由自己过). The rationale will be independently audited by the reviewer.",
+				reason: `researchClaims[${index}].evidenceRefs references unknown draft evidence: ${refs.join(", ")}. The draft evidence ledger is empty; record evidence after the goal starts.`,
 			};
 		}
 	}
-	// 第5条: research 阶段 HARD-GATE (形式). criteria >=3 对应 plan/collect/cross-validate
-	// 阶段产物. 诚实: 形式验非实质验, per-claim 交叉验证靠 reviewer (根因5残余).
-	if (input.taskType === "research" && input.criteria && input.criteria.length < 3) {
-		return {
-			ok: false,
-			reason: "Research goal requires >= 3 criteria (corresponding to plan/collect/cross-validate stage artifacts). Fewer = skipping research workflow stages (handoff §八 第5条).",
-		};
+	if (input.executionMode && input.executionPreference) {
+		return { ok: false, reason: "Use executionPreference or legacy executionMode, not both." };
 	}
 	return { ok: true };
+}
+
+/** Draft criteria that assert a repository/environment state instead of a task
+ *  outcome (UX finding: the draft writer repeatedly generated "git status
+ *  --porcelain must be empty" / "tracked changes must be zero" gates, which are
+ *  unsatisfiable on a dirty worktree and unrelated to the real objective,
+ *  causing REVISE loops). Such gates are downgraded to advisory: they keep
+ *  their text (visible in the review UI) but can no longer block completion.
+ *  When the objective itself is about the environment state (e.g. "clean up
+ *  the worktree"), the gate is kept blocking. Pure and unit-testable. */
+export interface DraftCriterionInput {
+	description: string;
+	level: "blocking" | "advisory";
+}
+
+const ENV_STATE_GATE_PATTERNS: Array<{ re: RegExp; label: string }> = [
+	{ re: /\bgit\s+status\b/i, label: "git status" },
+	{ re: /\bporcelain\b/i, label: "porcelain" },
+	{ re: /\b(working\s*tree|worktree)\b/i, label: "worktree" },
+	{ re: /\btracked\s+changes\b/i, label: "tracked changes" },
+	{ re: /\b(untracked|modified|uncommitted)\s+(files?|changes?)?\b/i, label: "files state" },
+	{ re: /\b(repo|repository)\b/i, label: "repository" },
+	{ re: /(仓库|工作区|工作树|git 状态|git\s*状态)/i, label: "repo (zh)" },
+];
+
+const ENV_STATE_GATE_STATE_WORDS = /(clean|empty|dirty|zero|none|no\s+(modified|untracked|uncommitted|changes|new\s+files)|must\s+not|干净|为空|无修改|没有修改|无改动|没有改动|无未提交|没有未提交|脏)/i;
+
+function matchesEnvironmentStateGate(description: string): boolean {
+	const env = ENV_STATE_GATE_PATTERNS.some(({ re }) => re.test(description));
+	if (!env) return false;
+	return ENV_STATE_GATE_STATE_WORDS.test(description);
+}
+
+export function downgradeEnvironmentStateGates(
+	criteria: readonly DraftCriterionInput[],
+	objective: string,
+): { criteria: DraftCriterionInput[]; downgraded: string[] } {
+	const objectiveIsEnvState = matchesEnvironmentStateGate(objective);
+	const downgraded: string[] = [];
+	const result = criteria.map((criterion) => {
+		const isEnvGate = criterion.level === "blocking"
+			&& matchesEnvironmentStateGate(criterion.description)
+			&& !objectiveIsEnvState;
+		if (!isEnvGate) return criterion;
+		downgraded.push(criterion.description);
+		return { ...criterion, level: "advisory" as const };
+	});
+	return { criteria: result, downgraded };
 }
 
 /** Assess a newly submitted evidence string against a criterion's existing
@@ -561,44 +755,22 @@ export function assessEvidence(newEvidence: string, existing: string[]): { dupli
  *  Backward-compat: taskType undefined or "coding" → no reviewer gate.
  *  Legacy goals behave exactly as before. */
 export function canComplete(goal: CompletableGoal): { ok: boolean; reason?: string } {
-	// 1. Evidence gate (existing behavior — preserved verbatim)
 	const uncovered = goal.criteria.filter((c) => c.evidence.length === 0);
 	if (uncovered.length > 0) {
 		return { ok: false, reason: uncovered.length + " criteria lack evidence" };
 	}
-	// 2. 深修 D: reviewer gate for non-coding goals
-	//    undefined / "coding" → no gate (backward-compat).
-	if (goal.taskType && goal.taskType !== "coding" && !goal.reviewerPassed) {
+	if (goal.reviewRequired && !goal.reviewerPassed) {
 		return {
 			ok: false,
-			reason: "Non-coding goal (taskType=" + goal.taskType + ") requires independent reviewer APPROVE before complete. Spawn a reviewer (reviewer ≠ producer) and have it submit its verdict, then the gate opens. Root cause addressed: prevent main-agent self-review (循环论证).",
+			reason: "This goal's risk-based assurance decision requires an independent reviewer before completion.",
 		};
 	}
-	// 第2条: reviewerPassed=true 须携带结构化 verdict, 验契约满足. 裸布尔不再够
-	// (CLM run 复盘: 浅 reviewer 橡皮图章 APPROVE). coding/undefined 无此检查 (backward-compat).
-	if (goal.taskType && goal.taskType !== "coding" && goal.reviewerPassed) {
+	if (goal.reviewRequired && goal.reviewerPassed) {
 		if (!goal.reviewerVerdict) {
-			return { ok: false, reason: "Non-coding goal reviewerPassed=true but no reviewerVerdict provided — a bare boolean is no longer sufficient (第2条: prevents rubber-stamp review). Re-spawn reviewer with a structured verdict (model/thinkingLevel>=medium/verifiedSources>=3/checksPassed)." };
+			return { ok: false, reason: "A required independent review must include a structured verdict." };
 		}
 		const v = validateReviewerVerdict(goal.reviewerVerdict);
 		if (!v.ok) return { ok: false, reason: "Reviewer verdict contract not satisfied: " + (v.reason ?? "unknown") };
-		// G7 (single 自批禁): single 模式的 singleRationale 须由 reviewer 独立审核通过.
-		// main agent 不得自给理由自过 — 执行权与验收权正交.
-		const singleCheck = validateSingleRationaleApproved(goal, goal.reviewerVerdict);
-		if (!singleCheck.ok) return { ok: false, reason: singleCheck.reason ?? "single rationale not approved by reviewer" };
-	}
-	// G7 预审 gate (执行前预审, A): single+非coding 须 singleRationaleStatus=approved.
-	// pending = 未预审不得 complete (防跳过预审直接做完); rejected = 预审拒了须降级.
-	if (goal.taskType && goal.taskType !== "coding" && goal.executionMode === "single") {
-		if (goal.singleRationaleStatus !== "approved") {
-			return {
-				ok: false,
-				reason: "single executionMode requires singleRationaleStatus=\"approved\" (执行前预审通过). Got: " + (goal.singleRationaleStatus ?? "undefined/pending") + ". "+
-					(goal.singleRationaleStatus === "rejected"
-						? "预审被拒 — 须降级: update_goal({ executionMode: \"orchestrated\" }) 改用 spawn role 重做."
-						: "须先 spawn reviewer 预审 singleRationale, 通过后调 update_goal({ singleRationalePreApproved: true, singleRationaleReviewer: {...} }) 写入, 再开始执行."),
-			};
-		}
 	}
 	return { ok: true };
 }
@@ -703,23 +875,101 @@ export function isSubagentSession(ctx: {
 	}
 }
 
-/** Load optional config from <cwd>/.pi/goal.json (trusted projects only).
- *  Falls back to DEFAULT_GOAL_CONFIG on any error or missing file. */
+export interface ParsedGoalConfig {
+	config: GoalConfig;
+	warnings: string[];
+}
+
+const TASK_KINDS = new Set<TaskKind>(["general", "coding", "research", "pm", "review"]);
+const EXECUTION_PREFERENCES = new Set<ExecutionPreference>(["auto", "direct", "specialist", "team"]);
+const REVIEW_POLICIES = new Set<ReviewPolicy>(["risk_based", "always", "never"]);
+const COMPLETION_POLICIES = new Set<CompletionPolicy>(["legacy", "shadow", "v2"]);
+
+/** Parse both the legacy flat config and schema v2 without silently accepting
+ * invalid policy values. Invalid fields fall back individually and are
+ * reported as warnings; a future schema falls back as a whole. */
+export function parseGoalConfig(input: unknown): ParsedGoalConfig {
+	const warnings: string[] = [];
+	const config: GoalConfig = { ...DEFAULT_GOAL_CONFIG };
+	if (!input || typeof input !== "object" || Array.isArray(input)) {
+		return { config, warnings: ["goal config must be a JSON object; using defaults"] };
+	}
+	const raw = input as Record<string, unknown>;
+	if (typeof raw.schemaVersion === "number" && raw.schemaVersion > 2) {
+		return { config, warnings: ["goal config schemaVersion " + raw.schemaVersion + " is newer than supported version 2; using defaults"] };
+	}
+	if (raw.schemaVersion !== undefined && raw.schemaVersion !== 1 && raw.schemaVersion !== 2) {
+		warnings.push("invalid schemaVersion; treating config as legacy")
+	}
+
+	if (raw.superpowersIntegration !== undefined) {
+		if (typeof raw.superpowersIntegration === "boolean") config.superpowersIntegration = raw.superpowersIntegration;
+		else warnings.push("superpowersIntegration must be boolean; using true");
+	}
+
+	const nonEmptyString = (key: string): string | undefined => {
+		const value = raw[key];
+		if (value === undefined) return undefined;
+		if (typeof value !== "string" || value.trim().length === 0) {
+			warnings.push(key + " must be a non-empty string; ignoring it");
+			return undefined;
+		}
+		return value.trim();
+	};
+	const evaluatorModel = nonEmptyString("evaluatorModel");
+	const legacyJudgeModel = nonEmptyString("judgeModel");
+	if (evaluatorModel && legacyJudgeModel && evaluatorModel !== legacyJudgeModel) {
+		warnings.push("evaluatorModel overrides deprecated judgeModel");
+	}
+	const selectedEvaluator = evaluatorModel ?? legacyJudgeModel;
+	config.evaluatorModel = selectedEvaluator;
+	// Keep the legacy runtime field populated for one compatibility cycle.
+	config.judgeModel = selectedEvaluator;
+	config.verifyCommand = nonEmptyString("verifyCommand");
+	config.stuckEscalateModel = nonEmptyString("stuckEscalateModel");
+
+	if (raw.verifyTimeoutMs !== undefined) {
+		if (typeof raw.verifyTimeoutMs === "number" && Number.isFinite(raw.verifyTimeoutMs) && raw.verifyTimeoutMs > 0) {
+			config.verifyTimeoutMs = Math.floor(raw.verifyTimeoutMs);
+		} else {
+			warnings.push("verifyTimeoutMs must be a positive finite number; using the default")
+		}
+	}
+
+	const parseEnum = <T extends string>(key: string, values: Set<T>, fallback: T | undefined): T | undefined => {
+		const value = raw[key];
+		if (value === undefined) return fallback;
+		if (typeof value === "string" && values.has(value as T)) return value as T;
+		warnings.push(key + " has an invalid value; using " + (fallback ?? "auto"));
+		return fallback;
+	};
+	config.forceTaskType = parseEnum("forceTaskType", TASK_KINDS, undefined);
+	config.reviewPolicy = parseEnum("reviewPolicy", REVIEW_POLICIES, "risk_based");
+	config.defaultExecution = parseEnum("defaultExecution", EXECUTION_PREFERENCES, "auto");
+	config.completionPolicy = parseEnum("completionPolicy", COMPLETION_POLICIES, "v2");
+
+	const knownKeys = new Set([
+		"schemaVersion", "superpowersIntegration", "evaluatorModel", "judgeModel",
+		"verifyCommand", "stuckEscalateModel", "verifyTimeoutMs", "forceTaskType",
+		"reviewPolicy", "defaultExecution", "completionPolicy",
+	]);
+	for (const key of Object.keys(raw)) {
+		if (!knownKeys.has(key)) warnings.push("unknown goal config key: " + key);
+	}
+	return { config, warnings };
+}
+
+/** Load optional config from <cwd>/.pi/goal.json (trusted projects only). */
 export function loadGoalConfig(cwd: string, trusted: boolean): GoalConfig {
 	if (!trusted) return { ...DEFAULT_GOAL_CONFIG };
 	const cfgPath = path.join(cwd, ".pi", "goal.json");
 	try {
 		if (!fs.existsSync(cfgPath)) return { ...DEFAULT_GOAL_CONFIG };
-		const raw = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as Partial<GoalConfig> & Record<string, unknown>;
-		return {
-			superpowersIntegration: raw.superpowersIntegration === false ? false : true,
-			judgeModel: typeof raw.judgeModel === "string" ? raw.judgeModel : undefined,
-			verifyCommand: typeof raw.verifyCommand === "string" ? raw.verifyCommand : undefined,
-			stuckEscalateModel: typeof raw.stuckEscalateModel === "string" ? raw.stuckEscalateModel : undefined,
-			verifyTimeoutMs: typeof raw.verifyTimeoutMs === "number" ? raw.verifyTimeoutMs : undefined,
-			forceTaskType: typeof raw.forceTaskType === "string" ? raw.forceTaskType : undefined,
-		};
-	} catch {
+		const parsed = parseGoalConfig(JSON.parse(fs.readFileSync(cfgPath, "utf8")));
+		for (const warning of parsed.warnings) console.warn("[pi-goal] " + warning);
+		return parsed.config;
+	} catch (error) {
+		console.warn("[pi-goal] failed to parse " + cfgPath + ": " + (error instanceof Error ? error.message : String(error)));
 		return { ...DEFAULT_GOAL_CONFIG };
 	}
 }

@@ -13,12 +13,9 @@ import {
 // Design: docs/superpowers/specs/2026-07-02-non-coding-goal-design.md §五
 
 describe("taskRoutingBlock — orchestrated 模式编排者约束 (深修 A/B)", () => {
-	it("contains orchestrator-vs-executor guidance", () => {
+	it("contains adaptive topology guidance", () => {
 		const block = taskRoutingBlock(DEFAULT_GOAL_CONFIG);
-		assert.ok(
-			block.includes("编排") || block.includes("orchestrat"),
-			`should mention orchestrator guidance, got: ${block.slice(0, 300)}`,
-		);
+		assert.ok(block.includes("direct") && block.includes("specialist") && block.includes("team"));
 	});
 
 	it("states non-coding tasks should not apply coding gates", () => {
