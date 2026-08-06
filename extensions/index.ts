@@ -1224,6 +1224,22 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				updateState({ completion: transition.completion, noProgressCount: 0 }, ctx);
 			}
 		}
+		// The print host can emit agent_end before this turn_end. In that order
+		// the continuation has already been queued using the previous counters,
+		// so checking only in sendContinuationNow lets a headless goal overshoot
+		// its configured cap (especially when completion is repeatedly revised).
+		// Enforce the guard after completion evaluation so a successful final
+		// evaluation still wins on the cap-boundary turn.
+		if (goal.headless && goal.status === "active") {
+			if (goal.noProgressCount >= CONFIG.maxNoProgressTurns) {
+				pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
+				return;
+			}
+			if (goal.autoTurnCount >= activeMaxAutoTurns) {
+				pauseGoal("reached max auto-turns (" + activeMaxAutoTurns + ")", ctx);
+				return;
+			}
+		}
 		if (goal.status === "active" && goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) {
 				const completionPolicy = goalConfig.completionPolicy ?? "v2";
 				const pendingV2Request = completionPolicy === "v2" && hasPendingCompletionRequest(goal);

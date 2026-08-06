@@ -276,6 +276,34 @@ describe("headless goal lifecycle", () => {
 		assert.equal(settled.at(-1)?.noProgressCount, 1);
 	});
 
+	it("pauses at the auto-turn cap when turn_end follows agent_end", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown({ completion: { maxAutoTurns: 1 } }));
+		const api = new HeadlessFakeAPI();
+		api.setFlag("goal-run", specPath);
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		// Reproduce print-mode ordering: agent_end queues the next continuation
+		// before turn_end has settled and incremented the counters.
+		await api.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
+		await api.emit("agent_end", {}, ctx);
+		await api.emit("turn_end", {
+			turnIndex: 1,
+			timestamp: Date.now(),
+			toolResults: [],
+			message: { role: "assistant", content: [{ type: "text", text: "" }], usage: { output: 0 } },
+		}, ctx);
+
+		const goal = await execute(api, "get_goal", {}, ctx);
+		const view = JSON.parse(goal.content[0].text);
+		assert.equal(view.status, "paused");
+		assert.equal(view.pausedReason, "reached max auto-turns (1)");
+		assert.equal(api.sent.filter((entry) => entry.message.customType === "pi-goal:continuation").length, 1);
+	});
+
 	it("does not misclassify a dispose abort as interrupted (headless)", async () => {
 		const cwd = project();
 		const specPath = path.join(cwd, "spec.md");
