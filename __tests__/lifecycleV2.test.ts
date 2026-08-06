@@ -549,6 +549,72 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		await api.emit("session_shutdown", {}, ctx);
 	});
 
+	it("defers drafting when the model flags genuine ambiguity", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const result = await execute(api, "propose_goal_draft", {
+			objective: "优化定价", criteria: ["定价策略确定"], taskKind: "pm",
+			executionPreference: "auto", roleCatalogAvailable: false,
+			needsClarification: true,
+			openQuestions: ["目标用户是个人还是企业？", "是否允许破坏性调价？"],
+		}, ctx);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details.needsClarification, true);
+		assert.deepEqual(result.details.openQuestions, ["目标用户是个人还是企业？", "是否允许破坏性调价？"]);
+		// 未创建 goal，等待澄清后再 draft。
+		const check = await execute(api, "get_goal", {}, ctx);
+		assert.match(check.content[0].text, /no goal|No goal/i);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+
+	it("passes through all clarification questions without a count limit", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const questions = [
+			"问题 1：目标市场？", "问题 2：预算约束？", "问题 3：时间窗口？",
+			"问题 4：合规要求？", "问题 5：团队规模？",
+		];
+		const result = await execute(api, "propose_goal_draft", {
+			objective: "制定定价策略", criteria: ["策略确定"], taskKind: "pm",
+			executionPreference: "auto", roleCatalogAvailable: false,
+			needsClarification: true, openQuestions: questions,
+		}, ctx);
+		assert.equal(result.isError, undefined);
+		assert.deepEqual(result.details.openQuestions, questions, "all questions are passed through, none truncated");
+		await api.emit("session_shutdown", {}, ctx);
+	});
+
+	it("writes the goal spec markdown when a goal starts", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const result = await execute(api, "propose_goal_draft", {
+			objective: "实现 slugify 函数并通过测试", criteria: ["npm test 全部通过"], taskKind: "coding",
+			executionPreference: "direct", roleCatalogAvailable: false,
+			constraints: ["不新增依赖"],
+		}, ctx);
+		assert.equal(result.isError, undefined);
+		const specPath = result.details?.specDoc;
+		assert.ok(specPath, "draft response reports the written spec path");
+		const absolute = path.join(cwd, specPath);
+		assert.equal(fs.existsSync(absolute), true, "spec md exists on disk");
+		const text = fs.readFileSync(absolute, "utf8");
+		assert.match(text, /## 目标/);
+		assert.match(text, /## 验收标准/);
+		assert.match(text, /- \[ \] `blocking` npm test 全部通过/);
+		assert.match(text, /- 不新增依赖/);
+		assert.match(text, /## 机器字段/);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+
 	it("judges a pending request even when the turn ended without assistant text", async () => {
 		// UX finding: the agent's last turn was a pure tool call, lastAssistantText
 		// stayed empty, and neither the judge nor scheduleContinuation ever ran.

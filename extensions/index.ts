@@ -18,6 +18,7 @@
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -59,6 +60,7 @@ import {
 	V2_JUDGE_SYSTEM_PROMPT,
 } from "./completion-runtime-v2";
 import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
+import { proposalToMarkdown, parseGoalSpecMarkdown, slugifyTitle, type SpecCriterion } from "./spec-doc";
 import {
 	GoalRuntimeTracker,
 	deriveGoalProgress,
@@ -655,9 +657,104 @@ interface GoalProposal {
 	execution: ExecutionDecision;
 	assurance: AssuranceDecision;
 	claims: ResearchClaim[];
+	/** 澄清对话的 Q/A 轨迹（写入 spec 文档，供用户回溯）。 */
+	decisions?: Array<{ question: string; answer: string }>;
 }
 
 type ReviewResult = "start" | "edit" | "execution" | "cancel";
+
+// ═══════════════════════════════════════════════════════════════════════
+// Goal Spec 文档（md）— 完整理解的序列化/恢复
+// ═══════════════════════════════════════════════════════════════════════
+
+function proposalToSpecInput(proposal: GoalProposal) {
+	return {
+		original: proposal.objective,
+		objective: proposal.objective,
+		criteria: proposal.criteria as SpecCriterion[],
+		constraints: proposal.constraints,
+		claims: proposal.claims.map((claim) => ({
+			id: claim.id, text: claim.text, materiality: claim.materiality,
+			...(claim.risk ? { risk: claim.risk } : {}),
+			evidenceRefs: claim.evidenceRefs ?? [],
+		})),
+		...(proposal.decisions ? { decisions: proposal.decisions } : {}),
+		machine: {
+			taskKind: proposal.taskKind,
+			execution: {
+				preference: proposal.execution.preference,
+				selected: proposal.execution.selected,
+				...(proposal.execution.role ? { role: proposal.execution.role } : {}),
+				source: proposal.execution.source,
+				reasons: proposal.execution.reasons,
+			},
+			assurance: {
+				reviewRequirement: proposal.assurance.reviewRequirement,
+				reviewStatus: proposal.assurance.reviewStatus,
+				depth: proposal.assurance.depth,
+				reasons: proposal.assurance.reasons,
+			},
+		},
+	};
+}
+
+function specDocToProposal(doc: NonNullable<ReturnType<typeof parseGoalSpecMarkdown>["doc"]>, base: GoalProposal): GoalProposal {
+	const taskKind = (doc.machine.taskKind as TaskKind | undefined) ?? base.taskKind;
+	const machineExecution = doc.machine.execution;
+	const execution: ExecutionDecision = machineExecution?.selected
+		? {
+			preference: (machineExecution.preference as ExecutionPreference) ?? "auto",
+			selected: machineExecution.selected as "direct" | "specialist" | "team",
+			...(machineExecution.role ? { role: machineExecution.role } : {}),
+			source: "user",
+			confidence: 1,
+			reasons: machineExecution.reasons ?? ["The user edited the goal spec document."],
+			reassessOn: ["scope_expanded", "new_workstream", "conflict", "stalled"],
+		}
+		: base.execution;
+	const machineAssurance = doc.machine.assurance;
+	const assurance: AssuranceDecision = machineAssurance?.reviewRequirement
+		? {
+			reviewRequirement: machineAssurance.reviewRequirement as AssuranceDecision["reviewRequirement"],
+			reviewStatus: (machineAssurance.reviewStatus as AssuranceDecision["reviewStatus"]) ?? "pending",
+			independent: machineAssurance.reviewRequirement !== "none",
+			depth: (machineAssurance.depth as AssuranceDecision["depth"]) ?? "light",
+			source: "user",
+			reasons: machineAssurance.reasons ?? ["The user edited the goal spec document."],
+			decidedAt: Date.now(),
+		}
+		: base.assurance;
+	return {
+		objective: doc.objective,
+		criteria: doc.criteria.map((criterion) => ({ description: criterion.description, level: criterion.level })),
+		constraints: doc.constraints,
+		claims: doc.claims.map((claim) => ({
+			id: claim.id, text: claim.text, materiality: claim.materiality,
+			...(claim.risk ? { risk: claim.risk } : {}),
+			evidenceRefs: [],
+		})),
+		taskKind,
+		executionPreference: machineExecution?.preference as ExecutionPreference | undefined ?? base.executionPreference,
+		execution,
+		assurance,
+		decisions: doc.decisions,
+	};
+}
+
+function writeGoalSpecDoc(proposal: GoalProposal, ctx: ExtensionContext, specDir: string | undefined, now: () => number): string | null {
+	try {
+		const dir = specDir ?? "docs/goals";
+		const absoluteDir = path.isAbsolute(dir) ? dir : path.join(ctx.cwd, dir);
+		fs.mkdirSync(absoluteDir, { recursive: true });
+		const fileName = slugifyTitle(proposal.objective) + "-goal.md";
+		const md = proposalToMarkdown({ ...proposalToSpecInput(proposal), createdAt: now() });
+		fs.writeFileSync(path.join(absoluteDir, fileName), md, "utf8");
+		return path.join(dir, fileName);
+	} catch (error) {
+		console.warn("[pi-goal] failed to write goal spec doc:", error);
+		return null;
+	}
+}
 
 async function showGoalReview(
 	proposal: GoalProposal,
@@ -687,6 +784,14 @@ async function showGoalReview(
 		for (const reason of proposal.assurance.reasons) container.addChild(new Text(theme.fg("dim", "  " + reason)));
 		container.addChild(new Text(""));
 
+		if (proposal.decisions && proposal.decisions.length > 0) {
+			container.addChild(new Text(theme.fg("accent", theme.bold("Clarifications:"))));
+			for (const decision of proposal.decisions) {
+				container.addChild(new Text(theme.fg("dim", "  Q: " + decision.question)));
+				container.addChild(new Text(theme.fg("dim", "  A: " + decision.answer)));
+			}
+			container.addChild(new Text(""));
+		}
 		if (proposal.criteria.length > 0) {
 			container.addChild(new Text(theme.fg("accent", theme.bold("Acceptance Criteria:"))));
 			for (const c of proposal.criteria) {
@@ -2263,6 +2368,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				evidenceRefs: Type.Optional(Type.Array(Type.String())),
 			}))),
 			tokenBudget: Type.Optional(Type.Number({ minimum: 1 })),
+			// Spec 澄清：模型判断目标存在真实歧义时，不创建 goal，先返回待确认问题。
+			needsClarification: Type.Optional(Type.Boolean({ description: "Set true when the objective has genuine ambiguity that should be clarified with the user before drafting. Simple, well-scoped goals must omit this." })),
+			openQuestions: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), { description: "Open questions to clarify with the user, ordered by importance. No count limit — ask everything that genuinely matters. Leave empty unless needsClarification is true." })),
 			// Deprecated aliases.
 			taskType: Type.Optional(StringEnum(["coding", "research", "pm", "review"] as const)),
 			executionMode: Type.Optional(StringEnum(["single", "orchestrated"] as const)),
@@ -2394,10 +2502,24 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				executionPreference: preference, execution, assurance,
 				claims,
 			};
+			// Spec 澄清（UX: 用户两三句话 → agent 展开的细节可能与意图相左）。
+			// 模型声明存在真实歧义时，不创建 goal，把 1-2 个最关键的问题交给主
+			// agent 逐一询问用户；回答进入对话上下文后，模型应带新理解重 draft。
+			const questions = (raw.openQuestions ?? [])
+				.map((question: unknown) => typeof question === "string" ? question.trim() : "")
+				.filter(Boolean);
+			if (raw.needsClarification === true && questions.length > 0) {
+				const uniqueQuestions = [...new Set(questions)];
+				return {
+					content: [{ type: "text", text: "Goal clarification needed before drafting. Ask the user the following question(s) in order of importance (one round per response; incorporate each answer before asking the next when follow-ups depend on it). When the objective involves external facts (market, competitors, API/pricing status, best practices), research the web first so the questions are grounded. Re-call propose_goal_draft only when the objective is fully understood or the user says to proceed. Do not create the goal yet." }],
+				details: { needsClarification: true, openQuestions: uniqueQuestions },
+			};
+			}
 			if (!ctx.hasUI) {
 				if (goal) return { content: [{ type: "text", text: "A goal is already set (status: " + goal.status + "). Clear it first." }], isError: true, details: {} };
 				setGoal(proposal, { tokenBudget: raw.tokenBudget }, ctx);
-				return { content: [{ type: "text", text: "Goal created (non-interactive)." }], details: { goal: { ...goal! } } };
+				const specPath = writeGoalSpecDoc(proposal, ctx, goalConfig.goalSpecDir, nowMs);
+				return { content: [{ type: "text", text: "Goal created (non-interactive)." }], details: { goal: { ...goal! }, specDoc: specPath } };
 			}
 			if (goal) {
 				// Any existing goal (active/paused/complete/unmet/blocked) requires
@@ -2433,17 +2555,28 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				choice = await showGoalReview(proposal, ctx);
 			}
 			switch (choice) {
-				case "start": { setGoal(proposal, { tokenBudget: raw.tokenBudget }, ctx); return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! } } }; }
+				case "start": {
+					setGoal(proposal, { tokenBudget: raw.tokenBudget }, ctx);
+					const specPath = writeGoalSpecDoc(proposal, ctx, goalConfig.goalSpecDir, nowMs);
+					if (specPath) ctx.ui?.notify?.("Goal spec written to " + specPath + " — edit the md and run /goal apply <path> to refine it.", "info");
+					return { content: [{ type: "text", text: "Goal started: " + goal!.objective }], details: { goal: { ...goal! }, specDoc: specPath } };
+				}
 				case "edit": {
-					const editedObjective = await ctx.ui.editor("Edit goal objective:", proposal.objective);
-					if (!editedObjective?.trim()) return { content: [{ type: "text", text: "Cancelled (empty objective)." }], details: {} };
-					const criteriaText = proposal.criteria.map((criterion) => criterion.description).join("\n");
-					const editedCriteria = await ctx.ui.editor("Edit criteria (one per line):", criteriaText);
-					const newCriteria = (editedCriteria ?? criteriaText).split("\n").map((line) => line.trim()).filter(Boolean)
-						.map((description, index) => ({ description, level: proposal.criteria[index]?.level ?? "blocking" as const }));
-					if (newCriteria.length === 0) return { content: [{ type: "text", text: "Cancelled (no criteria)." }], details: {} };
-					setGoal({ ...proposal, objective: editedObjective.trim(), criteria: newCriteria }, { tokenBudget: raw.tokenBudget }, ctx);
-					return { content: [{ type: "text", text: "Goal started after edit: " + goal!.objective }], details: { goal: { ...goal! } } };
+					// 升级：编辑完整 spec 文档（objective/criteria/constraints/claims/
+					// 执行策略/决策记录都在一份 md 里），而不是只改两行文本。
+					const specMarkdown = proposalToMarkdown({ ...proposalToSpecInput(proposal), createdAt: nowMs() });
+					const editedSpec = await ctx.ui.editor("Edit goal spec (markdown):", specMarkdown);
+					if (!editedSpec?.trim()) return { content: [{ type: "text", text: "Cancelled (empty spec)." }], details: {} };
+					const parsed = parseGoalSpecMarkdown(editedSpec);
+					if (!parsed.ok || !parsed.doc) {
+						const reason = parsed.error ?? "The spec document could not be parsed.";
+						ctx.ui?.notify?.("Spec edit rejected: " + reason, "warning");
+						return { content: [{ type: "text", text: "Spec edit rejected: " + reason }], isError: true, details: {} };
+					}
+					const editedProposal = specDocToProposal(parsed.doc, proposal);
+					if (editedProposal.criteria.length === 0) return { content: [{ type: "text", text: "Cancelled (no criteria)." }], details: {} };
+					setGoal(editedProposal, { tokenBudget: raw.tokenBudget }, ctx);
+					return { content: [{ type: "text", text: "Goal started after spec edit: " + goal!.objective }], details: { goal: { ...goal! }, specDoc: writeGoalSpecDoc(editedProposal, ctx, goalConfig.goalSpecDir, nowMs) } };
 				}
 				default: return { content: [{ type: "text", text: "Cancelled by user." }], details: {} };
 			}
@@ -2472,7 +2605,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	pi.registerCommand("goal", {
 		description: "Set, view, pause, resume, or clear a long-running autonomous goal",
 		getArgumentCompletions: (prefix) => {
-			return ["status", "pause", "resume", "clear", "help"].filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
+			return ["status", "pause", "resume", "clear", "help", "apply"].filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
 		},
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
@@ -2496,8 +2629,81 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return;
 			}
 			if (trimmed === "help") {
-				ctx.ui.notify("/goal <objective> [--tokens N] — set a goal\n/goal status — show current goal\n/goal pause — pause\n/goal resume — resume\n/goal clear — remove", "info");
+				ctx.ui.notify("/goal <objective> [--tokens N] — set a goal\n/goal status — show current goal\n/goal apply <path> — load & review a goal spec md\n/goal pause — pause\n/goal resume — resume\n/goal clear — remove", "info");
 				return;
+			}
+			if (trimmed.startsWith("apply ")) {
+				// 从用户微调过的 spec 文档恢复 proposal，走 review UI 确认。
+				const filePath = trimmed.slice("apply ".length).trim();
+				if (!filePath) { ctx.ui.notify("Usage: /goal apply <path-to-spec.md>", "warning"); return; }
+				const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(ctx.cwd, filePath);
+				let text: string;
+				try {
+					text = fs.readFileSync(absolutePath, "utf8");
+				} catch {
+					ctx.ui.notify("Cannot read spec file: " + filePath, "warning");
+					return;
+				}
+				const parsed = parseGoalSpecMarkdown(text);
+				if (!parsed.ok || !parsed.doc) {
+					ctx.ui.notify("Spec parse failed: " + (parsed.error ?? "unknown"), "warning");
+					return;
+				}
+				const fallbackExecution: ExecutionDecision = {
+					preference: "auto", selected: "direct", source: "auto", confidence: 0.5,
+					reasons: ["Loaded from a goal spec document; review before starting."],
+					reassessOn: ["scope_expanded", "new_workstream", "conflict", "stalled"],
+				};
+				const fallbackAssurance: AssuranceDecision = {
+					reviewRequirement: "advisory", reviewStatus: "pending", independent: true,
+					depth: "light", source: "auto", reasons: ["Loaded from a goal spec document."], decidedAt: nowMs(),
+				};
+				const base: GoalProposal = {
+					objective: parsed.doc.objective,
+					criteria: parsed.doc.criteria.map((criterion) => ({ description: criterion.description, level: criterion.level })),
+					constraints: parsed.doc.constraints,
+					claims: parsed.doc.claims.map((claim) => ({
+						id: claim.id, text: claim.text, materiality: claim.materiality,
+						...(claim.risk ? { risk: claim.risk } : {}),
+						evidenceRefs: [],
+					})),
+					taskKind: (parsed.doc.machine.taskKind as TaskKind) ?? "general",
+					executionPreference: "auto",
+					execution: fallbackExecution,
+					assurance: fallbackAssurance,
+				};
+				const proposal = specDocToProposal(parsed.doc, base);
+				if (proposal.criteria.length === 0) { ctx.ui.notify("Spec has no criteria.", "warning"); return; }
+				let choice = await showGoalReview(proposal, ctx);
+				if (choice === "execution") {
+					const selected = await ctx.ui.select("Execution preference", ["auto", "direct", "specialist", "team"]);
+					if (!selected) return;
+					proposal.execution = {
+						...proposal.execution, preference: selected as ExecutionPreference, selected: selected as "direct" | "specialist" | "team",
+						source: "user", confidence: 1, reasons: ["User selected execution in the review UI."],
+					};
+					choice = await showGoalReview(proposal, ctx);
+				}
+				if (choice === "start") {
+					setGoal(proposal, { tokenBudget: parsed.doc.machine.tokenBudget ?? null }, ctx);
+					ctx.ui.notify("Goal started from spec: " + goal!.objective, "info");
+					return;
+				}
+				if (choice === "edit") {
+					const specMarkdown = proposalToMarkdown({ ...proposalToSpecInput(proposal), createdAt: nowMs() });
+					const editedSpec = await ctx.ui.editor("Edit goal spec (markdown):", specMarkdown);
+					if (editedSpec?.trim()) {
+						const reparsed = parseGoalSpecMarkdown(editedSpec);
+						if (reparsed.ok && reparsed.doc) {
+							setGoal(specDocToProposal(reparsed.doc, proposal), { tokenBudget: parsed.doc.machine.tokenBudget ?? null }, ctx);
+							ctx.ui.notify("Goal started after spec edit: " + goal!.objective, "info");
+							return;
+						}
+						ctx.ui.notify("Spec edit rejected: " + (reparsed.error ?? "parse failed"), "warning");
+					}
+					ctx.ui.notify("Cancelled.", "info");
+					return;
+				}
 			}
 			if (trimmed === "clear") { if (!goal) { ctx.ui.notify("No goal to clear.", "info"); return; } clearGoal(ctx); ctx.ui.notify("Goal cleared.", "info"); return; }
 			if (trimmed === "pause") { if (!goal || goal.status !== "active") { ctx.ui.notify("No active goal.", "info"); return; } pauseGoal("user pause", ctx); ctx.ui.notify("Goal paused.", "info"); return; }
@@ -2513,7 +2719,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				);
 				if (!ok) { ctx.ui.notify("Kept current goal.", "info"); return; }
 			}
-				const proposeMsg = "Draft a formal goal for the following task using the pi-goal-writer skill. Call list_roles first when available, then call propose_goal_draft with a concise objective and at least one genuine, independently verifiable outcome criterion. Do not add criteria merely to meet a count.\n\n<untrusted_task>\n" + objective + "\n</untrusted_task>\n\n" + (tokenBudget
+				const proposeMsg = "Draft a formal goal for the following task using the pi-goal-writer skill. Call list_roles first when available, then call propose_goal_draft with a concise objective and at least one genuine, independently verifiable outcome criterion. Do not add criteria merely to meet a count.\n\nWhen the objective involves external facts (market, competitors, library/API status, pricing, best practices) or your knowledge may be stale, research the web with web_search BEFORE drafting so criteria and claims are grounded.\n\n<untrusted_task>\n" + objective + "\n</untrusted_task>\n\n" + (tokenBudget
 					? "Token budget: " + formatTokens(tokenBudget) + ". You MUST pass this exact token count into propose_goal_draft's tokenBudget parameter (a missing tokenBudget is a drafting error)."
 					: "Token budget: none");
 			pi.sendUserMessage(proposeMsg);

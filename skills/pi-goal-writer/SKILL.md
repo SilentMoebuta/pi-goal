@@ -56,6 +56,41 @@ Examples:
 
 Ask clarifying questions only if the user's request is genuinely ambiguous. If the intent is clear, proceed.
 
+When the objective has REAL ambiguity that materially changes the draft (scope boundary,
+acceptance method, external facts, or high-risk assumptions), do NOT guess: call
+`propose_goal_draft` with `needsClarification: true` and `openQuestions` containing every
+question that genuinely matters, ordered by importance. There is no count limit — clarify
+until the objective is unambiguous or the user says to proceed. Never fabricate
+clarifications for simple, well-scoped requests.
+
+**Clarification loop — research and questions alternate:**
+
+1. **Research first.** Whenever the objective involves external facts (market, competitors,
+   library/API status, pricing, version availability, best practices) or your knowledge may
+   be stale, run `web_search` BEFORE asking anything, and summarize what you found.
+2. **Ask grounded questions.** Questions must be based on the research and the user's own
+   words — never ask something the research already answers.
+3. **Answer → research again.** After each user answer, check whether the answer opens new
+   factual questions (e.g. "support X" → what does X cost / what version supports it); if
+   so, research before asking the next round.
+4. **Repeat until converged.** Each round must reduce remaining ambiguity. Stop when the
+   convergence criteria below hold, or when the user says to proceed.
+
+**Convergence criteria — a goal is fully clarified when ALL of these hold:**
+
+1. **Boundaries clear:** what is in scope and what is explicitly out of scope is settled.
+2. **Verifiable acceptance:** every blocking criterion has a concrete verification method
+   (a command, artifact, or source to check) — no "as appropriate" or vague standards.
+3. **Facts grounded:** every external fact that matters to the draft is backed by research
+   (primary or reliable sources) or is listed as an unverified assumption.
+4. **Assumptions explicit:** anything the user did not answer is listed as an assumption
+   and the user has seen/agreed to it.
+5. **Risk confirmed:** high-risk decisions (irreversible actions, money, privacy, legal)
+   have the user's explicit opinion, not an agent default.
+
+If any criterion is unmet, keep clarifying. Re-call `propose_goal_draft` (with
+`needsClarification`) until converged, then draft without the flag.
+
 ### Step 2: Draft the Goal
 
 Call `list_roles` first when it is available. Then choose the cheapest sufficient topology:
@@ -75,8 +110,11 @@ Call the `propose_goal_draft` tool with:
 - `researchClaims`: material claims and their risk when the goal is research-heavy
 
 The tool will open a review UI for the user. Wait for the user's decision:
-- **Start**: Goal is created and work begins immediately
-- **Edit**: User wants to modify — help them refine
+- **Start**: Goal is created and work begins immediately; the full spec (objective, criteria,
+  constraints, claims, execution) is also written to a markdown file under `docs/goals/`
+  (configurable via `goalSpecDir`) so the user can refine it later with `/goal apply <path>`
+- **Edit**: User opens the full spec as markdown and can change anything — objective,
+  criteria levels, constraints, claims — before starting
 - **Cancel**: Goal is discarded
 
 ### Step 3: If Started — Execute

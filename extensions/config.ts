@@ -66,6 +66,9 @@ export interface GoalConfig {
 
 	/** Controls whether the legacy or V2 evaluator may change goal state. */
 	completionPolicy?: CompletionPolicy;
+
+	/** 目录（相对 cwd 或绝对），goal 启动时把完整 spec 写成 md 供用户微调。 */
+	goalSpecDir?: string;
 }
 
 export const DEFAULT_GOAL_CONFIG: GoalConfig = {
@@ -80,6 +83,8 @@ export const DEFAULT_GOAL_CONFIG: GoalConfig = {
 	reviewPolicy: "risk_based",
 	defaultExecution: "auto",
 	completionPolicy: "v2",
+	/** 目录（相对 cwd 或绝对），goal 启动时把完整 spec 写成 md 供用户微调。 */
+	goalSpecDir: "docs/goals",
 };
 
 /** Whether to inject the superpowers coding-flow blocks (superpowersAdaptation
@@ -947,11 +952,13 @@ export function parseGoalConfig(input: unknown): ParsedGoalConfig {
 	config.reviewPolicy = parseEnum("reviewPolicy", REVIEW_POLICIES, "risk_based");
 	config.defaultExecution = parseEnum("defaultExecution", EXECUTION_PREFERENCES, "auto");
 	config.completionPolicy = parseEnum("completionPolicy", COMPLETION_POLICIES, "v2");
+	const specDir = typeof raw.goalSpecDir === "string" ? raw.goalSpecDir.trim() : "";
+	config.goalSpecDir = specDir || "docs/goals";
 
 	const knownKeys = new Set([
 		"schemaVersion", "superpowersIntegration", "evaluatorModel", "judgeModel",
 		"verifyCommand", "stuckEscalateModel", "verifyTimeoutMs", "forceTaskType",
-		"reviewPolicy", "defaultExecution", "completionPolicy",
+		"reviewPolicy", "defaultExecution", "completionPolicy", "goalSpecDir",
 	]);
 	for (const key of Object.keys(raw)) {
 		if (!knownKeys.has(key)) warnings.push("unknown goal config key: " + key);
