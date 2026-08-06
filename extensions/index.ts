@@ -1600,6 +1600,11 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				id: Type.Optional(Type.String()),
 				kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text"] as const),
 				summary: Type.String(),
+				// Accept target IDs inside the evidence object as well as at the
+				// canonical top level. Some model providers naturally group all
+				// evidence metadata together; normalization keeps both forms equal.
+				criterionIds: Type.Optional(Type.Array(Type.String())),
+				claimIds: Type.Optional(Type.Array(Type.String())),
 				locator: Type.Optional(Type.String()),
 				excerpt: Type.Optional(Type.String()),
 				sourceKind: Type.Optional(StringEnum(["primary", "secondary", "workspace", "user"] as const)),

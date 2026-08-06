@@ -42,6 +42,20 @@ describe("canonical update_goal action union", () => {
 		assert.deepEqual(action.criterionIds, ["c2"]);
 	});
 
+	it("normalizes criterion targets nested inside evidence", () => {
+		const action = normalized(normalizeUpdateGoalAction({
+			action: "record_evidence",
+			evidence: {
+				id: "ev1", kind: "artifact", summary: "Built artifact",
+				criterionIds: ["c1", "c2"], claimIds: ["claim-1"],
+			},
+		}, { now: 100 }));
+		assert.equal(action.action, "record_evidence");
+		if (action.action !== "record_evidence") return;
+		assert.deepEqual(action.criterionIds, ["c1", "c2"]);
+		assert.deepEqual(action.claimIds, ["claim-1"]);
+	});
+
 	it("normalizes upsert_claim", () => {
 		const action = normalized(normalizeUpdateGoalAction({
 			action: "upsert_claim",

@@ -262,6 +262,11 @@ function parseEvidence(raw: Record<string, unknown>, now: number): EvidenceRef {
 }
 
 function parseRecordEvidence(raw: Record<string, unknown>, now: number): RecordEvidenceAction {
+		const nestedEvidence = isRecord(raw.evidence) ? raw.evidence : undefined;
+		// Top-level targets are canonical; nested targets are accepted for
+		// compatibility with callers that group criterionIds/claimIds under
+		// evidence. When both are present, the explicit top-level values win.
+		const targetFields = nestedEvidence === undefined ? raw : { ...nestedEvidence, ...raw };
 	const reuseOnly = raw.evidence === undefined
 		&& raw.evidenceId !== undefined
 		&& raw.kind === undefined
@@ -274,8 +279,8 @@ function parseRecordEvidence(raw: Record<string, unknown>, now: number): RecordE
 		action: "record_evidence",
 		evidence,
 		evidenceId: evidence?.id ?? evidenceId,
-		criterionIds: singularAndPlural(raw, "criterionId", "criterionIds"),
-		claimIds: singularAndPlural(raw, "claimId", "claimIds"),
+		criterionIds: singularAndPlural(targetFields, "criterionId", "criterionIds"),
+		claimIds: singularAndPlural(targetFields, "claimId", "claimIds"),
 	};
 }
 
