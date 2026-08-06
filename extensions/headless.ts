@@ -340,3 +340,12 @@ export function finalizeHeadlessGoal(goal: GoalStateV2, now: number): GoalLogEnt
 	if (goal.headless) appendGoalLog(goal.headless.logPath, entry);
 	return entry;
 }
+
+/** Persist a non-terminal process-exit snapshot without claiming terminality. */
+export function snapshotActiveHeadlessGoal(goal: GoalStateV2, now: number): GoalLogEntry {
+	const view = buildGoalResultView(goal, now);
+	if (goal.headless) writeGoalResult(goal.headless.outputPath, view);
+	const entry = buildGoalLogEntry(goal.id, "snapshot", { result: view, terminal: false }, now);
+	if (goal.headless) appendGoalLog(goal.headless.logPath, entry);
+	return entry;
+}

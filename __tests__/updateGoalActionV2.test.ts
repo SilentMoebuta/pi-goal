@@ -56,6 +56,19 @@ describe("canonical update_goal action union", () => {
 		assert.deepEqual(action, { action: "request_completion", summary: "All blocking outcomes are met." });
 	});
 
+	it("treats an explicit action as authoritative when optional defaults are noisy", () => {
+		const action = normalized(normalizeUpdateGoalAction({
+			action: "request_completion",
+			summary: "Done.",
+			status: "",
+			criterionIds: [],
+			findings: [],
+			reasons: [],
+			reviewerPassed: false,
+		}, { now: 1 }));
+		assert.deepEqual(action, { action: "request_completion", summary: "Done." });
+	});
+
 	it("normalizes record_review", () => {
 		const action = normalized(normalizeUpdateGoalAction({
 			action: "record_review",
@@ -68,6 +81,35 @@ describe("canonical update_goal action union", () => {
 		}, { now: 1 }));
 		assert.equal(action.action, "record_review");
 		if (action.action === "record_review") assert.equal(action.review.evaluator.agentId, "review-1");
+	});
+
+	it("normalizes patch-first review locations and rejects non-global rewrites", () => {
+		const action = normalized(normalizeUpdateGoalAction({
+			action: "record_review",
+			review: {
+				status: "failed",
+				reason: "One section needs repair.",
+				evaluator: { kind: "reviewer", agentId: "review-1" },
+				sessionFile: "/sessions/review-1.jsonl",
+				findings: [{
+					code: "R-017", subjectId: "$goal", reason: "Unsupported sentence",
+					missingEvidenceKind: "source", scope: "local", targetPath: "sections/01.md",
+					sectionId: "opening", anchor: "## Opening", requiredFix: "Add the source-backed limit.", rewriteRequired: false,
+				}],
+			},
+		}, { now: 1 }));
+		assert.equal(action.action, "record_review");
+		if (action.action === "record_review") assert.equal(action.review.findings[0].targetPath, "sections/01.md");
+
+		const invalid = normalizeUpdateGoalAction({
+			action: "record_review",
+			review: {
+				status: "failed", reason: "bad", evaluator: { kind: "reviewer", agentId: "r" }, sessionFile: "/r.jsonl",
+				findings: [{ code: "R", subjectId: "$goal", reason: "bad", missingEvidenceKind: "source", scope: "local", rewriteRequired: true, rewriteReason: "rewrite" }],
+			},
+		}, { now: 1 });
+		assert.equal(invalid.ok, false);
+		if (!invalid.ok) assert.match(invalid.reason, /only when scope=global/);
 	});
 
 	it("normalizes change_execution", () => {

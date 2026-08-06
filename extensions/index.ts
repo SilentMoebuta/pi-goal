@@ -51,7 +51,7 @@ import {
 } from "./state";
 import { ExactTurnAccounting, type TurnIdentity } from "./turn-accounting";
 import { routeExecution, type ExecutionRoutingSignals } from "./execution-router-v2";
-import { rejectionFingerprint, selectReviewerPolicy, validateCompletionPolicy } from "./completion-policy-v2";
+import { computeBlueprintEvidenceDiagnostics, rejectionFingerprint, selectReviewerPolicy, validateCompletionPolicy } from "./completion-policy-v2";
 import { buildBoundedEvidencePacket, completionDecisionToEvaluation } from "./goal-integration-v2";
 import {
 	applyAuthoritativeCompletionEvaluation,
@@ -62,7 +62,7 @@ import {
 	V2_JUDGE_SYSTEM_PROMPT,
 } from "./completion-runtime-v2";
 import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
-import { GOAL_HEADLESS_EVENT_TYPE, appendGoalLog, buildGoalLogEntry, createGoalFromBlueprint, finalizeHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
+import { GOAL_HEADLESS_EVENT_TYPE, appendGoalLog, buildGoalLogEntry, createGoalFromBlueprint, finalizeHeadlessGoal, snapshotActiveHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
 import { proposalToMarkdown, parseGoalSpecMarkdown, parseBlueprint, slugifyTitle, type SpecCriterion } from "./spec-doc";
 import { runJudge, runV2CompletionJudge, type JudgeVerdict } from "./judge";
 import { formatTokens, formatDuration, escapeXml, extractOutputTokens, extractTextContent, isAssistantMessage, GOAL_STORAGE_TYPE, GOAL_EVENT_TYPE, GOAL_CONTINUATION_TYPE, GOAL_JUDGE_TYPE } from "./util";
@@ -181,6 +181,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	let continuationTimer: ReturnType<typeof setTimeout> | null = null;
 	let footerTicker: ReturnType<typeof setInterval> | null = null;
 	let observedRoleCatalog: string[] | null = null;
+	let activeMaxAutoTurns = CONFIG.maxAutoTurns;
 
 	function clearTimer() {
 		if (continuationTimer) { clearTimeout(continuationTimer); continuationTimer = null; }
@@ -218,11 +219,35 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		);
 	}
 
+	function withBlueprintEvidenceDiagnostics(evaluation: CompletionEvaluation): CompletionEvaluation {
+		if (!goal?.blueprint?.evidence) return evaluation;
+		const evidence = goal.blueprint.evidence;
+		const diagnostics = computeBlueprintEvidenceDiagnostics({
+			criteria: goal.criteria,
+			claims: goal.claims,
+			evidenceLedger: goal.evidenceLedger,
+			evidenceSpecs: evidence.criteria ?? [],
+			nodeSpecs: (evidence.nodes ?? []) as Parameters<typeof computeBlueprintEvidenceDiagnostics>[0]["nodeSpecs"],
+		});
+		return diagnostics.length === 0
+			? evaluation
+			: { ...evaluation, advisories: [...new Set([...evaluation.advisories, ...diagnostics])].sort() };
+	}
+
 	// ── headless 活动日志（turn 内黑盒透明化）────────────────────────────
 	// 外部 agent 需要区分"卡死"与"大任务进行中"：tool_started/tool_ended 记录
 	// 每次工具调用，llm_response 记录每轮模型响应，heartbeat 保证最长 30s 必有
 	// 信号（含当前 phase 与距上次活动时间）。
 	const headlessToolStarts = new Map<string, { name: string; startedAt: number }>();
+	const headlessSubagents = new Map<string, {
+		parentToolCallId: string;
+		role?: string;
+		sessionFile?: string;
+		phase: string;
+		turnCount: number;
+		tool?: string;
+		lastActivityAt: number;
+	}>();
 	let headlessHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 	function syncHeadlessHeartbeat(ctx: ExtensionContext): void {
@@ -243,6 +268,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				lastActivityMsAgo: runtime.lastActivityAt ? Math.max(0, now - runtime.lastActivityAt) : null,
 				tokensUsed: goal.tokensUsed,
 				activeMs: progress.resources.activeMs,
+				subagents: [...headlessSubagents.entries()].map(([agentId, child]) => ({ agentId, ...child })),
 			});
 		}, 30_000);
 		// unref 兜底：测试/无宿主场景下定时器不阻止进程退出（真实 pi 进程由
@@ -284,6 +310,14 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!blueprintResult.ok) return { ok: false, error: "Blueprint invalid: " + blueprintResult.errors.join("; ") };
 		const validation = validateBlueprint(blueprintResult.blueprint, parsed.doc, { trusted: isTrusted(ctx) });
 		if (!validation.ok) return { ok: false, error: validation.errors.join("; ") };
+		// Blueprint runtime settings are authoritative for this headless run.
+		goalConfig = {
+			...goalConfig,
+			...(blueprintResult.blueprint.completion?.policy ? { completionPolicy: blueprintResult.blueprint.completion.policy } : {}),
+			...(blueprintResult.blueprint.verification?.command ? { verifyCommand: blueprintResult.blueprint.verification.command } : {}),
+			...(blueprintResult.blueprint.verification?.timeoutMs ? { verifyTimeoutMs: blueprintResult.blueprint.verification.timeoutMs } : {}),
+		};
+		activeMaxAutoTurns = blueprintResult.blueprint.completion?.maxAutoTurns ?? CONFIG.maxAutoTurns;
 		if (options.confirmIfUI && ctx.hasUI && goal) {
 			const okConfirm = await ctx.ui.confirm(
 				"Replace current goal?",
@@ -335,6 +369,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		finalizedHeadlessGoals.add(goal.id);
 		clearTimer();
 		finalizeHeadlessGoal(goal, nowMs());
+	}
+
+	function snapshotActiveHeadless(ctx: ExtensionContext): void {
+		if (!goal?.headless || goal.status !== "active") return;
+		clearTimer();
+		const entry = snapshotActiveHeadlessGoal(goal, nowMs());
+		pi.sendMessage(
+			{ customType: GOAL_HEADLESS_EVENT_TYPE, content: "snapshot", display: false, details: { event: entry } },
+			{ triggerTurn: false },
+		);
 	}
 
 	function persist(action: GoalSnapshotActionV2) {
@@ -637,7 +681,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	/** 构造续跑消息体（sendContinuation 与 headless 同步版共用）。
 	 *  捕获并清空一次性注记（stuckSuggestion / verifyFailNote）。 */
 	function buildContinuationBody(goal: GoalState, config: GoalConfig): string {
-		let body = continuationPrompt(goal, config);
+		let body = continuationPrompt(goal, config, activeMaxAutoTurns);
 		const verifyFail = verifyFailNote;
 		const suggestion = stuckSuggestion;
 		verifyFailNote = null;
@@ -649,12 +693,12 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		}
 		// M2: feed the verify-command failure back so the agent can see WHY
 		// its tests failed (prevents a re-claim-completion loop).
-		if (verifyFailNote) {
-			body = "⚠ Verify command failed last turn — fix this before claiming completion:\n" + verifyFailNote + "\n\n---\n\n" + body;
+		if (verifyFail) {
+			body = "⚠ Verify command failed last turn — fix this before claiming completion:\n" + verifyFail + "\n\n---\n\n" + body;
 		}
 		// GG-3: if escalateStuck produced a fresh suggestion, prepend it.
-		if (stuckSuggestion) {
-			body = "💡 Stuck-escalation suggestion (from a stronger model — try this fresh approach next):\n" + stuckSuggestion + "\n\n---\n\n" + body;
+		if (suggestion) {
+			body = "💡 Stuck-escalation suggestion (from a stronger model — try this fresh approach next):\n" + suggestion + "\n\n---\n\n" + body;
 		}
 		return body;
 	}
@@ -683,7 +727,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
 			return;
 		}
-		const maxAutoTurns = Number(process.env.GOAL_MAX_AUTO_TURNS) || 200;
+		const maxAutoTurns = activeMaxAutoTurns;
 		if (goal.autoTurnCount >= maxAutoTurns) {
 			continuationQueued = false;
 			pauseGoal("reached max auto-turns (" + maxAutoTurns + ")", ctx);
@@ -817,9 +861,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			ctx.ui.notify("\u23F8 Goal paused (no progress). Use /goal resume to continue.", "warning");
 			return;
 		}
-		if (goal.autoTurnCount >= CONFIG.maxAutoTurns) {
-			diag(ctx, "scheduleContinuation: pause (max turns " + goal.autoTurnCount + "/" + CONFIG.maxAutoTurns + ")");
-			pauseGoal("reached max auto-turns (" + CONFIG.maxAutoTurns + ")", ctx);
+		if (goal.autoTurnCount >= activeMaxAutoTurns) {
+			diag(ctx, "scheduleContinuation: pause (max turns " + goal.autoTurnCount + "/" + activeMaxAutoTurns + ")");
+			pauseGoal("reached max auto-turns (" + activeMaxAutoTurns + ")", ctx);
 			ctx.ui.notify("\u23F8 Goal paused (max turns reached).", "info");
 			return;
 		}
@@ -847,6 +891,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		observedRoleCatalog = null;
 		// Load project-local config (opt out of superpowers integration).
 		goalConfig = loadGoalConfig(ctx.cwd, isTrusted(ctx));
+		activeMaxAutoTurns = CONFIG.maxAutoTurns;
 	reconstruct(ctx);
 	syncTools();
 	const goalRunFlag = typeof pi.getFlag === "function" ? pi.getFlag("goal-run") : undefined;
@@ -892,8 +937,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (headlessHeartbeatTimer) { dependencies.clearInterval(headlessHeartbeatTimer); headlessHeartbeatTimer = null; }
 		if (settleCurrentTurnTime() && goal) persist("usage");
 		if (goal?.headless && goal.status === "active") {
-			// 进程退出时 active 的 headless goal 尽力收尾（幂等；aborted 路径可能已 finalize）。
-			finalizeHeadless(ctx);
+			// Active is an interim process snapshot, never a terminal result. A later
+			// resumed/continued run may still produce the authoritative terminal file.
+			snapshotActiveHeadless(ctx);
 			process.exitCode = 1;
 		}
 		currentTurn = null;
@@ -958,6 +1004,37 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	pi.on("tool_execution_update", (event, ctx) => {
 		if (!goal || goal.status !== "active" || isSubagentSession(ctx)) return;
 		progressRuntime.toolUpdated(event.toolCallId, event.toolName, event.partialResult, nowMs());
+		const partial = event.partialResult && typeof event.partialResult === "object"
+			? event.partialResult as { details?: unknown }
+			: null;
+		const details = partial?.details && typeof partial.details === "object"
+			? partial.details as Record<string, unknown>
+			: null;
+		if (goal.headless && details?.kind === "subagent-progress" && typeof details.id === "string") {
+			const agentId = details.id;
+			const previous = headlessSubagents.get(agentId);
+			const child = {
+				parentToolCallId: event.toolCallId,
+				...(typeof details.role === "string" ? { role: details.role } : {}),
+				...(typeof details.sessionFile === "string" ? { sessionFile: details.sessionFile } : {}),
+				phase: typeof details.phase === "string" ? details.phase : "thinking",
+				turnCount: typeof details.turnCount === "number" ? details.turnCount : 0,
+				...(typeof details.tool === "string" ? { tool: details.tool } : {}),
+				lastActivityAt: typeof details.lastActivityAt === "number" ? details.lastActivityAt : nowMs(),
+			};
+			headlessSubagents.set(agentId, child);
+			const terminal = child.phase === "completed" || child.phase === "error";
+			goalLog(ctx, !previous ? "subagent_started" : terminal ? "subagent_completed" : "subagent_progress", {
+				agentId,
+				role: child.role ?? null,
+				sessionFile: child.sessionFile ?? null,
+				phase: child.phase,
+				turnCount: child.turnCount,
+				tool: child.tool ?? null,
+				lastActivityAt: child.lastActivityAt,
+			});
+			if (terminal) headlessSubagents.delete(agentId);
+		}
 		updateFooter(ctx);
 	});
 
@@ -973,6 +1050,11 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				durationMs: started ? Math.max(0, nowMs() - started.startedAt) : null,
 				result: summarizeValue(event.result, 500),
 			});
+			for (const [agentId, child] of headlessSubagents) {
+				if (child.parentToolCallId !== event.toolCallId) continue;
+				goalLog(ctx, "subagent_completed", { agentId, role: child.role ?? null, sessionFile: child.sessionFile ?? null, phase: event.isError ? "error" : "completed", turnCount: child.turnCount, tool: child.tool ?? null });
+				headlessSubagents.delete(agentId);
+			}
 		}
 		if (goal) updateFooter(ctx);
 	});
@@ -1188,7 +1270,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				// print-mode 进程退出路径的 dispose-abort：不是用户中断，不 pauseGoal。
 				// 正常 headless 续跑由 sendContinuationNow 在 emit 窗口内同步入队 followUp
 				// 让 agent loop 继续，根本不会走到 dispose；此分支只接真正的中止。
-				finalizeHeadless(ctx);
+				snapshotActiveHeadless(ctx);
 				process.exitCode = 1;
 				return;
 			}
@@ -1204,7 +1286,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// empty, so neither the judge nor scheduleContinuation ever ran).
 		const responseText = lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)";
 		if (goalDriven) {
-				const completionPolicy = goalConfig.completionPolicy ?? "v2";
+			const completionPolicy = goalConfig.completionPolicy ?? "v2";
 			const pendingV2Request = completionPolicy !== "legacy" && hasPendingCompletionRequest(goal);
 			if (pendingV2Request) {
 				progressRuntime.evaluationStarted(nowMs());
@@ -1215,18 +1297,19 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				: undefined;
 
 			if (pendingV2Request) {
-					const v2Run = await runV2CompletionJudge(goal, responseText, ctx, pi, goalConfig, verification, dependencies.complete);
+				const v2Run = await runV2CompletionJudge(goal, responseText, ctx, pi, goalConfig, verification, dependencies.complete);
+				const evaluated = withBlueprintEvidenceDiagnostics(v2Run.evaluation);
 				progressRuntime.evaluationEnded(nowMs());
 				updateFooter(ctx);
 				if (ctx.signal?.aborted) {
-					if (goal.headless) { finalizeHeadless(ctx); process.exitCode = 1; return; }
+						if (goal.headless) { snapshotActiveHeadless(ctx); process.exitCode = 1; return; }
 					pauseGoal("interrupted", ctx); return;
 				}
 				if (completionPolicy === "shadow") {
-					updateState({ completion: applyShadowCompletionEvaluation(goal, v2Run.evaluation) }, ctx);
+					updateState({ completion: applyShadowCompletionEvaluation(goal, evaluated) }, ctx);
 					goalLog(ctx, "completion_evaluated", { decision: goal.completion.lastEvaluation?.decision ?? null, findings: goal.completion.lastEvaluation?.findings ?? [], advisories: goal.completion.lastEvaluation?.advisories ?? [] });
 				} else {
-					const transition = applyAuthoritativeCompletionEvaluation(goal, v2Run.evaluation);
+					const transition = applyAuthoritativeCompletionEvaluation(goal, evaluated);
 					if (transition.status === "complete") {
 						updateState({ status: "complete", completion: transition.completion, noProgressCount: 0 }, ctx);
 						pi.sendMessage({
@@ -1275,7 +1358,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			// goal complete) to an aborted turn — treat it like the pre-judge
 			// abort above and pause without applying the verdict.
 			if (ctx.signal?.aborted) {
-				if (goal.headless) { finalizeHeadless(ctx); process.exitCode = 1; return; }
+					if (goal.headless) { snapshotActiveHeadless(ctx); process.exitCode = 1; return; }
 				pauseGoal("interrupted", ctx); return;
 			}
 			if (verdict.parseFailed) {
@@ -1489,6 +1572,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				code: Type.String(), subjectId: Type.String(), reason: Type.String(),
 				evidenceRefs: Type.Optional(Type.Array(Type.String())),
 				missingEvidenceKind: Type.Optional(StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text"] as const)),
+				scope: Type.Optional(StringEnum(["local", "section", "global"] as const)),
+				targetPath: Type.Optional(Type.String()), sectionId: Type.Optional(Type.String()),
+				anchor: Type.Optional(Type.String()), requiredFix: Type.Optional(Type.String()),
+				rewriteRequired: Type.Optional(Type.Boolean()), rewriteReason: Type.Optional(Type.String()),
 			}))),
 				advisories: Type.Optional(Type.Array(Type.String())),
 				review: Type.Optional(Type.Object({
@@ -1507,6 +1594,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						code: Type.String(), subjectId: Type.String(), reason: Type.String(),
 						evidenceRefs: Type.Optional(Type.Array(Type.String())),
 						missingEvidenceKind: Type.Optional(StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text"] as const)),
+						scope: Type.Optional(StringEnum(["local", "section", "global"] as const)),
+						targetPath: Type.Optional(Type.String()), sectionId: Type.Optional(Type.String()),
+						anchor: Type.Optional(Type.String()), requiredFix: Type.Optional(Type.String()),
+						rewriteRequired: Type.Optional(Type.Boolean()), rewriteReason: Type.Optional(Type.String()),
 					}))),
 					advisories: Type.Optional(Type.Array(Type.String())),
 				})),

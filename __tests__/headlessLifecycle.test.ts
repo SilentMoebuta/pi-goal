@@ -183,6 +183,39 @@ describe("headless goal lifecycle", () => {
 		assert.equal(typeof heartbeat.tokensUsed, "number");
 	});
 
+	it("bridges nested spawn_role progress into the headless log and heartbeat", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const intervals: Array<() => void> = [];
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({
+			setInterval: ((cb: () => void) => { intervals.push(cb); return intervals.length; }) as never,
+			clearInterval: ((timer: number) => { intervals.splice(timer - 1, 1); }) as never,
+		})(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		await api.emit("tool_execution_start", { toolCallId: "spawn-1", toolName: "spawn_role", args: { role: "report-reviewer" } }, ctx);
+		await api.emit("tool_execution_update", {
+			toolCallId: "spawn-1", toolName: "spawn_role",
+			partialResult: { details: { kind: "subagent-progress", id: "sub-1", role: "report-reviewer", sessionFile: "/child.jsonl", phase: "tool", turnCount: 2, tool: "read", lastActivityAt: Date.now() } },
+		}, ctx);
+		const lines = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const started = lines.find((entry) => entry.type === "subagent_started");
+		assert.equal(started.agentId, "sub-1");
+		assert.equal(started.tool, "read");
+		assert.equal("args" in started, false, "nested progress remains sanitized");
+		assert.ok(intervals.length > 0);
+		intervals[0]();
+		const heartbeatEntries = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line) as { type?: string; subagents?: any[] });
+		const heartbeats = heartbeatEntries.filter((entry) => entry.type === "heartbeat");
+		const heartbeat = heartbeats[heartbeats.length - 1];
+		assert.ok(heartbeat?.subagents);
+		assert.equal(heartbeat.subagents[0].agentId, "sub-1");
+		assert.equal(heartbeat.subagents[0].phase, "tool");
+	});
+
 	it("synchronously continues the loop at agent_end (print-mode fix)", async () => {
 		// print-mode 的 session.prompt() 只等当前 run 完成；agent_end 的 emit 窗口内
 		// isStreaming=true，同步 sendMessage(followUp) 入队后 agent loop 继续。
@@ -227,6 +260,8 @@ describe("headless goal lifecycle", () => {
 		const result = JSON.parse(fs.readFileSync(path.join(cwd, "spec.result.json"), "utf8"));
 		assert.equal(result.status, "active");
 		assert.equal(result.exit.code, 1);
+		const log = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(log.some((entry) => entry.type === "terminal"), false, "active abort is an interim snapshot, not terminal");
 		// 无续跑消息
 		assert.equal(api.sent.some((entry) => entry.message.customType === "pi-goal:continuation"), false);
 	});

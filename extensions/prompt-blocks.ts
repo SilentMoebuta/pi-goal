@@ -101,6 +101,7 @@ export function reviewerTranscriptContractBlock(goal: GoalState): string {
 	return "\n\nReviewer transcript contract:\n" +
 		"- report_role_result.findings[0] must be exactly `✅ Ready` or `❌ Not ready`.\n" +
 		"- Every blocking finding must then name code, subjectId (criterion, claim, or $constraint:n), and either evidenceRefs or missingEvidenceKind.\n" +
+		"- For report/artifact defects also provide scope (local/section/global), targetPath, sectionId, anchor, requiredFix, and rewriteRequired. rewriteRequired may be true only for a global structural defect and must include rewriteReason.\n" +
 		"- Submit those same identifiers through update_goal action=record_review; unbound or contradictory verdicts are rejected.\n";
 }
 
@@ -176,6 +177,11 @@ export function headlessBlueprintBlock(goal: GoalState): string {
 	lines.push("If you deviate from any declared item (topology, roles, DAG nodes, evidence expectations, review setup),");
 	lines.push("you MUST call update_goal({ action: \"record_deviation\", subjectId?, description, reason, impact }) as you deviate.");
 	lines.push("Unreported deviations are the one unforgivable failure mode in a headless run.");
+	if (blueprint.entry?.prompt) {
+		lines.push("");
+		lines.push("Entry instructions:");
+		lines.push(blueprint.entry.prompt);
+	}
 	lines.push("");
 	lines.push("Execution blueprint:");
 	lines.push("- Topology: " + blueprint.execution.topology);
@@ -316,12 +322,13 @@ export function budgetLimitPrompt(goal: GoalState): string {
  *  上溯 + 调研；需要用户决策 → pause 汇报。交互一律前置，执行中不打断用户。 */
 function executionFailureGuidanceBlock(): string {
 	return "\n\n## Execution failure recovery\n" +
-		"When a DAG execution finishes but completion verification fails, recover inside the DAG structure instead of patching files directly in the main session:\n" +
-		"1. If the failure maps to specific nodes, call dag_rerun(checkpoint, { rerunNodes: [...], inject: { nodeId: \"why it failed / what verification rejected\" } }) — it reruns those nodes AND their downstream closure, reusing untouched results.\n" +
-		"2. If the graph itself is wrong (missing nodes, wrong dependencies, wrong roles), call dag_rerun with specPatch { add | remove | modify } to restructure, then rerun.\n" +
-		"3. Only patch directly in the main session for a small, isolated issue that no DAG node owns — and say so explicitly.\n" +
-		"4. When the same class of failure repeats, stop re-running: analyze the ROOT CAUSE upstream — is a preceding step missing (research, design, verification) that would make later steps flow? Run web_search to see how others solve it before changing anything.\n" +
-		"5. If progress is impossible without a user decision, call update_goal({ action: \"pause\", reason: \"<what is blocked, what decision is needed>\" }) — the goal pauses and reports to the user. Never keep patching in circles.";
+		"When a review or completion check finds a defect in an existing report/artifact, use PATCH-FIRST remediation:\n" +
+		"1. Classify each finding as local, section, or global and record a stable id, targetPath, sectionId, anchor, problem, requiredFix, evidenceRefs, and rewriteRequired.\n" +
+		"2. For local/section findings, read the existing targetPath and edit it in place (or under the project's edited-sections override), preserving the artifact path and unrelated sections. Do not call write to regenerate the entire report.\n" +
+		"3. Re-review the same finding ids individually after the patch. A finding is closed only when its target anchor and requiredFix are verified.\n" +
+		"4. Preserve the original draft by strong default. A full rewrite remains available for the exceptional case where scope=global, rewriteRequired=true, and a concrete reason explains why bounded edits cannot keep the document coherent; otherwise do not rerun the writer DAG node.\n" +
+		"5. Use dag_rerun only for a genuinely structural graph failure (missing node, wrong dependency, or invalid upstream result), and rerun the smallest affected closure.\n" +
+		"6. When the same class of failure repeats, stop and report the root cause. If progress needs a user decision, call update_goal({ action: \"pause\", reason: \"<what is blocked, what decision is needed>\" }).";
 }
 
 export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
@@ -349,4 +356,3 @@ export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_G
 		headlessContinuationBlock(goal) +
 		executionFailureGuidanceBlock();
 }
-

@@ -424,6 +424,15 @@ export class GoalRuntimeTracker {
 		const tool = this.activeTools.get(toolCallId);
 		if (!tool) return;
 		tool.updatedAt = now;
+		const partial = objectValue(partialResult);
+		const child = objectValue(partial?.details);
+		if (child?.kind === "subagent-progress") {
+			const role = stringValue(child.role) ?? tool.role ?? "specialist";
+			const phase = stringValue(child.phase) ?? "thinking";
+			const childTool = stringValue(child.tool);
+			tool.label = "role " + shortText(role, 24) + ": " + phase + (childTool ? " (" + shortText(childTool, 20) + ")" : "");
+			tool.role = role;
+		}
 		if (toolName === "dag_execute" || toolName === "dag_resume") {
 			const dag = extractDagProgress(tool, partialResult, now, true, this.dagProgressByTool.get(toolCallId) ?? null);
 			if (dag) {

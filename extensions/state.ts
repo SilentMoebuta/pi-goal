@@ -149,6 +149,14 @@ export interface CompletionFinding {
 	reason: string;
 	evidenceRefs?: string[];
 	missingEvidenceKind?: EvidenceKind;
+	/** Patch-first remediation metadata for document/report artifacts. */
+	scope?: "local" | "section" | "global";
+	targetPath?: string;
+	sectionId?: string;
+	anchor?: string;
+	requiredFix?: string;
+	rewriteRequired?: boolean;
+	rewriteReason?: string;
 }
 
 export interface CompletionEvaluator {
@@ -481,12 +489,26 @@ function parseFinding(value: unknown, path: string): CompletionFinding {
 	const object = asObject(value, path);
 	const missingEvidenceKind = optionalEnum(object.missingEvidenceKind, EVIDENCE_KINDS, path + ".missingEvidenceKind");
 	const evidenceRefs = object.evidenceRefs === undefined ? undefined : stringArray(object.evidenceRefs, path + ".evidenceRefs");
+	const scope = optionalEnum(object.scope, ["local", "section", "global"] as const, path + ".scope");
+	const targetPath = optionalString(object.targetPath, path + ".targetPath");
+	const sectionId = optionalString(object.sectionId, path + ".sectionId");
+	const anchor = optionalString(object.anchor, path + ".anchor");
+	const requiredFix = optionalString(object.requiredFix, path + ".requiredFix");
+	const rewriteRequired = object.rewriteRequired === undefined ? undefined : asBoolean(object.rewriteRequired, path + ".rewriteRequired");
+	const rewriteReason = optionalString(object.rewriteReason, path + ".rewriteReason");
 	return {
 		code: asString(object.code, path + ".code"),
 		subjectId: asString(object.subjectId, path + ".subjectId"),
 		reason: asString(object.reason, path + ".reason"),
 		...(evidenceRefs === undefined ? {} : { evidenceRefs }),
 		...(missingEvidenceKind === undefined ? {} : { missingEvidenceKind }),
+		...(scope === undefined ? {} : { scope }),
+		...(targetPath === undefined ? {} : { targetPath }),
+		...(sectionId === undefined ? {} : { sectionId }),
+		...(anchor === undefined ? {} : { anchor }),
+		...(requiredFix === undefined ? {} : { requiredFix }),
+		...(rewriteRequired === undefined ? {} : { rewriteRequired }),
+		...(rewriteReason === undefined ? {} : { rewriteReason }),
 	};
 }
 

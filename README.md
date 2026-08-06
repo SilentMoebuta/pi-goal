@@ -1,5 +1,20 @@
 # pi-goal
 
+## Headless nested-agent runs
+
+When a goal uses `spawn_role`, `pi-roles` streams sanitized child lifecycle
+updates through the parent tool call. Headless runs persist these as
+`subagent_started`, `subagent_progress`, and `subagent_completed` entries in the
+goal JSONL log; heartbeat entries include currently active child IDs, roles,
+phases, turn counts, tools, and readable archived session files.
+
+Review remediation is patch-first. Findings can carry `scope` (`local`,
+`section`, or `global`), `targetPath`, `sectionId`, `anchor`, `requiredFix`, and
+an explicit `rewriteRequired`/`rewriteReason`. Local and section findings should
+be edited in the existing artifact and re-reviewed by finding ID. A global
+rewrite remains possible for exceptional structural failures, but requires the
+explicit global flag and reason.
+
 Persistent, evidence-aware goals for the [pi coding agent](https://github.com/earendil-works/pi-coding-agent). Goal V2 keeps the objective, execution route, evidence, assurance decision, completion audit, and live resource usage across turns and session reloads.
 
 The completion policy, verification strategy, and execution topology are separate decisions. A goal uses the least expensive topology that is sufficient, asks for independent review according to risk, and completes from outcome evidence rather than fixed counts of criteria, URLs, roles, or workflow waves.

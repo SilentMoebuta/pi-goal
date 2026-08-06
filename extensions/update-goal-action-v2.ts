@@ -199,6 +199,17 @@ function inferredActions(raw: Record<string, unknown>): Set<UpdateGoalActionName
 	return result;
 }
 
+function isSchemaDefaultNoise(value: unknown): boolean {
+	if (value === undefined || value === null || value === false || value === "" || value === 0) return true;
+	if (Array.isArray(value)) return value.length === 0;
+	if (isRecord(value)) return Object.values(value).every(isSchemaDefaultNoise);
+	return false;
+}
+
+function withoutSchemaDefaultNoise(raw: Record<string, unknown>): Record<string, unknown> {
+	return Object.fromEntries(Object.entries(raw).filter(([key, value]) => key === "action" || !isSchemaDefaultNoise(value)));
+}
+
 function legacyEvidenceId(raw: Record<string, unknown>, text: string): string {
 	const context = [raw.criterionId, raw.claimId, text].map((item) => String(item ?? "")).join("\u0000");
 	return `legacy-update:${createHash("sha256").update(context).digest("hex").slice(0, 20)}`;
@@ -318,13 +329,34 @@ function parseReview(raw: Record<string, unknown>): RecordReviewAction {
 			if (!isRecord(item)) throw new ActionValidationError(`review.findings[${index}] must be an object`);
 			const missingEvidenceKind = item.missingEvidenceKind === undefined
 				? undefined
-				: enumValue(item.missingEvidenceKind, EVIDENCE_KINDS, `review.findings[${index}].missingEvidenceKind`);
+					: enumValue(item.missingEvidenceKind, EVIDENCE_KINDS, `review.findings[${index}].missingEvidenceKind`);
+			const scope = item.scope === undefined
+				? undefined
+				: enumValue(item.scope, new Set(["local", "section", "global"] as const), `review.findings[${index}].scope`);
+			const rewriteRequired = item.rewriteRequired === undefined ? undefined : item.rewriteRequired;
+			if (rewriteRequired !== undefined && typeof rewriteRequired !== "boolean") {
+				throw new ActionValidationError(`review.findings[${index}].rewriteRequired must be a boolean`);
+			}
+			if (rewriteRequired === true && scope !== "global") {
+				throw new ActionValidationError(`review.findings[${index}] may require a full rewrite only when scope=global`);
+			}
+			const rewriteReason = optionalString(item.rewriteReason, `review.findings[${index}].rewriteReason`);
+			if (rewriteRequired === true && !rewriteReason) {
+				throw new ActionValidationError(`review.findings[${index}].rewriteReason is required when rewriteRequired=true`);
+			}
 			return {
 				code: requiredString(item.code, `review.findings[${index}].code`),
 				subjectId: requiredString(item.subjectId, `review.findings[${index}].subjectId`),
 				reason: requiredString(item.reason, `review.findings[${index}].reason`),
 				...(item.evidenceRefs === undefined ? {} : { evidenceRefs: stringArray(item.evidenceRefs, `review.findings[${index}].evidenceRefs`) }),
 				...(missingEvidenceKind ? { missingEvidenceKind } : {}),
+				...(scope ? { scope } : {}),
+				...(optionalString(item.targetPath, `review.findings[${index}].targetPath`) ? { targetPath: optionalString(item.targetPath, `review.findings[${index}].targetPath`)! } : {}),
+				...(optionalString(item.sectionId, `review.findings[${index}].sectionId`) ? { sectionId: optionalString(item.sectionId, `review.findings[${index}].sectionId`)! } : {}),
+				...(optionalString(item.anchor, `review.findings[${index}].anchor`) ? { anchor: optionalString(item.anchor, `review.findings[${index}].anchor`)! } : {}),
+				...(optionalString(item.requiredFix, `review.findings[${index}].requiredFix`) ? { requiredFix: optionalString(item.requiredFix, `review.findings[${index}].requiredFix`)! } : {}),
+				...(rewriteRequired === undefined ? {} : { rewriteRequired }),
+				...(rewriteReason ? { rewriteReason } : {}),
 			};
 		});
 	};
@@ -542,7 +574,13 @@ export function normalizeUpdateGoalAction(
 	if (value.action !== undefined && (typeof value.action !== "string" || !ACTIONS.has(value.action as UpdateGoalActionName))) {
 		return { ok: false, kind: "invalid", reason: `Unknown update_goal action: ${String(value.action)}` };
 	}
-	const inferred = inferredActions(value);
+	// A canonical discriminator is authoritative. Some model/tool-schema stacks
+	// materialize unrelated optional properties with empty/default values; inferring
+	// action families from those fields turns one valid mutation into a false
+	// mixed-action error. Legacy inputs without `action` still use inference.
+	const inferred = typeof value.action === "string"
+		? inferredActions(withoutSchemaDefaultNoise(value))
+		: inferredActions(value);
 	if (inferred.size > 1) {
 		return {
 			ok: false,
@@ -554,12 +592,7 @@ export function normalizeUpdateGoalAction(
 	if (!action) return { ok: false, kind: "invalid", reason: "No update_goal action was provided" };
 	try {
 		const normalized = parseAction(value, action, options.now);
-		const legacy = value.action === undefined
-			|| value.status !== undefined
-			|| value.executionMode !== undefined
-			|| value.reviewerPassed !== undefined
-			|| value.singleRationalePreApproved !== undefined
-			|| (typeof value.evidence === "string" && !isRecord(value.evidence));
+		const legacy = value.action === undefined;
 		return {
 			ok: true,
 			action: normalized,
