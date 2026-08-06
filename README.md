@@ -4,6 +4,24 @@ Persistent, evidence-aware goals for the [pi coding agent](https://github.com/ea
 
 The completion policy, verification strategy, and execution topology are separate decisions. A goal uses the least expensive topology that is sufficient, asks for independent review according to risk, and completes from outcome evidence rather than fixed counts of criteria, URLs, roles, or workflow waves.
 
+## Table of Contents
+
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Interactive Usage](#interactive-usage)
+- [Headless Blueprint Goals (external programs)](#headless-blueprint-goals-external-programs)
+  - [Spec file format](#spec-file-format)
+  - [Result file](#result-file)
+  - [Real-time log](#real-time-log)
+  - [Example: calling from a program](#example-calling-from-a-program)
+- [Model Tools](#model-tools)
+- [Evidence And Completion](#evidence-and-completion)
+- [State Machine](#state-machine)
+- [Goal Progress View](#goal-progress-view)
+- [Persistence](#persistence)
+- [Configuration](#configuration)
+- [Development](#development)
+
 ## Install
 
 ```sh
@@ -12,73 +30,296 @@ pi install git:github.com/SilentMoebuta/pi-goal
 
 Adaptive `specialist` and `team` execution integrates with [`pi-roles`](https://github.com/SilentMoebuta/pi-roles). pi-goal remains usable without pi-roles; when the role catalog is unavailable, automatic routing falls back to `direct`.
 
-## Commands
+## Quick Start
+
+**1. Set a goal** — in a pi session, type:
+
+```
+/goal Migrate the auth module to JWT with proper error handling, keeping all 47 existing tests passing
+```
+
+The agent drafts a formal goal (objective + acceptance criteria + constraints), shows it to you for review (`start` / `edit` / `change execution`), and starts working automatically.
+
+**2. Watch it run** — the footer shows a one-line summary, `/goal` (or `/goal status`) opens the full progress view:
+
+```text
+goal active | 1 blocking open | 12.4K tok | active 3m12s | wall 8m41s | DAG 2 running, 1 ready
+```
+
+**3. Interrupt or steer anytime** — just type a message; your input runs first and the goal resumes after. Use `/goal pause` for an explicit stop, `/goal resume` to continue.
+
+**4. Completion is evidence-based** — when the agent believes it is done it calls `update_goal({ action: "request_completion" })`; a separate evaluator checks the evidence ledger, tests, and (if configured) a deterministic verification command. The goal completes only when blocking outcomes hold:
+
+```
+Goal achieved! ✅
+```
+
+**5. Optional token budget** — bound an autonomous run:
+
+```
+/goal <objective> --tokens 50k
+```
+
+## Interactive Usage
 
 | Command | Description |
 |---|---|
-| `/goal <objective> [--tokens N]` | Draft a Goal V2 for review. `--tokens 50k` and `--tokens=1m` set an optional token budget. |
-| `/goal` or `/goal status` | Show the unified Goal Progress view: route, outcomes, activity, evidence, assurance, health, and resources. |
-| `/goal run <spec.md>` | Start a goal from a headless blueprint spec (see below; same code path as `--goal-run`). |
-| `/goal apply <spec.md>` | Load and review a goal spec document. |
+| `/goal <objective> [--tokens N]` | Draft a Goal V2 for review. `--tokens 50k` / `--tokens=1m` set an optional token budget. |
+| `/goal` or `/goal status` | Show the unified Goal Progress view (route, outcomes, activity, evidence, assurance, health, resources). |
+| `/goal run <spec.md>` | Start a goal from a headless blueprint spec (same code path as `--goal-run`; confirms once when a goal is active). |
+| `/goal apply <spec.md>` | Load and review a goal spec document (edit it, then start). |
 | `/goal pause` | Pause the active goal. |
 | `/goal resume` | Resume a paused or limited goal. |
 | `/goal clear` | Remove the current goal. |
+| `/goal telemetry` | Show completed-goal statistics (routing, review, rejections, tokens) for policy calibration. |
 | `/goal help` | Show usage. |
 
-## Headless Blueprint Goals
+### Typical interactive flow
 
-An external agent or program can run a fully pre-specified goal in a headless pi session, with machine-readable output and a real-time structured log:
+```
+/goal Refactor the checkout service so p95 latency is under 120ms without regressing the correctness suite
+```
+
+1. The draft shows: task kind, execution route (direct/specialist/team), routing reasons, assurance decision, criteria, constraints.
+2. Choose `start`, or `edit` to open the full spec document (markdown, `docs/goals/*.md`), or change execution preference.
+3. The goal runs; record evidence as you work with `update_goal` (see [Model Tools](#model-tools)).
+4. When blocking outcomes are satisfied, call `update_goal({ action: "request_completion", summary })` — the evaluator decides.
+5. Rejections tell you exactly what is missing; repeated identical rejections escalate (feedback → replan → pause for your input).
+
+## Headless Blueprint Goals (external programs)
+
+An external agent or program can run a **fully pre-specified** goal in a headless pi session — no drafting, no review UI, no human in the loop — and consume machine-readable output:
 
 ```bash
 pi --approve --goal-run spec.md -p "Run the goal defined by --goal-run to completion."
-# result: spec.result.json (terminal state + evidence ledger + completion audit)
-# live:   spec.goal.jsonl (JSONL event stream — tail -f while it runs)
+# live:   spec.goal.jsonl   ← tail -f while it runs (JSONL event stream)
+# result: spec.result.json  ← terminal state + evidence ledger + completion audit
 ```
 
 | Flag | Description |
 |---|---|
-| `--goal-run <path>` | Run a goal blueprint spec to completion (no drafting, no review UI). |
+| `--goal-run <path>` | Run a goal blueprint spec to completion. |
 | `--goal-output <path>` | Result JSON path (default `<spec>.result.json`). |
 | `--goal-log <path>` | Real-time JSONL log path (default `<spec>.goal.jsonl`). |
 
-The spec is the existing goal spec markdown plus a `blueprint` machine block that pre-declares everything: execution topology (`direct`/`specialist`/`team`), ad-hoc role definitions (roleDefs, compatible with pi-roles `spawn_role`/`dag_execute`), an optional DAG, per-criterion evidence expectations, reviewer requirement + checklist, deterministic verification command (trusted projects only), and a token budget. Blueprints are **guided**, not strict: the agent follows them as strong instructions and must record every deviation via `update_goal({ action: "record_deviation", ... })`. Deviations, evidence gaps, and the full completion audit land in the result file and the goal log. See `docs/design/2026-08-06-headless-goal-blueprint.md` for the contract.
+The blueprint spec pre-declares **everything** the run needs: execution topology, ad-hoc role definitions, an optional DAG, per-criterion evidence expectations, reviewer requirement + checklist, deterministic verification command, and a token budget. Blueprints are **guided**, not strict: the agent follows them as strong instructions and must record every deviation via `update_goal({ action: "record_deviation", ... })` — unreported deviations are the one unforgivable failure mode in a headless run. Deviations, evidence gaps, and the completion audit all land in the result file and the log.
 
-`update_goal` gains one action: `record_deviation` (subjectId/description/reason/impact), which appends to the goal's deviation ledger (visible in `get_goal` and the result file).
+### Spec file format
 
-## Goal Drafts And Routing
+A blueprint spec is the regular goal spec markdown plus a `blueprint` JSON block in the machine section. Criterion ids are positional: `c1`, `c2`, … in document order. Full example (copy-paste ready):
 
-`propose_goal_draft` requires a concise objective and **at least one genuine outcome criterion**. Criteria can be `blocking` or `advisory`; do not add workflow steps, source counts, or filler criteria to meet a quota. Drafts can also declare explicit constraints, a task kind (`general`, `coding`, `research`, `pm`, or `review`), research claims, and an execution preference.
+````markdown
+# Goal: JWT 认证迁移
 
-When pi-roles is available, the drafter should call its read-only `list_roles` tool before choosing a specialist. Automatic routing selects:
+## 原始描述
 
-- `direct` for one clear workstream that the main session can complete.
-- `specialist` for one dominant specialist capability or a low-confidence probe. The role must exist in the role catalog.
-- `team` only for at least two genuinely independent workstreams or useful separation of duties.
+> 将 auth 模块从 session 认证迁移到 JWT
 
-Risk alone does not require a team. An automatic route may be reassessed when scope expands, a new workstream appears, evidence conflicts, or progress stalls. An explicit user preference is locked until the user changes it.
+## 目标
 
-The draft review shows the task kind, selected topology and role, routing reasons, assurance decision, criteria, constraints, and initial claims. The user can change the execution preference before starting.
+将 src/auth 迁移到 JWT 中间件，保持 47 个存量测试通过，不新增运行时依赖
+
+## 验收标准
+
+- [ ] `blocking` npm run test:auth 与 npm run lint 全部通过
+- [ ] `blocking` src/auth/jwt.ts 存在并导出 verifyToken
+- [ ] `advisory` README 补充迁移说明
+
+## 约束
+
+- 不新增依赖
+- 公开 API 保持不变
+
+## 研究声明
+
+- `migration-parity` (material · high) JWT 迁移与旧 session 认证等价
+
+## 机器字段
+
+```json
+{
+  "taskKind": "coding",
+  "blueprint": {
+    "execution": {
+      "topology": "team",
+      "roleDefs": [
+        {
+          "name": "migrator",
+          "description": "JWT 迁移专家",
+          "prompt": "你负责 src/auth 迁移：分析影响面、实现中间件、补齐测试。",
+          "tools": ["read", "bash", "edit", "write", "grep", "find"],
+          "maxTurns": 200,
+          "model": "deepseek/deepseek-v4-flash",
+          "thinkingLevel": "medium"
+        }
+      ],
+      "dag": {
+        "nodes": [
+          {
+            "id": "research",
+            "roleDef": "migrator",
+            "task": "分析现有 session 认证，输出迁移影响面清单",
+            "expected_output": "影响面：文件/契约/测试清单",
+            "consumers": ["implement"]
+          },
+          {
+            "id": "implement",
+            "roleDef": "migrator",
+            "task": "实现 JWT 迁移并补齐测试",
+            "expected_output": "jwt.ts 与全量测试通过输出",
+            "consumers": ["$result"]
+          }
+        ],
+        "maxConcurrent": 2
+      }
+    },
+    "evidence": {
+      "criteria": [
+        {
+          "id": "c1",
+          "kinds": ["artifact", "command"],
+          "minCount": 1,
+          "verification": "verified",
+          "note": "artifact 指向测试输出文件；command 是测试运行结果"
+        }
+      ],
+      "nodes": [
+        { "id": "research", "evidenceKind": "artifact", "attachTo": "c1" },
+        { "id": "implement", "evidenceKind": "command", "attachTo": "c1" }
+      ]
+    },
+    "review": {
+      "requirement": "required",
+      "model": "anthropic/sonnet",
+      "thinkingLevel": "high",
+      "tools": ["read", "bash", "grep", "find"],
+      "checklist": [
+        "对照影响面清单逐一确认迁移覆盖",
+        "运行契约测试并核对输出",
+        "确认无新增依赖"
+      ],
+      "maxTurns": 120
+    },
+    "verification": { "command": "npm test", "timeoutMs": 120000 },
+    "budget": { "tokens": 500000 },
+    "completion": { "policy": "v2", "maxAutoTurns": 200 }
+  }
+}
+```
+````
+
+Blueprint fields:
+
+| Field | Meaning |
+|---|---|
+| `execution.topology` | `direct` / `specialist` / `team`. |
+| `execution.role` | A registered role from the pi-roles catalog (specialist topology). |
+| `execution.roleDefs` | Ad-hoc role definitions (compatible with `spawn_role` / `dag_execute` roleDefs): name, description, prompt, tools, maxTurns, model, thinkingLevel. |
+| `execution.dag` | Optional DAG: nodes (id, task, roleDef/role, expected_output, consumers, depends_on), maxConcurrent. |
+| `evidence.criteria` | Per-criterion expectations: kinds (`artifact`, `command`, `source`, `tool_result`, `observation`, `user_confirmation`), minCount, verification. Gaps become advisories (diagnostic), not automatic rejections. |
+| `evidence.nodes` | Map a DAG node / roleDef to evidence it should produce (`evidenceKind`, `attachTo` criterion). |
+| `review` | Reviewer requirement + checklist + model/thinking. The checklist is injected into the spawned reviewer. |
+| `verification.command` | Deterministic verification command run before each completion evaluation. **Trusted projects only** (pass `--approve` or trust the project). |
+| `budget.tokens` | Token budget; the run stops at `budget_limited` with a result file. |
+| `completion.policy` | `legacy` / `shadow` / `v2`. |
+
+### Result file
+
+`<spec>.result.json` is written when the run reaches a terminal state (`complete`, `unmet`, `blocked`, `paused`, `budget_limited`, `usage_limited`). Schema (v1):
+
+```json
+{
+  "schemaVersion": 1,
+  "status": "complete",
+  "objective": "将 src/auth 迁移到 JWT 中间件……",
+  "criteria": [
+    { "id": "c1", "description": "npm run test:auth 与 npm run lint 全部通过", "level": "blocking", "status": "verified", "evidenceRefs": ["e1"] }
+  ],
+  "evidenceLedger": [
+    { "id": "e1", "kind": "command", "summary": "npm run test:auth 通过（47/47）", "verification": "verified" }
+  ],
+  "claims": [{ "id": "migration-parity", "materiality": "material", "evidenceRefs": ["e2"] }],
+  "deviations": [{ "id": "d1", "subjectId": "dag.nodes.implement", "description": "改为串行实现", "reason": "无并行空间", "impact": "无" }],
+  "execution": { "topology": "team", "source": "user" },
+  "review": { "requirement": "required", "status": "passed", "checklist": ["……"] },
+  "completion": { "decision": "accept", "findings": [], "advisories": [] },
+  "resources": { "tokensUsed": 123456, "tokenBudget": 500000, "activeMs": 3600000, "wallMs": 3800000 },
+  "exit": { "code": 0, "message": "Goal achieved." }
+}
+```
+
+`exit.code` is `0` only for `complete`. The process also sets its exit code accordingly (best-effort). **The result file is the contract** — read it, don't parse stdout.
+
+### Real-time log
+
+`<spec>.goal.jsonl` is an append-only JSONL stream, one event per line — the external agent's live view (works with `tail -f`; survives process crashes):
+
+```json
+{"v":1,"ts":1786010786886,"goalId":"...","type":"goal_started","objective":"...","topology":"team","tokenBudget":500000}
+{"v":1,"ts":1786010790000,"goalId":"...","type":"turn_settled","tokensUsed":217,"activeMs":4193}
+{"v":1,"ts":1786010800000,"goalId":"...","type":"evidence_recorded","entry":{"id":"e1","kind":"command","summary":"...","verification":"verified"},"criterionIds":["c1"]}
+{"v":1,"ts":1786010801000,"goalId":"...","type":"deviation_recorded","deviation":{"id":"d1","description":"..."}}
+{"v":1,"ts":1786010802000,"goalId":"...","type":"completion_evaluated","decision":"revise","findings":[{"code":"blocking_requirement_unsatisfied","subjectId":"c1","reason":"..."}]}
+{"v":1,"ts":1786010803000,"goalId":"...","type":"budget_warning","tokensUsed":4140,"tokenBudget":8000,"percent":50}
+{"v":1,"ts":1786010804000,"goalId":"...","type":"terminal","result":{ "…same shape as spec.result.json…" }}
+```
+
+Event types: `goal_started`, `status`, `turn_settled`, `evidence_recorded`, `deviation_recorded`, `completion_requested`, `completion_evaluated`, `review_recorded`, `budget_warning` (50%/80%/90%), `paused`/`resumed`, `terminal` (final; its `result` payload equals the result file). The `terminal` line is the completion signal. In `--mode json` sessions the same events are also echoed in-band as `pi-goal:headless_event` custom messages.
+
+### Example: calling from a program
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+SPEC=spec.md
+rm -f "$SPEC.result.json" "$SPEC.goal.jsonl"
+
+pi --approve --goal-run "$SPEC" -p "Run the goal defined by --goal-run to completion." &
+
+# Poll for the terminal event (or tail the log for live progress)
+for i in $(seq 1 600); do
+  if [ -f "$SPEC.result.json" ]; then break; fi
+  sleep 1
+done
+
+result=$(cat "$SPEC.result.json")
+status=$(python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" <<< "$result")
+echo "goal status: $status"
+[ "$status" = "complete" ] || exit 1
+```
+
+For long runs, stream `tail -f "$SPEC.goal.jsonl"` and act on `budget_warning` / `completion_evaluated` / `terminal` lines as they arrive.
+
+**Headless gotchas**
+
+- A goal that would pause for user input (e.g., three identical completion rejections, budget exhaustion, rate limiting) **ends the run** in headless mode — the result file records the pause reason and the exit code is non-zero. The caller decides whether to retry with a different spec/budget.
+- The agent cannot be trusted to report deviations it was not told about — the blueprint block in every continuation prompt enforces `record_deviation`; audit `deviations` in the result file before trusting a `complete`.
+- `verification.command` runs arbitrary shell — only use it in trusted projects (`--approve`).
 
 ## Model Tools
 
+The agent (and you, in tool-capable setups) manages the goal through three tools:
+
 | Tool | Description |
 |---|---|
-| `get_goal` | Read the Goal V2 public view, including its structured `progress` snapshot, route, claims, evidence ledger, and completion audit. |
+| `get_goal` | Read the Goal V2 public view: status, criteria, evidence ledger, claims, deviations, execution route, assurance, completion audit, progress, usage. |
 | `propose_goal_draft` | Propose an objective with one or more outcome criteria, task kind, route inputs, assurance inputs, and optional research claims. |
-| `update_goal` | Apply exactly one action. V1 flat arguments are accepted for one compatibility cycle, but must not be mixed with V2 actions. |
+| `update_goal` | Apply exactly one action (see below). V1 flat arguments are accepted for one compatibility cycle, but must not be mixed with V2 actions. |
 
-`update_goal` is an action-based interface:
+`update_goal` actions:
 
 | Action | Purpose |
 |---|---|
-| `record_evidence` | Add a structured ledger entry and attach its ID to one existing criterion or claim. |
-| `upsert_claim` | Add or update a research claim whose evidence references already exist in the ledger. |
-| `request_completion` | Store a completion summary and request evaluation; it does not mark the goal complete by itself. |
-| `record_review` | Persist an independent review from a real spawned reviewer session, including structured findings and advisories. |
+| `record_evidence` | Add a structured ledger entry and attach it to a criterion or claim. `artifact` entries are mechanically verified against the filesystem (Proof-or-Stop: claimed `verified` artifacts that do not exist become `rejected`). |
+| `upsert_claim` | Add or update a research claim (materiality/risk) whose evidence references already exist in the ledger. |
+| `request_completion` | Store a completion summary and request evaluation; does **not** mark the goal complete by itself. |
+| `record_review` | Persist an independent review from a real spawned reviewer session (transcript-verified; findings must bind to criteria/evidence). |
 | `change_execution` | Change or lock the execution preference, selected topology, and optional registered specialist role. |
+| `record_deviation` | Record a blueprint deviation (subjectId/description/reason/impact) — required whenever the agent deviates from a headless blueprint. |
 | `mark_unmet` | End the goal as unmet with a concrete blocker. |
+| `pause` | Pause the goal and report why to the user. |
 
-Submit one action per call. For example:
+Example:
 
 ```ts
 update_goal({
@@ -101,7 +342,7 @@ update_goal({
 
 ## Evidence And Completion
 
-All evidence lives in one goal-wide ledger. An entry has a stable ID, kind (`source`, `artifact`, `command`, `tool_result`, `observation`, `user_confirmation`, or migrated `legacy_text`), summary, origin, verification state, and optional locator, excerpt, source kind, and independence key. Criteria and claims refer to entries by ID, so the evaluator can validate every reference.
+All evidence lives in one goal-wide ledger. An entry has a stable ID, kind (`source`, `artifact`, `command`, `tool_result`, `observation`, `user_confirmation`, or migrated `legacy_text`), summary, origin, verification state, and optional locator, excerpt, source kind, and independence key. Criteria and claims refer to entries by ID, so the evaluator can validate every reference. `artifact` evidence with a local path is mechanically verified at write time (existence + SHA-256 for small files) — the agent cannot mark a nonexistent file `verified`.
 
 Research claims record `materiality` (`material` or `supporting`), risk (`ordinary` or `high`), and their evidence references. A normal material claim can be supported by one authoritative primary source. High-risk, disputed, or conflicting claims require independent corroboration. Supporting gaps are advisory.
 
@@ -139,7 +380,7 @@ A required review must come from a real spawned reviewer session. Its blocking f
 
 User input cancels a pending automatic continuation so the user's message runs first, but it does not pause the goal. Use `/goal pause` for an explicit stop. An Esc abort pauses the goal.
 
-## Goal Progress
+## Goal Progress View
 
 Every topology uses the same progress model. A direct goal reports main-session thinking and tools, a specialist goal reports `spawn_role` activity, and a team goal adds scheduler frontier details from `dag_execute` or `dag_resume`. DAG waves are not the top-level progress concept. Foreground specialists are tracked for their full tool lifetime; a background specialist can only be shown as dispatched because the current pi-roles completion notification is an unstructured parent steer.
 
@@ -208,6 +449,7 @@ The environment variable `GOAL_MAX_AUTO_TURNS` overrides the per-resume-cycle au
 ## Development
 
 ```sh
+npm install   # dev deps (tsx, typescript)
 npm test
 npm run typecheck
 ```
