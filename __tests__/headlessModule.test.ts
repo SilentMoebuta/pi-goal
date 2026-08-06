@@ -12,6 +12,7 @@ import {
 	finalizeHeadlessGoal,
 	HEADLESS_LOG_MAX_BYTES,
 	specCriterionId,
+	summarizeValue,
 	validateBlueprint,
 } from "../extensions/headless";
 import type { GoalStateV2 } from "../extensions/state";
@@ -174,6 +175,28 @@ describe("buildGoalResultView", () => {
 		const view = buildGoalResultView(goal, 2000);
 		assert.equal((view.exit as { code: number }).code, 0);
 		assert.equal((view.exit as { message: string }).message, "Goal achieved.");
+	});
+});
+
+describe("summarizeValue", () => {
+	it("serializes objects and passes through short values", () => {
+		assert.equal(summarizeValue("short"), "short");
+		assert.equal(summarizeValue({ a: 1 }), "{\"a\":1}");
+		assert.equal(summarizeValue(undefined), "");
+		assert.equal(summarizeValue(null), "");
+	});
+
+	it("truncates long values with a length marker", () => {
+		const long = "x".repeat(1000);
+		const result = summarizeValue(long, 100);
+		assert.equal(result.length, 100 + "…(1000 chars)".length);
+		assert.match(result, /\(1000 chars\)$/);
+	});
+
+	it("falls back to String for circular structures", () => {
+		const circular: Record<string, unknown> = {};
+		circular.self = circular;
+		assert.equal(summarizeValue(circular), "[object Object]");
 	});
 });
 

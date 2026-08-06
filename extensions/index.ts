@@ -62,7 +62,7 @@ import {
 	V2_JUDGE_SYSTEM_PROMPT,
 } from "./completion-runtime-v2";
 import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
-import { GOAL_HEADLESS_EVENT_TYPE, appendGoalLog, buildGoalLogEntry, createGoalFromBlueprint, finalizeHeadlessGoal, validateBlueprint } from "./headless";
+import { GOAL_HEADLESS_EVENT_TYPE, appendGoalLog, buildGoalLogEntry, createGoalFromBlueprint, finalizeHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
 import { proposalToMarkdown, parseGoalSpecMarkdown, parseBlueprint, slugifyTitle, type SpecCriterion } from "./spec-doc";
 import { runJudge, runV2CompletionJudge, type JudgeVerdict } from "./judge";
 import { formatTokens, formatDuration, escapeXml, extractOutputTokens, extractTextContent, isAssistantMessage, GOAL_STORAGE_TYPE, GOAL_EVENT_TYPE, GOAL_CONTINUATION_TYPE, GOAL_JUDGE_TYPE } from "./util";
@@ -218,6 +218,38 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		);
 	}
 
+	// ── headless 活动日志（turn 内黑盒透明化）────────────────────────────
+	// 外部 agent 需要区分"卡死"与"大任务进行中"：tool_started/tool_ended 记录
+	// 每次工具调用，llm_response 记录每轮模型响应，heartbeat 保证最长 30s 必有
+	// 信号（含当前 phase 与距上次活动时间）。
+	const headlessToolStarts = new Map<string, { name: string; startedAt: number }>();
+	let headlessHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+	function syncHeadlessHeartbeat(ctx: ExtensionContext): void {
+		if (headlessHeartbeatTimer) {
+			dependencies.clearInterval(headlessHeartbeatTimer);
+			headlessHeartbeatTimer = null;
+		}
+		if (!goal?.headless || goal.status !== "active") return;
+		headlessHeartbeatTimer = dependencies.setInterval(() => {
+			if (!goal?.headless || goal.status !== "active") { syncHeadlessHeartbeat(ctx); return; }
+			const now = nowMs();
+			const runtime = progressRuntime.snapshot();
+			const progress = progressFor(goal, now);
+			goalLog(ctx, "heartbeat", {
+				phase: runtime.phase,
+				label: runtime.label,
+				thinkingMs: runtime.turnStartedAt ? Math.max(0, now - runtime.turnStartedAt) : null,
+				lastActivityMsAgo: runtime.lastActivityAt ? Math.max(0, now - runtime.lastActivityAt) : null,
+				tokensUsed: goal.tokensUsed,
+				activeMs: progress.resources.activeMs,
+			});
+		}, 30_000);
+		// unref 兜底：测试/无宿主场景下定时器不阻止进程退出（真实 pi 进程由
+		// session_shutdown 显式清理，unref 只保证事件循环不被心跳卡住）。
+		(headlessHeartbeatTimer as unknown as { unref?: () => void })?.unref?.();
+	}
+
 	const budgetWarnedThresholds = new Map<string, Set<number>>();
 	/** 预算渐进提醒：50%/80%/90% 各一次（抄 Codex rollout_budget 的 reminder 思路）。 */
 	function checkBudgetWarnings(ctx: ExtensionContext): void {
@@ -282,6 +314,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		persist("set");
 		updateFooter(ctx);
 		syncFooterTicker(ctx);
+		syncHeadlessHeartbeat(ctx);
 		syncTools();
 		goalLog(ctx, "goal_started", {
 			objective: newGoal.objective,
@@ -433,6 +466,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		}
 		updateFooter(ctx);
 		syncFooterTicker(ctx);
+		syncHeadlessHeartbeat(ctx);
 		syncTools();
 	}
 
@@ -855,6 +889,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		shuttingDown = true;
 		clearTimer();
 		clearFooterTicker();
+		if (headlessHeartbeatTimer) { dependencies.clearInterval(headlessHeartbeatTimer); headlessHeartbeatTimer = null; }
 		if (settleCurrentTurnTime() && goal) persist("usage");
 		if (goal?.headless && goal.status === "active") {
 			// 进程退出时 active 的 headless goal 尽力收尾（幂等；aborted 路径可能已 finalize）。
@@ -913,6 +948,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// Reading the projection must not make the projection report itself as work.
 		if (event.toolName === "get_goal") return;
 		progressRuntime.toolStarted(event.toolCallId, event.toolName, event.args, nowMs());
+		if (goal.headless) {
+			headlessToolStarts.set(event.toolCallId, { name: event.toolName, startedAt: nowMs() });
+			goalLog(ctx, "tool_started", { tool: event.toolName, args: summarizeValue(event.args, 300) });
+		}
 		updateFooter(ctx);
 	});
 
@@ -925,6 +964,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	pi.on("tool_execution_end", (event, ctx) => {
 		if (isSubagentSession(ctx)) return;
 		progressRuntime.toolEnded(event.toolCallId, event.result, event.isError, nowMs());
+		if (goal?.headless) {
+			const started = headlessToolStarts.get(event.toolCallId);
+			headlessToolStarts.delete(event.toolCallId);
+			goalLog(ctx, "tool_ended", {
+				tool: event.toolName,
+				isError: Boolean(event.isError),
+				durationMs: started ? Math.max(0, nowMs() - started.startedAt) : null,
+				result: summarizeValue(event.result, 500),
+			});
+		}
 		if (goal) updateFooter(ctx);
 	});
 
@@ -961,8 +1010,24 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		currentTurn = { turnId, goalId: goal.id };
 		turnAccounting.beginTurn({ ...currentTurn, startedAtMs: event.timestamp });
 		progressRuntime.turnStarted(event.timestamp);
+		if (goal.headless) {
+			goalLog(ctx, "turn_started", { turnIndex: event.turnIndex });
+			syncHeadlessHeartbeat(ctx);
+		}
 		updateFooter(ctx);
 		syncFooterTicker(ctx);
+	});
+
+	// 每轮 LLM 响应完成：记录 usage 与 stopReason（外部 agent 可据此判断推理轮次与异常终止）。
+	pi.on("message_end", async (event, ctx) => {
+		if (isSubagentSession(ctx)) return;
+		if (!goal?.headless) return;
+		const msg = event.message as { role?: string; usage?: unknown; stopReason?: string };
+		if (msg.role !== "assistant") return;
+		goalLog(ctx, "llm_response", {
+			...(msg.usage === undefined ? {} : { usage: msg.usage }),
+			...(msg.stopReason === undefined ? {} : { stopReason: msg.stopReason }),
+		});
 	});
 
 	pi.on("turn_end", async (event, ctx) => {

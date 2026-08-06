@@ -266,7 +266,19 @@ Blueprint fields:
 {"v":1,"ts":1786010804000,"goalId":"...","type":"terminal","result":{ "…same shape as spec.result.json…" }}
 ```
 
-Event types: `goal_started`, `status`, `turn_settled`, `evidence_recorded`, `deviation_recorded`, `completion_requested`, `completion_evaluated`, `review_recorded`, `budget_warning` (50%/80%/90%), `paused`/`resumed`, `terminal` (final; its `result` payload equals the result file). The `terminal` line is the completion signal. In `--mode json` sessions the same events are also echoed in-band as `pi-goal:headless_event` custom messages.
+Event types: `goal_started`, `status`, `turn_started`, `turn_settled`, `tool_started`, `tool_ended`, `llm_response`, `heartbeat`, `evidence_recorded`, `deviation_recorded`, `completion_requested`, `completion_evaluated`, `review_recorded`, `budget_warning` (50%/80%/90%), `paused`/`resumed`, `terminal` (final; its `result` payload equals the result file). The `terminal` line is the completion signal. In `--mode json` sessions the same events are also echoed in-band as `pi-goal:headless_event` custom messages.
+
+**Activity transparency** — the log exposes what pi is doing *inside* each turn, so a caller can tell "stuck" from "working on a big task":
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `turn_started` | `turnIndex` | A new LLM turn (reasoning round) began. |
+| `llm_response` | `usage`, `stopReason` | One LLM response completed (`stopReason`: `toolUse` → will call a tool next; `end_turn` → turn finished; `error`/`aborted` → problem). |
+| `tool_started` | `tool`, `args` (truncated 300) | A tool call began (bash/read/edit/…). |
+| `tool_ended` | `tool`, `isError`, `durationMs`, `result` (truncated 500) | The tool finished — error flag and wall time make slow/failing calls obvious. |
+| `heartbeat` | `phase` (`thinking`/`tool`/`specialist`/`dag`/`evaluating`/`waiting`/`idle`), `label`, `thinkingMs`, `lastActivityMsAgo`, `tokensUsed`, `activeMs` | Liveness signal every 30s while active. `thinkingMs` growing means a long reasoning round; `lastActivityMsAgo` small means the agent is actively working. |
+
+**Stuck vs. big-task heuristic for callers**: if `heartbeat` lines keep arriving with `thinkingMs` increasing or `tool_started`/`tool_ended`/`llm_response` flowing, the agent is working. If no log line arrives for longer than your chosen timeout (default suggestion: 3× the 30s heartbeat interval), the process is likely dead — check the process and the result file.
 
 ### Example: calling from a program
 

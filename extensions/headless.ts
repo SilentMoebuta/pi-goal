@@ -292,6 +292,19 @@ export interface GoalLogEntry {
 	[key: string]: unknown;
 }
 
+/** 工具参数/结果摘要：JSON 安全序列化 + 截断（防日志爆炸，保留关键信息）。 */
+export function summarizeValue(value: unknown, max = 300): string {
+	if (value === undefined || value === null) return "";
+	let text: string;
+	try {
+		text = typeof value === "string" ? value : JSON.stringify(value);
+	} catch {
+		text = String(value);
+	}
+	if (text.length <= max) return text;
+	return text.slice(0, max) + "…(" + text.length + " chars)";
+}
+
 export function buildGoalLogEntry(goalId: string, type: string, payload: Record<string, unknown>, ts: number): GoalLogEntry {
 	return { v: 1, ts, goalId, type, ...payload };
 }

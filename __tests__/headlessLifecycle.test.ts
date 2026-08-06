@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import piGoalExtension from "../extensions/index";
+import piGoalExtension, { createPiGoalExtension } from "../extensions/index";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
@@ -135,6 +135,54 @@ async function execute(api: HeadlessFakeAPI, name: string, params: unknown, ctx:
 }
 
 describe("headless goal lifecycle", () => {
+	it("logs tool calls, llm responses, and heartbeats (activity transparency)", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		// 注入可控定时器：捕获心跳回调，手动触发验证。
+		const intervals: Array<() => void> = [];
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({
+			setInterval: ((cb: () => void) => { intervals.push(cb); return intervals.length; }) as never,
+			clearInterval: ((timer: number) => { intervals.splice(timer - 1, 1); }) as never,
+		})(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		// 工具调用日志
+		await api.emit("tool_execution_start", { toolCallId: "t1", toolName: "bash", args: { command: "npm test" } }, ctx);
+		await api.emit("tool_execution_end", { toolCallId: "t1", toolName: "bash", result: { stdout: "ok" }, isError: false }, ctx);
+		// LLM 响应
+		await api.emit("message_end", { message: { role: "assistant", usage: { input: 10, output: 20 }, stopReason: "tool_use" } }, ctx);
+
+		const lines = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n");
+		const events = lines.map((line) => JSON.parse(line));
+		const toolStarted = events.find((e) => e.type === "tool_started");
+		assert.ok(toolStarted, "tool_started logged");
+		assert.equal(toolStarted.tool, "bash");
+		assert.match(toolStarted.args, /npm test/);
+		const toolEnded = events.find((e) => e.type === "tool_ended");
+		assert.ok(toolEnded, "tool_ended logged");
+		assert.equal(toolEnded.isError, false);
+		assert.equal(typeof toolEnded.durationMs, "number");
+		assert.match(toolEnded.result, /ok/);
+		const llm = events.find((e) => e.type === "llm_response");
+		assert.ok(llm, "llm_response logged");
+		assert.equal(llm.stopReason, "tool_use");
+		assert.deepEqual(llm.usage, { input: 10, output: 20 });
+
+		// 心跳：触发捕获的 interval 回调
+		await api.emit("turn_start", { turnIndex: 3, timestamp: Date.now() }, ctx);
+		assert.equal(intervals.length, 1, "heartbeat interval registered");
+		intervals[0]();
+		const heartbeat = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n")
+			.map((line) => JSON.parse(line)).find((e) => e.type === "heartbeat");
+		assert.ok(heartbeat, "heartbeat logged");
+		assert.ok(["thinking", "tool", "waiting", "idle"].includes(heartbeat.phase));
+		assert.equal(typeof heartbeat.tokensUsed, "number");
+	});
+
 	it("synchronously continues the loop at agent_end (print-mode fix)", async () => {
 		// print-mode 的 session.prompt() 只等当前 run 完成；agent_end 的 emit 窗口内
 		// isStreaming=true，同步 sendMessage(followUp) 入队后 agent loop 继续。
