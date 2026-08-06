@@ -364,6 +364,27 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	/** headless 进程退出路径的收尾：不 pauseGoal（不是用户中断），如实写 result。幂等。 */
 	const finalizedHeadlessGoals = new Set<string>();
+	function isHeadlessPrintProcess(): boolean {
+		const args = process.argv.slice(2);
+		if (!args.includes("--goal-run")) return false;
+		if (args.includes("-p") || args.includes("--print")) return true;
+		const modeIndex = args.indexOf("--mode");
+		return args.includes("--mode=json") || (modeIndex >= 0 && args[modeIndex + 1] === "json");
+	}
+
+	function requestHeadlessShutdown(ctx: ExtensionContext): void {
+		ctx.shutdown();
+		// The current pi print-mode host does not bind ExtensionContext.shutdown,
+		// so a completed goal can otherwise leave the process alive after writing
+		// its terminal result. Keep the fallback limited to explicit headless print
+		// invocations; RPC has a real shutdown handler and interactive sessions must
+		// remain open.
+		if (!ctx.hasUI && isHeadlessPrintProcess()) {
+			const exitCode = goal?.status === "complete" ? 0 : 1;
+			setImmediate(() => process.exit(exitCode));
+		}
+	}
+
 	function finalizeHeadless(ctx: ExtensionContext): void {
 		if (!goal?.headless || finalizedHeadlessGoals.has(goal.id)) return;
 		finalizedHeadlessGoals.add(goal.id);
@@ -474,6 +495,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	const telemetryWritten = new Set<string>();
 	function updateState(patch: Partial<GoalState>, ctx: ExtensionContext, options: { preserveFreshEvaluation?: boolean } = {}) {
+		let shutdownHeadless = false;
 		if (!goal) return;
 		const now = nowMs();
 		const previousEvaluation = JSON.stringify(goal.completion.lastEvaluation);
@@ -506,12 +528,17 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			if (patch.status !== "active") {
 				finalizeHeadless(ctx);
 				if (goal.status !== "complete") process.exitCode = 1;
+				shutdownHeadless = !ctx.hasUI;
 			}
 		}
 		updateFooter(ctx);
 		syncFooterTicker(ctx);
 		syncHeadlessHeartbeat(ctx);
 		syncTools();
+		// Headless print/json sessions do not exit merely because a terminal
+		// result was written. Request shutdown only after all terminal state and
+		// timer cleanup has completed; interactive /goal run stays open.
+		if (shutdownHeadless) requestHeadlessShutdown(ctx);
 	}
 
 	function reassessGoalExecution(

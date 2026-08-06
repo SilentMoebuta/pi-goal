@@ -64,9 +64,12 @@ function project() {
 }
 
 function context(cwd: string, api: HeadlessFakeAPI, trusted = true) {
+	const shutdownState = { calls: 0 };
 	return {
 		cwd,
 		hasUI: false,
+		shutdownState,
+		shutdown: () => { shutdownState.calls += 1; },
 		modelRegistry: {
 			find: () => undefined,
 			getApiKeyAndHeaders: async () => ({ ok: false, error: "no test model" }),
@@ -415,6 +418,7 @@ describe("headless goal lifecycle", () => {
 		const last = JSON.parse(logLines[logLines.length - 1]);
 		assert.equal(last.type, "terminal");
 		assert.equal(last.result.status, "unmet");
+		assert.equal(ctx.shutdownState.calls, 1, "terminal headless transition requests process shutdown once");
 		// status 变更日志在 terminal 之前
 		const types = logLines.map((line) => JSON.parse(line).type);
 		assert.ok(types.includes("status"));
