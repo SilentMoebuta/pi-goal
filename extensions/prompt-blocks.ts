@@ -168,6 +168,84 @@ export function superpowersDisciplineBlock(): string {
 	);
 }
 
+export function headlessBlueprintBlock(goal: GoalState): string {
+	const blueprint = goal.blueprint;
+	if (!blueprint) return "";
+	const lines: string[] = ["\n<HEADLESS-BLUEPRINT>"];
+	lines.push("This goal runs headless from a pre-specified blueprint. Treat it as STRONG guidance.");
+	lines.push("If you deviate from any declared item (topology, roles, DAG nodes, evidence expectations, review setup),");
+	lines.push("you MUST call update_goal({ action: \"record_deviation\", subjectId?, description, reason, impact }) as you deviate.");
+	lines.push("Unreported deviations are the one unforgivable failure mode in a headless run.");
+	lines.push("");
+	lines.push("Execution blueprint:");
+	lines.push("- Topology: " + blueprint.execution.topology);
+	if (blueprint.execution.role) lines.push("- Registered role: " + blueprint.execution.role);
+	const roleDefs = blueprint.execution.roleDefs ?? [];
+	for (const roleDef of roleDefs) {
+		const meta = [
+			...(roleDef.tools && roleDef.tools.length > 0 ? ["tools: " + roleDef.tools.join(", ")] : []),
+			...(roleDef.maxTurns ? ["maxTurns: " + roleDef.maxTurns] : []),
+			...(roleDef.model ? ["model: " + roleDef.model] : []),
+		].join("; ");
+		lines.push("- roleDef " + roleDef.name + ": " + roleDef.description + (meta ? " (" + meta + ")" : ""));
+	}
+	const dag = blueprint.execution.dag;
+	if (dag) {
+		lines.push("- DAG (expect to execute with dag_execute, honoring consumers/depends_on):");
+		for (const node of dag.nodes) {
+			const target = node.roleDef ? " via " + node.roleDef : node.role ? " via role " + node.role : " (main agent)";
+			const consumers = node.consumers && node.consumers.length > 0 ? " -> " + node.consumers.join(", ") : "";
+			lines.push("  * " + node.id + target + ": " + node.task + consumers);
+		}
+		if (dag.maxConcurrent) lines.push("- maxConcurrent: " + dag.maxConcurrent);
+	}
+	const evidence = blueprint.evidence;
+	if (evidence && ((evidence.criteria ?? []).length > 0 || (evidence.nodes ?? []).length > 0)) {
+		lines.push("");
+		lines.push("Evidence expectations (diagnostic — gaps appear as advisories, they do not by themselves reject completion):");
+		for (const expectation of evidence.criteria ?? []) {
+			const kinds = expectation.kinds && expectation.kinds.length > 0 ? expectation.kinds.join("/") : "any kind";
+			lines.push("- " + expectation.id + ": " + kinds + " x" + (expectation.minCount ?? 1) + (expectation.verification ? " " + expectation.verification : "") + (expectation.note ? " — " + expectation.note : ""));
+		}
+		for (const node of evidence.nodes ?? []) {
+			lines.push("- node " + node.id + " should produce " + node.evidenceKind + " evidence attached to " + node.attachTo);
+		}
+	}
+	const review = blueprint.review;
+	if (review) {
+		lines.push("");
+		lines.push("Reviewer:");
+		lines.push("- Requirement: " + (review.requirement ?? "advisory"));
+		if (review.checklist.length > 0) {
+			lines.push("- Checklist (spawn the reviewer with these checks):");
+			for (const [index, item] of review.checklist.entries()) lines.push("  " + (index + 1) + ". " + item);
+		}
+		const reviewerMeta = [
+			...(review.model ? ["model: " + review.model] : []),
+			...(review.thinkingLevel ? ["thinking: " + review.thinkingLevel] : []),
+		].join("; ");
+		if (reviewerMeta) lines.push("- " + reviewerMeta);
+	}
+	if (blueprint.verification?.command) {
+		lines.push("");
+		lines.push("Verification command: " + blueprint.verification.command + (blueprint.verification.timeoutMs ? " (timeout " + blueprint.verification.timeoutMs + "ms)" : ""));
+	}
+	lines.push("</HEADLESS-BLUEPRINT>");
+	return lines.join("\n");
+}
+
+/** 每轮续跑：蓝图指令 + 偏离必报要求 + 证据期望 + reviewer checklist。 */
+export function headlessContinuationBlock(goal: GoalState): string {
+	const blueprint = goal.blueprint;
+	if (!blueprint) return "";
+	const block = headlessBlueprintBlock(goal);
+	if (!block) return "";
+	return "\n\n" + block + "\n\n" +
+		"This run is headless: every turn, record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence })" +
+		" so the external caller sees durable progress in the goal log. If you must stop for a user decision," +
+		" call update_goal({ action: \"pause\", reason }) — the run ends and reports instead of waiting silently.\n";
+}
+
 export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG, maxAutoTurns = Number(process.env.GOAL_MAX_AUTO_TURNS) || 200): string {
 	const budgetLine = goal.tokenBudget != null
 		? "- Token budget: " + formatTokens(goal.tokenBudget) + " (" + formatTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) + " remaining)"
@@ -190,6 +268,7 @@ export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT
 			executionDecisionBlock(goal.execution) +
 			reviewerTranscriptContractBlock(goal) +
 			completionFeedbackBlock(goal, config) +
+		headlessContinuationBlock(goal) +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -267,6 +346,7 @@ export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_G
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
 			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind) : "") +
 			executionDecisionBlock(goal.execution) + reviewerTranscriptContractBlock(goal) + completionFeedbackBlock(goal, config) +
+		headlessContinuationBlock(goal) +
 		executionFailureGuidanceBlock();
 }
 

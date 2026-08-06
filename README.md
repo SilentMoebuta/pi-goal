@@ -18,10 +18,32 @@ Adaptive `specialist` and `team` execution integrates with [`pi-roles`](https://
 |---|---|
 | `/goal <objective> [--tokens N]` | Draft a Goal V2 for review. `--tokens 50k` and `--tokens=1m` set an optional token budget. |
 | `/goal` or `/goal status` | Show the unified Goal Progress view: route, outcomes, activity, evidence, assurance, health, and resources. |
+| `/goal run <spec.md>` | Start a goal from a headless blueprint spec (see below; same code path as `--goal-run`). |
+| `/goal apply <spec.md>` | Load and review a goal spec document. |
 | `/goal pause` | Pause the active goal. |
 | `/goal resume` | Resume a paused or limited goal. |
 | `/goal clear` | Remove the current goal. |
 | `/goal help` | Show usage. |
+
+## Headless Blueprint Goals
+
+An external agent or program can run a fully pre-specified goal in a headless pi session, with machine-readable output and a real-time structured log:
+
+```bash
+pi --approve --goal-run spec.md -p "Run the goal defined by --goal-run to completion."
+# result: spec.result.json (terminal state + evidence ledger + completion audit)
+# live:   spec.goal.jsonl (JSONL event stream — tail -f while it runs)
+```
+
+| Flag | Description |
+|---|---|
+| `--goal-run <path>` | Run a goal blueprint spec to completion (no drafting, no review UI). |
+| `--goal-output <path>` | Result JSON path (default `<spec>.result.json`). |
+| `--goal-log <path>` | Real-time JSONL log path (default `<spec>.goal.jsonl`). |
+
+The spec is the existing goal spec markdown plus a `blueprint` machine block that pre-declares everything: execution topology (`direct`/`specialist`/`team`), ad-hoc role definitions (roleDefs, compatible with pi-roles `spawn_role`/`dag_execute`), an optional DAG, per-criterion evidence expectations, reviewer requirement + checklist, deterministic verification command (trusted projects only), and a token budget. Blueprints are **guided**, not strict: the agent follows them as strong instructions and must record every deviation via `update_goal({ action: "record_deviation", ... })`. Deviations, evidence gaps, and the full completion audit land in the result file and the goal log. See `docs/design/2026-08-06-headless-goal-blueprint.md` for the contract.
+
+`update_goal` gains one action: `record_deviation` (subjectId/description/reason/impact), which appends to the goal's deviation ledger (visible in `get_goal` and the result file).
 
 ## Goal Drafts And Routing
 

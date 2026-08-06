@@ -675,3 +675,74 @@ export function adaptStateEvidenceRecord(record: EvidenceRecordV2): EvidenceRef 
 		verification: record.verification,
 	};
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Headless blueprint evidence diagnostics（guided 模式：诊断级，不阻塞完成）
+// ═══════════════════════════════════════════════════════════════════
+// 纯函数：按蓝图声明的证据期望与节点产物要求，机械计算缺失项。
+// 结果以 advisory 形式进入完成评估（不产生 blocking failure）；
+// 将来 strict 模式（blueprint.mandatory）可把同一函数的输出升级为 failures。
+
+export interface BlueprintEvidenceExpectationInput {
+	/** criterion 或 claim 的 id。 */
+	id: string;
+	kinds?: readonly string[];
+	minCount?: number;
+	verification?: "verified" | "unverified";
+}
+
+export interface BlueprintNodeEvidenceInput {
+	/** DAG 节点 id 或 roleDef 名。 */
+	id: string;
+	evidenceKind: EvidenceKind;
+	attachTo: string;
+}
+
+export interface BlueprintEvidenceDiagnosticsInput {
+	criteria: readonly { id: string; evidenceRefs: readonly string[] }[];
+	claims: readonly { id: string; evidenceRefs: readonly string[] }[];
+	evidenceLedger: readonly EvidenceRef[];
+	evidenceSpecs: readonly BlueprintEvidenceExpectationInput[];
+	nodeSpecs: readonly BlueprintNodeEvidenceInput[];
+}
+
+/** 机械计算蓝图证据缺失项，返回 advisory 字符串列表（去重、排序）。 */
+export function computeBlueprintEvidenceDiagnostics(input: BlueprintEvidenceDiagnosticsInput): string[] {
+	const advisories: string[] = [];
+	const ledgerById = new Map(input.evidenceLedger.map((entry) => [entry.id, entry]));
+	const refsById = new Map<string, readonly string[]>();
+	for (const criterion of input.criteria) refsById.set(criterion.id, criterion.evidenceRefs);
+	for (const claim of input.claims) refsById.set(claim.id, claim.evidenceRefs);
+
+	for (const spec of input.evidenceSpecs) {
+		const refs = refsById.get(spec.id) ?? [];
+		const entries = refs.map((ref) => ledgerById.get(ref)).filter((entry): entry is EvidenceRef => entry !== undefined);
+		const kinds = spec.kinds ?? [];
+		const minCount = spec.minCount ?? 1;
+		const matching = kinds.length === 0
+			? entries
+			: entries.filter((entry) => kinds.includes(entry.kind));
+		const verified = matching.filter((entry) => entry.verification === "verified");
+		const sufficient = spec.verification === "verified"
+			? verified.length >= minCount
+			: matching.length >= minCount;
+		if (!sufficient) {
+			const kindLabel = kinds.length > 0 ? kinds.join("/") : "any";
+			const verifyLabel = spec.verification === "verified" ? " verified" : "";
+			advisories.push(
+				`blueprint_evidence_missing: ${spec.id} expects ${kindLabel} x${minCount}${verifyLabel} (found ${matching.length}${spec.verification === "verified" ? `, ${verified.length} verified` : ""})`,
+			);
+		}
+	}
+
+	for (const node of input.nodeSpecs) {
+		const refs = refsById.get(node.attachTo) ?? [];
+		const entries = refs.map((ref) => ledgerById.get(ref)).filter((entry): entry is EvidenceRef => entry !== undefined);
+		const found = entries.some((entry) => entry.kind === node.evidenceKind);
+		if (!found) {
+			advisories.push(`blueprint_node_evidence_missing: node ${node.id} (${node.evidenceKind} on ${node.attachTo})`);
+		}
+	}
+
+	return [...new Set(advisories)].sort();
+}

@@ -37,6 +37,7 @@ import {
 	type AssuranceDecision,
 	type CompletionEvaluation,
 	type CompletionFinding,
+	type DeviationRecord,
 	type EvidenceRef,
 	type ExecutionDecision,
 	type ExecutionPreference,
@@ -61,7 +62,8 @@ import {
 	V2_JUDGE_SYSTEM_PROMPT,
 } from "./completion-runtime-v2";
 import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
-import { proposalToMarkdown, parseGoalSpecMarkdown, slugifyTitle, type SpecCriterion } from "./spec-doc";
+import { GOAL_HEADLESS_EVENT_TYPE, appendGoalLog, buildGoalLogEntry, createGoalFromBlueprint, finalizeHeadlessGoal, validateBlueprint } from "./headless";
+import { proposalToMarkdown, parseGoalSpecMarkdown, parseBlueprint, slugifyTitle, type SpecCriterion } from "./spec-doc";
 import { runJudge, runV2CompletionJudge, type JudgeVerdict } from "./judge";
 import { formatTokens, formatDuration, escapeXml, extractOutputTokens, extractTextContent, isAssistantMessage, GOAL_STORAGE_TYPE, GOAL_EVENT_TYPE, GOAL_CONTINUATION_TYPE, GOAL_JUDGE_TYPE } from "./util";
 import { buildCriteriaBlock, completionFeedbackBlock, reviewerTranscriptDecision, transcriptBindsFinding, assuranceAfterOutcomeMutation, isTerminalGoalStatus, legacyAcceptedEvaluation, reviewerTranscriptContractBlock, superpowersAdaptationBlock, superpowersDisciplineBlock, continuationPrompt, budgetLimitPrompt, goalSystemPrompt } from "./prompt-blocks";
@@ -134,6 +136,21 @@ interface PiGoalRuntimeDependencies {
 }
 
 function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDependencies) {
+	// 测试桩/最小宿主可能没有 registerFlag；headless 启动仅靠 flag 存在时生效。
+	if (typeof pi.registerFlag === "function") {
+		pi.registerFlag("goal-run", {
+			description: "Headless: run a goal blueprint spec to completion (see docs/design/2026-08-06-headless-goal-blueprint.md)",
+			type: "string",
+		});
+		pi.registerFlag("goal-output", {
+			description: "Headless: result JSON path (default <spec>.result.json)",
+			type: "string",
+		});
+		pi.registerFlag("goal-log", {
+			description: "Headless: real-time JSONL log path (default <spec>.goal.jsonl)",
+			type: "string",
+		});
+	}
 	const nowMs = dependencies.now;
 	let goal: GoalState | null = null;
 	let goalConfig: GoalConfig = DEFAULT_GOAL_CONFIG;
@@ -188,6 +205,94 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			{ customType: "pi-goal:diag", content: "[pi-goal] " + reason, display: false, details: { reason, autoTurnCount: goal?.autoTurnCount, noProgressCount: goal?.noProgressCount, status: goal?.status, userSuspended, hasPending: ctx.hasPendingMessages?.() } },
 			{ triggerTurn: false },
 		);
+	}
+
+	/** Headless 实时日志 + 事件回显（仅在 goal.headless 时生效）。 */
+	function goalLog(ctx: ExtensionContext, type: string, payload: Record<string, unknown>): void {
+		if (!goal || !goal.headless) return;
+		const entry = buildGoalLogEntry(goal.id, type, payload, nowMs());
+		appendGoalLog(goal.headless.logPath, entry);
+		pi.sendMessage(
+			{ customType: GOAL_HEADLESS_EVENT_TYPE, content: type, display: false, details: { event: entry } },
+			{ triggerTurn: false },
+		);
+	}
+
+	const budgetWarnedThresholds = new Map<string, Set<number>>();
+	/** 预算渐进提醒：50%/80%/90% 各一次（抄 Codex rollout_budget 的 reminder 思路）。 */
+	function checkBudgetWarnings(ctx: ExtensionContext): void {
+		if (!goal || !goal.headless || goal.tokenBudget == null || goal.tokensUsed <= 0) return;
+		const percent = Math.floor((goal.tokensUsed / goal.tokenBudget) * 100);
+		const warned = budgetWarnedThresholds.get(goal.id) ?? new Set<number>();
+		for (const threshold of [50, 80, 90]) {
+			if (percent >= threshold && !warned.has(threshold)) {
+				warned.add(threshold);
+				goalLog(ctx, "budget_warning", { tokensUsed: goal.tokensUsed, tokenBudget: goal.tokenBudget, percent: threshold });
+			}
+		}
+		budgetWarnedThresholds.set(goal.id, warned);
+	}
+
+	/** 从 spec 文件启动 headless blueprint goal（flag 启动与 /goal run 共用）。 */
+	async function startGoalFromSpecPath(
+		ctx: ExtensionContext,
+		absolutePath: string,
+		options: { confirmIfUI?: boolean; outputPath?: string; logPath?: string } = {},
+	): Promise<{ ok: boolean; error?: string }> {
+		let text: string;
+		try {
+			text = fs.readFileSync(absolutePath, "utf8");
+		} catch {
+			return { ok: false, error: "Cannot read spec file: " + absolutePath };
+		}
+		const parsed = parseGoalSpecMarkdown(text);
+		if (!parsed.ok || !parsed.doc) return { ok: false, error: "Spec parse failed: " + (parsed.error ?? "unknown") };
+		const rawBlueprint = (parsed.doc.machine as { blueprint?: unknown }).blueprint;
+		const blueprintResult = parseBlueprint(rawBlueprint);
+		if (!blueprintResult.ok) return { ok: false, error: "Blueprint invalid: " + blueprintResult.errors.join("; ") };
+		const validation = validateBlueprint(blueprintResult.blueprint, parsed.doc, { trusted: isTrusted(ctx) });
+		if (!validation.ok) return { ok: false, error: validation.errors.join("; ") };
+		if (options.confirmIfUI && ctx.hasUI && goal) {
+			const okConfirm = await ctx.ui.confirm(
+				"Replace current goal?",
+				"Starting a blueprint goal will replace the current goal (status: " + goal.status + ").",
+			);
+			if (!okConfirm) return { ok: false, error: "Cancelled by user." };
+		}
+		if (goal?.status === "active") {
+			updateState({ status: "blocked", blocker: "Replaced by new goal" }, ctx);
+		}
+		const now = nowMs();
+		const specBase = absolutePath.replace(/\.md$/i, "");
+		const newGoal = createGoalFromBlueprint({
+			id: randomUUID(),
+			doc: parsed.doc,
+			blueprint: blueprintResult.blueprint,
+			specPath: absolutePath,
+			outputPath: options.outputPath ?? specBase + ".result.json",
+			logPath: options.logPath ?? specBase + ".goal.jsonl",
+			now,
+		});
+		goal = newGoal;
+		progressRuntime.reset(now, newGoal.progress.lastOutcomeDeltaAt);
+		lastOutcomeSignature = outcomeSignature(newGoal);
+		currentTurn = null;
+		userSuspended = false;
+		continuationQueued = false;
+		persist("set");
+		updateFooter(ctx);
+		syncFooterTicker(ctx);
+		syncTools();
+		goalLog(ctx, "goal_started", {
+			objective: newGoal.objective,
+			topology: newGoal.execution.selected,
+			criteriaCount: newGoal.criteria.length,
+			tokenBudget: newGoal.tokenBudget,
+		});
+		// 不立即 sendContinuation：headless print 模式下初始 prompt 的 run 可能已在
+		// 处理中，此时 followUp 会被拒（"Agent is already processing"）。初始 turn
+		// 结束后的 agent_end → scheduleContinuation 会自然启动续跑循环。
+		return { ok: true };
 	}
 
 	function persist(action: GoalSnapshotActionV2) {
@@ -286,6 +391,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!goal) return;
 		const now = nowMs();
 		const previousEvaluation = JSON.stringify(goal.completion.lastEvaluation);
+		const previousStatus = goal.status;
 		if (patch.status && patch.status !== "active") {
 			settleCurrentTurnTime(now);
 			progressRuntime.turnEnded(now);
@@ -306,6 +412,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			options.preserveFreshEvaluation === true,
 		);
 		persist("update");
+		// Headless：状态变更日志 + 非 active 状态收尾（写 result + terminal 日志 + 退出码）。
+		if (goal.headless && patch.status && patch.status !== previousStatus) {
+			if (patch.status === "paused") goalLog(ctx, "paused", { reason: goal.pausedReason ?? "unknown" });
+			else if (patch.status === "active" && previousStatus === "paused") goalLog(ctx, "resumed", {});
+			else goalLog(ctx, "status", { status: goal.status, pausedReason: goal.pausedReason, blocker: goal.blocker });
+			if (patch.status !== "active") {
+				finalizeHeadlessGoal(goal, now);
+				if (goal.status !== "complete") process.exitCode = 1;
+			}
+		}
 		updateFooter(ctx);
 		syncFooterTicker(ctx);
 		syncTools();
@@ -643,9 +759,33 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		observedRoleCatalog = null;
 		// Load project-local config (opt out of superpowers integration).
 		goalConfig = loadGoalConfig(ctx.cwd, isTrusted(ctx));
-		reconstruct(ctx);
-		syncTools();
-		if (goal?.status === "active") {
+	reconstruct(ctx);
+	syncTools();
+	const goalRunFlag = typeof pi.getFlag === "function" ? pi.getFlag("goal-run") : undefined;
+	let goalStartedFromFlag = false;
+	if (typeof goalRunFlag === "string" && goalRunFlag.trim() && !goal) {
+		const goalRunPath = goalRunFlag.trim();
+		const absolutePath = path.isAbsolute(goalRunPath) ? goalRunPath : path.join(ctx.cwd, goalRunPath);
+		const outputFlag = typeof pi.getFlag === "function" ? pi.getFlag("goal-output") : undefined;
+		const logFlag = typeof pi.getFlag === "function" ? pi.getFlag("goal-log") : undefined;
+		const resolvePath = (value: unknown): string | undefined => {
+			if (typeof value !== "string" || !value.trim()) return undefined;
+			const trimmed = value.trim();
+			return path.isAbsolute(trimmed) ? trimmed : path.join(ctx.cwd, trimmed);
+		};
+		const started = await startGoalFromSpecPath(ctx, absolutePath, {
+			confirmIfUI: false,
+			outputPath: resolvePath(outputFlag),
+			logPath: resolvePath(logFlag),
+		});
+		if (!started.ok) {
+			console.error("[pi-goal] " + started.error);
+			ctx.ui?.notify?.("Headless goal failed to start: " + started.error, "error");
+			process.exitCode = 1;
+		}
+		goalStartedFromFlag = started.ok;
+	}
+	if (goal?.status === "active" && !goalStartedFromFlag) {
 			updateState({ status: "paused", pausedReason: "session reload" }, ctx);
 			ctx.ui.notify("\u23F8 Goal paused (session reload): " + goal.objective.slice(0, 80) + "\u2026\nUse /goal resume to continue.", "info");
 		} else if (goal) {
@@ -662,6 +802,11 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		clearTimer();
 		clearFooterTicker();
 		if (settleCurrentTurnTime() && goal) persist("usage");
+		if (goal?.headless && goal.status === "active") {
+			// 进程退出时 active 的 headless goal 尽力收尾（status=interrupted 语义由调用方读 result 判断）。
+			finalizeHeadlessGoal(goal, nowMs());
+			process.exitCode = 1;
+		}
 		currentTurn = null;
 		progressRuntime.turnEnded(nowMs());
 		updateFooter(ctx);
@@ -791,7 +936,53 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			goal.autoTurnCount += 1;
 		}
 		if (isAssistantMessage(event.message)) lastAssistantText = extractTextContent(event.message);
-			if (goal.status === "active" && goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) {
+		// Headless 模式：run 内的每轮 turn 都评估 pending 的完成请求。print 模式下
+		// agent_end 只在整个 run 结束时触发，若无此路径，agent 请求完成评估后永远
+		// 得不到 judge 反馈，会在初始 run 里无限循环。
+		if (goal.headless && goal.status === "active") {
+			const headlessPolicy = goalConfig.completionPolicy ?? "v2";
+			const headlessPending = headlessPolicy !== "legacy" && hasPendingCompletionRequest(goal);
+			if (headlessPending) {
+				const verification = goalConfig.verifyCommand
+					? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
+					: undefined;
+				progressRuntime.evaluationStarted(nowMs());
+				const v2Run = await runV2CompletionJudge(goal, lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)", ctx, pi, goalConfig, verification, dependencies.complete);
+				progressRuntime.evaluationEnded(nowMs());
+				updateFooter(ctx);
+				const transition = applyAuthoritativeCompletionEvaluation(goal, v2Run.evaluation);
+				goalLog(ctx, "completion_evaluated", {
+					decision: transition.completion.lastEvaluation?.decision ?? null,
+					findings: transition.completion.lastEvaluation?.findings ?? [],
+					advisories: transition.completion.lastEvaluation?.advisories ?? [],
+				});
+				if (transition.status === "complete") {
+					updateState({ status: "complete", completion: transition.completion, noProgressCount: 0 }, ctx);
+					pi.sendMessage({
+						customType: GOAL_EVENT_TYPE,
+						content: "Goal achieved! \u2705\n\nObjective: " + goal.objective +
+							"\nEvaluator: Goal V2 accepted the persisted evidence packet (evaluated at turn end)." +
+							"\nTokens: " + formatTokens(goal.tokensUsed) + "\nTime: " + formatDuration(goal.timeUsedMs),
+						display: true,
+						details: { kind: "complete", goal: { ...goal, status: "complete" }, progress: progressFor(goal) },
+					}, { triggerTurn: false });
+					return;
+				}
+				if (transition.status === "paused") {
+					updateState({
+						status: "paused",
+						completion: transition.completion,
+						pausedReason: transition.pausedReason,
+						noProgressCount: 0,
+					}, ctx);
+					clearTimer();
+					userSuspended = true;
+					return;
+				}
+				updateState({ completion: transition.completion, noProgressCount: 0 }, ctx);
+			}
+		}
+		if (goal.status === "active" && goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) {
 				const completionPolicy = goalConfig.completionPolicy ?? "v2";
 				const pendingV2Request = completionPolicy === "v2" && hasPendingCompletionRequest(goal);
 				if (pendingV2Request) {
@@ -844,6 +1035,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			return;
 		}
 		if (settlement.time.applied || settlement.tokens.applied) persist("usage");
+		if (goal.headless) {
+			goalLog(ctx, "turn_settled", { tokensUsed: goal.tokensUsed, activeMs: goal.timeUsedMs, noProgressCount: goal.noProgressCount, autoTurnCount: goal.autoTurnCount });
+			checkBudgetWarnings(ctx);
+		}
 		updateFooter(ctx);
 		syncFooterTicker(ctx);
 	});
@@ -896,6 +1091,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
 				if (completionPolicy === "shadow") {
 					updateState({ completion: applyShadowCompletionEvaluation(goal, v2Run.evaluation) }, ctx);
+					goalLog(ctx, "completion_evaluated", { decision: goal.completion.lastEvaluation?.decision ?? null, findings: goal.completion.lastEvaluation?.findings ?? [], advisories: goal.completion.lastEvaluation?.advisories ?? [] });
 				} else {
 					const transition = applyAuthoritativeCompletionEvaluation(goal, v2Run.evaluation);
 					if (transition.status === "complete") {
@@ -923,6 +1119,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						return;
 					}
 					updateState({ completion: transition.completion, noProgressCount: 0 }, ctx);
+					goalLog(ctx, "completion_evaluated", { decision: transition.completion.lastEvaluation?.decision ?? null, findings: transition.completion.lastEvaluation?.findings ?? [], advisories: transition.completion.lastEvaluation?.advisories ?? [] });
 					if (transition.rejectionAction === "replan") {
 						ctx.ui?.notify?.("Completion was rejected again; the next turn must change verification strategy or replan.", "warning");
 					}
@@ -1097,6 +1294,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				taskKind: goal.taskKind,
 				criteria: goal.criteria.map(({ id, description, level, evidenceRefs }) => ({ id, description, level, evidenceRefs })),
 				constraints: goal.constraints,
+				deviations: goal.deviations,
+				...(goal.blueprint ? { blueprint: goal.blueprint } : {}),
+				...(goal.headless ? { headless: goal.headless } : {}),
 				execution: goal.execution,
 				assurance: goal.assurance,
 				claims: goal.claims,
@@ -1116,7 +1316,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		name: "update_goal", label: "Update Goal",
 		description: "Apply exactly one Goal V2 action. Legacy flat arguments remain accepted for one compatibility cycle.",
 		parameters: Type.Object({
-			action: Type.Optional(StringEnum(["record_evidence", "upsert_claim", "request_completion", "record_review", "change_execution", "mark_unmet"] as const)),
+			action: Type.Optional(StringEnum(["record_evidence", "upsert_claim", "request_completion", "record_review", "change_execution", "mark_unmet", "pause", "record_deviation"] as const)),
 			status: Type.Optional(StringEnum(["complete", "unmet"] as const)),
 				evidence: Type.Optional(Type.Union([Type.String(), Type.Object({
 				id: Type.Optional(Type.String()),
@@ -1131,6 +1331,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				})])),
 				evidenceId: Type.Optional(Type.String({ description: "Reuse an existing ledger entry by ID when evidence is omitted." })),
 				blocker: Type.Optional(Type.String({ description: "Required for unmet." })),
+				subjectId: Type.Optional(Type.String({ description: "For action=record_deviation: criterion/claim or blueprint node id this deviation touches." })),
+				description: Type.Optional(Type.String({ description: "For action=record_deviation: what deviated from the blueprint." })),
+				reason: Type.Optional(Type.String({ description: "For action=record_deviation: why the deviation was necessary." })),
+				impact: Type.Optional(Type.String({ description: "For action=record_deviation: impact on acceptance criteria." })),
 				criterionId: Type.Optional(Type.String({ description: "ID of criterion for per-criterion evidence." })),
 				criterionIds: Type.Optional(Type.Array(Type.String())),
 				claimId: Type.Optional(Type.String()),
@@ -1335,6 +1539,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 								...(conflictExecution ? { execution: conflictExecution } : {}),
 								...(nextAssurance !== goal.assurance ? { assurance: nextAssurance } : {}),
 						}, ctx);
+					goalLog(ctx, "evidence_recorded", { entry: record, criterionIds: action.criterionIds, claimIds: action.claimIds });
 					return {
 						content: [{ type: "text", text: "Evidence recorded: " + record.id + (conflicts.length > 0 ? " (conflict diagnostics recorded)" : "") }],
 						details: { evidenceId: record.id, criterionIds: action.criterionIds, claimIds: action.claimIds, conflicts },
@@ -1367,6 +1572,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						(goal.completion.lastEvaluation?.evaluatedAt ?? -1) + 1,
 					);
 					updateState({ completion: { ...goal.completion, summary: action.summary, requestedAt } }, ctx);
+					goalLog(ctx, "completion_requested", { summary: action.summary });
 					return { content: [{ type: "text", text: "Completion evaluation requested." }], details: { requestedAt } };
 				}
 
@@ -1445,6 +1651,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 							completion: transition.completion,
 							...(transition.status === "paused" ? { status: "paused", pausedReason: transition.pausedReason } : {}),
 						}, ctx);
+						goalLog(ctx, "review_recorded", { status: "failed", findings: action.review.findings.length, advisories: action.review.advisories.length });
 						if (transition.status === "paused") {
 							clearTimer();
 							userSuspended = true;
@@ -1458,6 +1665,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						assurance: { ...goal.assurance, reviewStatus: "passed" },
 						completion: { ...goal.completion, lastEvaluation: evaluation, rejectionCount: 0 },
 					}, ctx);
+					goalLog(ctx, "review_recorded", { status: "passed", findings: action.review.findings.length, advisories: action.review.advisories.length });
 					return { content: [{ type: "text", text: "Independent review recorded: passed" }], details: { evaluation } };
 				}
 
@@ -1501,6 +1709,25 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					pauseGoal(action.reason, ctx);
 					ctx.ui?.notify?.("Goal paused: needs your input — " + action.reason, "warning");
 					return { content: [{ type: "text", text: "Goal paused for user input: " + action.reason + " (reply to resume with guidance, or /goal resume)" }], details: { status: "paused", reason: action.reason } };
+				}
+				if (action.action === "record_deviation") {
+					const deviation: DeviationRecord = {
+						id: "d" + randomUUID().slice(0, 6),
+						...(action.subjectId ? { subjectId: action.subjectId } : {}),
+						description: action.description,
+						reason: action.reason,
+						...(action.impact ? { impact: action.impact } : {}),
+						recordedAt: nowMs(),
+						origin: "agent",
+					};
+					// 有限账本：超出 20 条折叠（防失控）。
+					const capped = [...goal.deviations, deviation].slice(-20);
+					updateState({ deviations: capped }, ctx);
+					goalLog(ctx, "deviation_recorded", { deviation });
+					return {
+						content: [{ type: "text", text: "Deviation recorded: " + deviation.id + " — " + deviation.description }],
+						details: { deviation },
+					};
 				}
 				updateState({ status: "unmet", blocker: action.blocker, noProgressCount: 0 }, ctx);
 				return { content: [{ type: "text", text: "Goal marked unmet: " + action.blocker }], details: { status: "unmet" } };
@@ -1954,6 +2181,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			}
 			if (trimmed === "help") {
 				ctx.ui.notify("/goal <objective> [--tokens N] — set a goal\n/goal status — show current goal\n/goal apply <path> — load & review a goal spec md\n/goal telemetry — show completed goal statistics\n/goal pause — pause\n/goal resume — resume\n/goal clear — remove", "info");
+				return;
+			}
+			if (trimmed.startsWith("run ")) {
+				// 交互式补充入口：与 --goal-run flag 完全同一条代码路径。
+				const filePath = trimmed.slice("run ".length).trim();
+				if (!filePath) { ctx.ui.notify("Usage: /goal run <path-to-spec.md>", "warning"); return; }
+				const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(ctx.cwd, filePath);
+				const started = await startGoalFromSpecPath(ctx, absolutePath, { confirmIfUI: true });
+				if (!started.ok) ctx.ui.notify("Blueprint goal failed to start: " + started.error, "error");
 				return;
 			}
 			if (trimmed.startsWith("apply ")) {

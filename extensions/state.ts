@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { parseBlueprint, type HeadlessBlueprint } from "./spec-doc";
 
 export const GOAL_SNAPSHOT_SCHEMA_VERSION = 2 as const;
 export const SHADOW_COMPLETION_ADVISORY = "completionPolicy=shadow: this evaluation is durable audit data but was not authoritative for completion.";
@@ -199,6 +200,27 @@ export interface GoalMigrationV2 {
 	warnings: string[];
 }
 
+/** 蓝图偏离记录（guided 模式信任机制：偏离不可怕，不报告的偏离才可怕）。 */
+export interface DeviationRecord {
+	id: string;
+	/** 可空；指向 criterion/claim id 或蓝图节点 id。 */
+	subjectId?: string;
+	description: string;
+	reason: string;
+	/** 对验收标准的影响（无/部分/风险…）。 */
+	impact?: string;
+	recordedAt: number;
+	origin: "agent" | "user";
+}
+
+/** headless 运行元数据（结果/日志写入路径）。 */
+export interface GoalHeadlessMeta {
+	specPath: string;
+	outputPath: string;
+	logPath: string;
+	startedAt: number;
+}
+
 export interface GoalStateV2 {
 	id: string;
 	objective: string;
@@ -223,6 +245,12 @@ export interface GoalStateV2 {
 	assurance: AssuranceDecision;
 	completion: GoalCompletionV2;
 	progress: GoalOutcomeProgressV2;
+	/** 蓝图偏离账本（不入证据账本，避免污染 criterion 证据语义）。 */
+	deviations: DeviationRecord[];
+	/** Headless 蓝图（guided 模式：强指令 + 诊断期望）。 */
+	blueprint?: HeadlessBlueprint;
+	/** headless 运行元数据；仅 --goal-run 启动的 goal 携带。 */
+	headless?: GoalHeadlessMeta;
 	migration: GoalMigrationV2 | null;
 }
 
@@ -559,6 +587,39 @@ function parseMigration(value: unknown, path: string): GoalMigrationV2 | null {
 	return { fromSchemaVersion: 1, warnings: stringArray(object.warnings, path + ".warnings") };
 }
 
+function parseDeviation(value: unknown, path: string): DeviationRecord {
+	const object = asObject(value, path);
+	const subjectId = optionalString(object.subjectId, path + ".subjectId");
+	const impact = optionalString(object.impact, path + ".impact");
+	return {
+		id: asString(object.id, path + ".id"),
+		...(subjectId === undefined ? {} : { subjectId }),
+		description: asString(object.description, path + ".description"),
+		reason: asString(object.reason, path + ".reason"),
+		...(impact === undefined ? {} : { impact }),
+		recordedAt: finiteNonNegative(object.recordedAt, path + ".recordedAt"),
+		origin: asEnum(object.origin, ["agent", "user"] as const, path + ".origin"),
+	};
+}
+
+function parseStoredBlueprint(value: unknown, path: string): HeadlessBlueprint {
+	const parsed = parseBlueprint(value);
+	if (!parsed.ok) {
+		throw new SnapshotValidationError(path + " " + parsed.errors.join("; "));
+	}
+	return parsed.blueprint;
+}
+
+function parseHeadlessMeta(value: unknown, path: string): GoalHeadlessMeta {
+	const object = asObject(value, path);
+	return {
+		specPath: asString(object.specPath, path + ".specPath"),
+		outputPath: asString(object.outputPath, path + ".outputPath"),
+		logPath: asString(object.logPath, path + ".logPath"),
+		startedAt: finiteNonNegative(object.startedAt, path + ".startedAt"),
+	};
+}
+
 function ensureUnique(values: readonly string[], path: string): void {
 	const seen = new Set<string>();
 	for (const value of values) {
@@ -728,6 +789,12 @@ function parseGoalState(value: unknown, path: string): GoalStateV2 {
 	const evidenceLedger = object.evidenceLedger.map((item, index) => parseEvidenceRef(item, `${path}.evidenceLedger[${index}]`));
 	const assurance = parseAssurance(object.assurance, path + ".assurance");
 	const completion = parseCompletion(object.completion, path + ".completion");
+	const deviations = object.deviations === undefined ? [] : (() => {
+		if (!Array.isArray(object.deviations)) throw new SnapshotValidationError(path + ".deviations must be an array");
+		return object.deviations.map((item, index) => parseDeviation(item, `${path}.deviations[${index}]`));
+	})();
+	const blueprint = object.blueprint === undefined ? undefined : parseStoredBlueprint(object.blueprint, path + ".blueprint");
+	const headless = object.headless === undefined ? undefined : parseHeadlessMeta(object.headless, path + ".headless");
 	const goal: GoalStateV2 = {
 		id: asString(object.id, path + ".id"),
 		objective: asString(object.objective, path + ".objective"),
@@ -751,6 +818,9 @@ function parseGoalState(value: unknown, path: string): GoalStateV2 {
 		assurance,
 		completion,
 		progress: parseOutcomeProgress(object.progress, path + ".progress", { createdAt, endedAt, evidenceLedger, assurance, completion }),
+		deviations,
+		...(blueprint === undefined ? {} : { blueprint }),
+		...(headless === undefined ? {} : { headless }),
 		migration: parseMigration(object.migration, path + ".migration"),
 	};
 	if (goal.progress.lastOutcomeDeltaAt < goal.createdAt || goal.progress.lastOutcomeDeltaAt > goal.updatedAt) {
@@ -981,6 +1051,7 @@ function migrateLegacyGoal(value: unknown): { goal: GoalStateV2; warnings: strin
 			rejectionCount: rejectionHistory.length,
 		},
 		progress: { outcomeRevision: 0, lastOutcomeDeltaAt: updatedAt, lastEvaluatedOutcomeRevision: lastEvaluation ? 0 : null },
+		deviations: [],
 		migration: { fromSchemaVersion: 1, warnings: [...warnings] },
 	};
 	validateReferences(goal);
@@ -1068,6 +1139,10 @@ export interface CreateGoalStateV2Input {
 	execution: ExecutionDecision;
 	assurance: AssuranceDecision;
 	tokenBudget?: number | null;
+	/** Headless 蓝图（guided 模式）。 */
+	blueprint?: HeadlessBlueprint;
+	/** headless 运行元数据。 */
+	headless?: GoalHeadlessMeta;
 	now: number;
 }
 
@@ -1102,6 +1177,9 @@ export function createGoalStateV2(input: CreateGoalStateV2Input): GoalStateV2 {
 		assurance: input.assurance,
 		completion: { summary: null, requestedAt: null, lastEvaluation: null, rejectionHistory: [], rejectionCount: 0 },
 		progress: { outcomeRevision: 0, lastOutcomeDeltaAt: input.now, lastEvaluatedOutcomeRevision: null },
+		deviations: [],
+		...(input.blueprint === undefined ? {} : { blueprint: input.blueprint }),
+		...(input.headless === undefined ? {} : { headless: input.headless }),
 		migration: null,
 	};
 	return parseGoalState(raw, "goal");

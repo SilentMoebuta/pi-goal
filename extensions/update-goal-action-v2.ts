@@ -21,7 +21,8 @@ export type UpdateGoalActionName =
 	| "record_review"
 	| "change_execution"
 	| "mark_unmet"
-	| "pause";
+	| "pause"
+	| "record_deviation";
 
 export interface RecordEvidenceAction {
 	action: "record_evidence";
@@ -75,6 +76,16 @@ export interface PauseGoalAction {
 	reason: string;
 }
 
+export interface RecordDeviationAction {
+	action: "record_deviation";
+	/** 可空；指向 criterion/claim id 或蓝图节点 id。 */
+	subjectId?: string;
+	description: string;
+	reason: string;
+	/** 对验收标准的影响（无/部分/风险…）。 */
+	impact?: string;
+}
+
 export type NormalizedUpdateGoalAction =
 	| RecordEvidenceAction
 	| UpsertClaimAction
@@ -82,7 +93,8 @@ export type NormalizedUpdateGoalAction =
 	| RecordReviewAction
 	| ChangeExecutionAction
 	| MarkUnmetAction
-	| PauseGoalAction;
+	| PauseGoalAction
+	| RecordDeviationAction;
 
 export type NormalizeUpdateGoalActionResult =
 	| { ok: true; action: NormalizedUpdateGoalAction; legacy: boolean; warnings: string[] }
@@ -100,6 +112,7 @@ const ACTIONS = new Set<UpdateGoalActionName>([
 	"change_execution",
 	"mark_unmet",
 	"pause",
+	"record_deviation",
 ]);
 const EVIDENCE_KINDS = new Set<EvidenceKind>([
 	"source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text",
@@ -181,6 +194,8 @@ function inferredActions(raw: Record<string, unknown>): Set<UpdateGoalActionName
 		|| raw.reasons !== undefined) result.add("change_execution");
 	if (raw.blocker !== undefined || raw.status === "unmet") result.add("mark_unmet");
 	if (raw.action === "pause" || raw.pausedReason !== undefined) result.add("pause");
+	// record_deviation 无 legacy 扁平形式：只接受显式 action（避免与旧字段误判）。
+	if (raw.action === "record_deviation") result.add("record_deviation");
 	return result;
 }
 
@@ -489,7 +504,32 @@ function parseAction(raw: Record<string, unknown>, action: UpdateGoalActionName,
 		case "change_execution": return parseChangeExecution(raw);
 		case "mark_unmet": return { action: "mark_unmet", blocker: requiredString(raw.blocker, "blocker") };
 		case "pause": return { action: "pause", reason: requiredString(raw.reason, "reason") };
+		case "record_deviation": return parseRecordDeviation(raw);
 	}
+}
+
+const DEVIATION_MAX = { description: 500, reason: 1000, impact: 500, subjectId: 100 } as const;
+
+function boundedString(value: unknown, field: string, max: number): string {
+	const parsed = requiredString(value, field);
+	if (parsed.length > max) throw new ActionValidationError(`${field} must be at most ${max} characters`);
+	return parsed;
+}
+
+function parseRecordDeviation(raw: Record<string, unknown>): RecordDeviationAction {
+	const subjectId = raw.subjectId === undefined
+		? undefined
+		: boundedString(raw.subjectId, "subjectId", DEVIATION_MAX.subjectId);
+	const impact = raw.impact === undefined
+		? undefined
+		: boundedString(raw.impact, "impact", DEVIATION_MAX.impact);
+	return {
+		action: "record_deviation",
+		...(subjectId === undefined ? {} : { subjectId }),
+		description: boundedString(raw.description, "description", DEVIATION_MAX.description),
+		reason: boundedString(raw.reason, "reason", DEVIATION_MAX.reason),
+		...(impact === undefined ? {} : { impact }),
+	};
 }
 
 /** Normalize one atomic update_goal mutation. Multiple action families are rejected before parsing. */
