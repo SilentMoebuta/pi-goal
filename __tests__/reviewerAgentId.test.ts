@@ -150,6 +150,21 @@ describe("verifyReviewerSource — G3 决策：编造 verdict 被拒 (教训6 �
 		assert.equal(r.ok, true);
 	});
 
+	it("accepts the specialized report-reviewer role under the reviewer provenance contract", () => {
+		const r = verifyReviewerSource("sub_1_0", "/path/s.jsonl", {
+			found: true,
+			findings: ["✅ Ready"],
+			spawnedSession: true,
+			parentSession: "/path/parent.jsonl",
+			sessionId: "child-session",
+			provenance: {
+				schemaVersion: 1, agentId: "sub_1_0", role: "report-reviewer",
+				sessionId: "child-session", parentSession: "/path/parent.jsonl",
+			},
+		}, { parentSession: "/path/parent.jsonl", role: "reviewer", sessionId: "child-session" });
+		assert.equal(r.ok, true);
+	});
+
 	it("rejects a plausible agent id when the transcript is not a child session", () => {
 		const r = verifyReviewerSource("sub_1_0", "/path/s.jsonl", {
 			found: true,

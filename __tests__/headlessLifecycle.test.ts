@@ -201,8 +201,14 @@ describe("headless goal lifecycle", () => {
 			toolCallId: "spawn-1", toolName: "spawn_role",
 			partialResult: { details: { kind: "subagent-progress", id: "sub-1", role: "report-reviewer", sessionFile: "/child.jsonl", phase: "tool", turnCount: 2, tool: "read", lastActivityAt: Date.now() } },
 		}, ctx);
+		await api.emit("tool_execution_update", {
+			toolCallId: "spawn-1", toolName: "spawn_role",
+			partialResult: { details: { kind: "subagent-progress", id: "sub-1", role: "report-reviewer", sessionFile: "/child.jsonl", phase: "tool", turnCount: 2, tool: "read", lastActivityAt: Date.now() } },
+		}, ctx);
 		const lines = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-		const started = lines.find((entry) => entry.type === "subagent_started");
+		const nested = lines.filter((entry) => entry.type === "subagent_started" || entry.type === "subagent_progress");
+		assert.equal(nested.length, 1, "identical nested progress is deduplicated");
+		const started = nested[0];
 		assert.equal(started.agentId, "sub-1");
 		assert.equal(started.tool, "read");
 		assert.equal("args" in started, false, "nested progress remains sanitized");

@@ -440,6 +440,12 @@ export interface ReviewerSourceExpectation {
 	sessionId?: string;
 }
 
+/** Registered report reviewers are specialized reviewer roles. They retain
+ * the same provenance contract as the generic reviewer role. */
+function reviewerRoleMatches(actual: string, expected: ReviewerSourceExpectation["role"]): boolean {
+	return actual === expected || (expected === "reviewer" && actual === "report-reviewer");
+}
+
 export function extractReviewerFindings(jsonlText: string): ReviewerTranscriptEvidence {
 	if (!jsonlText || jsonlText.trim().length === 0) return { found: false, spawnedSession: false };
 	const lines = jsonlText.split("\n");
@@ -550,8 +556,8 @@ export function verifyReviewerSource(
 		if (provenance.agentId !== agentId) {
 			return { ok: false, reason: "Reviewer agentId does not match the trusted child-session provenance." };
 		}
-		if (provenance.role !== expected.role) {
-			return { ok: false, reason: "The supplied child session was spawned as role '" + provenance.role + "', not reviewer." };
+		if (!reviewerRoleMatches(provenance.role, expected.role)) {
+			return { ok: false, reason: "The supplied child session was spawned as role '" + provenance.role + "', not reviewer or report-reviewer." };
 		}
 		if (provenance.sessionId !== extracted.sessionId || (expected.sessionId && expected.sessionId !== extracted.sessionId)) {
 			return { ok: false, reason: "Reviewer sessionId does not match its header/provenance." };

@@ -1024,7 +1024,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			};
 			headlessSubagents.set(agentId, child);
 			const terminal = child.phase === "completed" || child.phase === "error";
-			goalLog(ctx, !previous ? "subagent_started" : terminal ? "subagent_completed" : "subagent_progress", {
+			const changed = !previous
+				|| previous.role !== child.role
+				|| previous.sessionFile !== child.sessionFile
+				|| previous.phase !== child.phase
+				|| previous.turnCount !== child.turnCount
+				|| previous.tool !== child.tool;
+			// pi-roles may emit the same sanitized state repeatedly while a child
+			// is thinking. Persist only semantic transitions; heartbeats retain the
+			// latest activity for observers without inflating the JSONL log.
+			if (changed || terminal) goalLog(ctx, !previous ? "subagent_started" : terminal ? "subagent_completed" : "subagent_progress", {
 				agentId,
 				role: child.role ?? null,
 				sessionFile: child.sessionFile ?? null,
