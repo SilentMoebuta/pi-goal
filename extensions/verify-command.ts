@@ -41,6 +41,13 @@ export interface VerifyResult {
  *  must not flood the judge prompt / session entry with output. */
 const VERIFY_MAX_OUTPUT = 2_000;
 
+/** Stream cap guard: stop accumulating beyond the cap so a chatty command
+ *  cannot grow memory without bound before close/timeout (audit finding). */
+function appendCapped(buffer: string, chunk: string, max = VERIFY_MAX_OUTPUT): string {
+	if (buffer.length >= max) return buffer;
+	return (buffer + chunk).slice(0, max);
+}
+
 function truncate(s: string): string {
 	return s.length > VERIFY_MAX_OUTPUT ? s.slice(0, VERIFY_MAX_OUTPUT) : s;
 }
@@ -86,8 +93,8 @@ export async function runVerifyCommand(cmd: string, timeoutMs = 120_000): Promis
 			finish({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: truncate(stderr) + (stderr ? "\n" : "") + "verify command timed out after " + timeoutMs + "ms" });
 		}, timeoutMs);
 
-		child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
-		child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+		child.stdout?.on("data", (d: Buffer) => { stdout = appendCapped(stdout, d.toString()); });
+		child.stderr?.on("data", (d: Buffer) => { stderr = appendCapped(stderr, d.toString()); });
 		child.on("error", (e) => {
 			finish({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: "verify command failed to spawn: " + e.message });
 		});
