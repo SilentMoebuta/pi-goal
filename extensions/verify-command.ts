@@ -62,11 +62,14 @@ export async function runVerifyCommand(cmd: string, timeoutMs = 120_000): Promis
 		let settled = false;
 		let stdout = "";
 		let stderr = "";
+		// Declared before spawn so a synchronous spawn throw cannot hit the TDZ:
+		// finish() clears it even when spawn never started (audit finding).
+		let timer: ReturnType<typeof setTimeout> | undefined;
 
 		const finish = (result: VerifyResult): void => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
+			if (timer) clearTimeout(timer);
 			resolve(result);
 		};
 
@@ -78,7 +81,7 @@ export async function runVerifyCommand(cmd: string, timeoutMs = 120_000): Promis
 			return;
 		}
 
-		const timer = setTimeout(() => {
+		timer = setTimeout(() => {
 			try { child.kill("SIGKILL"); } catch { /* already dead */ }
 			finish({ ok: false, exitCode: null, stdout: truncate(stdout), stderr: truncate(stderr) + (stderr ? "\n" : "") + "verify command timed out after " + timeoutMs + "ms" });
 		}, timeoutMs);

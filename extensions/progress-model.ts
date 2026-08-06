@@ -191,6 +191,75 @@ function nonNegativeInteger(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+function collectNodeStatuses(nodes: Record<string, DagNodeLike>): Map<string, string> {
+	const statuses = new Map<string, string>();
+	for (const [id, node] of Object.entries(nodes)) {
+		const candidate = stringValue(objectValue(node)?.status);
+		statuses.set(id, candidate && DAG_STATES.has(candidate) ? candidate : "queued");
+	}
+	return statuses;
+}
+
+function depsOf(node: DagNodeLike | undefined, originalNode: unknown): string[] {
+	const direct = stringList(objectValue(node)?.deps);
+	return direct.length > 0 ? direct : stringList(objectValue(originalNode)?.depends_on);
+}
+
+function countByStatus(statuses: Map<string, string>, status: string): number {
+	let count = 0;
+	for (const value of statuses.values()) if (value === status) count += 1;
+	return count;
+}
+
+interface DagFrontierProjection {
+	running: string[];
+	ready: string[];
+	blocked: string[];
+	critical: string[];
+	waitingOn: Record<string, string[]>;
+	/** ids with terminal states, only available when the event carries a frontier. */
+	settledIds: string[];
+	failedIds: string[];
+}
+
+function projectDagFrontier(
+	nodes: Record<string, DagNodeLike>,
+	statuses: Map<string, string>,
+	originalNodes: Record<string, unknown>,
+	source: Record<string, unknown>,
+	active: boolean,
+): DagFrontierProjection {
+	const frontier = objectValue(source.frontier);
+	const knownIds = (value: unknown) => [...new Set(stringList(value).filter((id) => statuses.has(id)))];
+	const projectedRunning = knownIds(frontier?.running);
+	const projectedReady = knownIds(frontier?.ready);
+	const projectedBlocked = knownIds(frontier?.blocked);
+	const projectedCritical = knownIds(frontier?.critical);
+	const projectedSettled = knownIds(frontier?.settled);
+	const projectedFailed = knownIds(frontier?.failed);
+	const running = active
+		? (frontier ? projectedRunning : Object.keys(nodes).filter((id) => statuses.get(id) === "running"))
+		: [];
+	const computedReady = Object.keys(nodes).filter((id) => {
+		if (statuses.get(id) !== "queued") return false;
+		return depsOf(nodes[id], originalNodes[id]).every((dep) => TERMINAL_DAG_STATES.has(statuses.get(dep) ?? "queued"));
+	});
+	const ready = active ? (frontier ? projectedReady : computedReady) : [];
+	const blocked = active
+		? (frontier ? projectedBlocked : Object.keys(nodes).filter((id) => statuses.get(id) === "queued" && !computedReady.includes(id)))
+		: [];
+	const critical = active && frontier ? projectedCritical : [];
+	const waitingOn: Record<string, string[]> = {};
+	for (const id of blocked) {
+		const explicit = stringList(objectValue(nodes[id])?.waitingOn);
+		const deps = depsOf(nodes[id], originalNodes[id]);
+		waitingOn[id] = explicit.length > 0
+			? explicit.filter((dep) => statuses.has(dep))
+			: deps.filter((dep) => !TERMINAL_DAG_STATES.has(statuses.get(dep) ?? "queued"));
+	}
+	return { running, ready, blocked, critical, waitingOn, settledIds: projectedSettled, failedIds: projectedFailed };
+}
+
 function extractDagProgress(
 	tool: TrackerTool,
 	payload: unknown,
@@ -212,56 +281,15 @@ function extractDagProgress(
 	const nodeIds = Object.keys(nodes);
 	if (nodeIds.length === 0 && !previous && tool.toolName !== "dag_execute" && tool.toolName !== "dag_resume") return null;
 
-	const statuses = new Map<string, string>();
-	for (const [id, node] of Object.entries(nodes)) {
-		const candidate = stringValue(objectValue(node)?.status);
-		const status = candidate && DAG_STATES.has(candidate) ? candidate : "queued";
-		statuses.set(id, status);
-	}
+	const statuses = collectNodeStatuses(nodes);
 	const frontier = objectValue(source.frontier);
-	const knownFrontierIds = (value: unknown) => [...new Set(stringList(value).filter((id) => statuses.has(id)))];
-	const projectedRunning = knownFrontierIds(frontier?.running);
-	const projectedReady = knownFrontierIds(frontier?.ready);
-	const projectedBlocked = knownFrontierIds(frontier?.blocked);
-	const projectedCritical = knownFrontierIds(frontier?.critical);
-	const projectedSettled = knownFrontierIds(frontier?.settled);
-	const projectedFailed = knownFrontierIds(frontier?.failed);
-	const running = active
-		? (frontier ? projectedRunning : nodeIds.filter((id) => statuses.get(id) === "running"))
-		: [];
-	const computedReady = nodeIds.filter((id) => {
-		if (statuses.get(id) !== "queued") return false;
-		const deps = stringList(objectValue(nodes[id])?.deps)
-			.length > 0
-			? stringList(objectValue(nodes[id])?.deps)
-			: stringList(objectValue(objectValue(originalNodes[id]))?.depends_on);
-		return deps.every((dep) => TERMINAL_DAG_STATES.has(statuses.get(dep) ?? "queued"));
-	});
-	const ready = active ? (frontier ? projectedReady : computedReady) : [];
-	const blocked = active
-		? (frontier ? projectedBlocked : nodeIds.filter((id) => statuses.get(id) === "queued" && !computedReady.includes(id)))
-		: [];
-	const critical = active && frontier ? projectedCritical : [];
-	const waitingOn: Record<string, string[]> = {};
-	for (const id of blocked) {
-		const node = objectValue(nodes[id]);
-		const explicit = stringList(node?.waitingOn);
-		const deps = stringList(node?.deps).length > 0
-			? stringList(node?.deps)
-			: stringList(objectValue(originalNodes[id])?.depends_on);
-		waitingOn[id] = explicit.length > 0
-			? explicit.filter((dep) => statuses.has(dep))
-			: deps.filter((dep) => !TERMINAL_DAG_STATES.has(statuses.get(dep) ?? "queued"));
-	}
-	const completed = nodeIds.filter((id) => statuses.get(id) === "completed").length;
-	const failed = nodeIds.filter((id) => statuses.get(id) === "failed").length;
-	const skipped = nodeIds.filter((id) => statuses.get(id) === "skipped").length;
+	const projection = projectDagFrontier(nodes, statuses, originalNodes, source, active);
 	const metrics = objectValue(details.metrics);
 	const total = nodeIds.length > 0 ? nodeIds.length : nonNegativeInteger(metrics?.totalNodes) ?? previous?.total ?? 0;
 	const boundedCount = (value: unknown, fallback: number) => Math.min(total, nonNegativeInteger(value) ?? fallback);
-	const metricCompleted = boundedCount(metrics?.completed, completed);
-	const metricFailed = boundedCount(metrics?.failed, failed);
-	const metricSkipped = boundedCount(metrics?.skipped, skipped);
+	const completed = boundedCount(metrics?.completed, countByStatus(statuses, "completed"));
+	const failed = boundedCount(metrics?.failed, countByStatus(statuses, "failed"));
+	const skipped = boundedCount(metrics?.skipped, countByStatus(statuses, "skipped"));
 	const scheduler = source.scheduler === "ready" || source.scheduler === "wave"
 		? source.scheduler
 		: previous?.scheduler ?? "unknown";
@@ -271,27 +299,28 @@ function extractDagProgress(
 		: details.status === "failed" || details.status === "error" ? "blocked"
 		: previous?.termination;
 	const dagId = stringValue(source.dagId) ?? previous?.dagId ?? "";
-	const routes = nodeIds.filter((id) => Boolean(stringValue(objectValue(nodes[id])?.route))).length;
+	const routes = Object.keys(nodes).filter((id) => Boolean(stringValue(objectValue(nodes[id])?.route))).length;
 	const routeDecisions = objectValue(source.routeDecisions);
 	const generatedNodes = objectValue(source.generatedNodes);
+	const generated = generatedNodes
+		? Object.keys(generatedNodes).length
+		: originalSpec ? nodeIds.filter((id) => !(id in originalNodes)).length : previous?.generated ?? 0;
 	return {
 		toolCallId: tool.toolCallId,
 		dagId,
 		scheduler,
 		active,
 		total,
-		running,
-		ready,
-		blocked,
-		critical,
-		waitingOn,
-		settled: frontier ? projectedSettled.length : Math.min(total, metricCompleted + metricFailed + metricSkipped),
-		completed: metricCompleted,
-		failed: frontier ? projectedFailed.length : metricFailed,
-		skipped: metricSkipped,
-		generated: generatedNodes
-			? Object.keys(generatedNodes).length
-			: originalSpec ? nodeIds.filter((id) => !(id in originalNodes)).length : previous?.generated ?? 0,
+		running: projection.running,
+		ready: projection.ready,
+		blocked: projection.blocked,
+		critical: projection.critical,
+		waitingOn: projection.waitingOn,
+		settled: frontier ? projection.settledIds.length : Math.min(total, completed + failed + skipped),
+		completed,
+		failed: frontier ? projection.failedIds.length : failed,
+		skipped,
+		generated,
 		routes: nonNegativeInteger(metrics?.routeCount) ?? Math.max(Object.keys(routeDecisions ?? {}).length, routes, previous?.routes ?? 0),
 		...(termination ? { termination } : {}),
 		updatedAt: now,

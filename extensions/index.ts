@@ -20,7 +20,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { complete } from "@earendil-works/pi-ai";
+// 0.83: the legacy `complete` moved to the official compat entrypoint.
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";

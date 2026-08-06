@@ -134,3 +134,16 @@ describe("GoalConfig.verifyCommand (GG-1 config wiring)", () => {
 		}
 	});
 });
+
+describe("verify command TDZ hardening", () => {
+	it("resolves (never rejects) when spawn throws synchronously", async () => {
+		// Audit finding: finish() referenced `timer` before initialization when
+		// spawn threw synchronously. The fix hoists the declaration; verify the
+		// promise still resolves with a clean failure instead of an unhandled
+		// rejection. Trigger via a command that makes child_process.spawn throw.
+		const result = await runVerifyCommand("\u0000invalid", 5_000);
+		assert.equal(result.ok, false);
+		assert.equal(result.exitCode, null);
+		assert.match(result.stderr, /failed to spawn/i);
+	});
+});
