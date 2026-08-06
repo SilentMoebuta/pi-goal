@@ -295,6 +295,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		return { ok: true };
 	}
 
+	/** headless 进程退出路径的收尾：不 pauseGoal（不是用户中断），如实写 result。幂等。 */
+	const finalizedHeadlessGoals = new Set<string>();
+	function finalizeHeadless(ctx: ExtensionContext): void {
+		if (!goal?.headless || finalizedHeadlessGoals.has(goal.id)) return;
+		finalizedHeadlessGoals.add(goal.id);
+		clearTimer();
+		finalizeHeadlessGoal(goal, nowMs());
+	}
+
 	function persist(action: GoalSnapshotActionV2) {
 		const snapshot = createGoalSnapshotV2({
 			revision: ++snapshotRevision,
@@ -418,7 +427,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			else if (patch.status === "active" && previousStatus === "paused") goalLog(ctx, "resumed", {});
 			else goalLog(ctx, "status", { status: goal.status, pausedReason: goal.pausedReason, blocker: goal.blocker });
 			if (patch.status !== "active") {
-				finalizeHeadlessGoal(goal, now);
+				finalizeHeadless(ctx);
 				if (goal.status !== "complete") process.exitCode = 1;
 			}
 		}
@@ -591,6 +600,76 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		return true;
 	}
 
+	/** 构造续跑消息体（sendContinuation 与 headless 同步版共用）。
+	 *  捕获并清空一次性注记（stuckSuggestion / verifyFailNote）。 */
+	function buildContinuationBody(goal: GoalState, config: GoalConfig): string {
+		let body = continuationPrompt(goal, config);
+		const verifyFail = verifyFailNote;
+		const suggestion = stuckSuggestion;
+		verifyFailNote = null;
+		stuckSuggestion = null;
+		// Goal-drift check (audit P0): every DRIFT_CHECK_INTERVAL auto-turns, ask
+		// the agent to compare recent work with the objective direction.
+		if (goal.autoTurnCount > 0 && goal.autoTurnCount % CONFIG.driftCheckIntervalTurns === 0) {
+			body = "<DRIFT-CHECK>\nCompare your recent work (last actions and recorded evidence) with the objective below. If the work has drifted off-target (wrong direction, wrong scope, solving a different problem), do NOT keep going: call update_goal({ action: \"pause\", reason: \"<what drifted and why>\" }) to report to the user. Otherwise continue; do not mention this check.\n</DRIFT-CHECK>\n\n" + body;
+		}
+		// M2: feed the verify-command failure back so the agent can see WHY
+		// its tests failed (prevents a re-claim-completion loop).
+		if (verifyFailNote) {
+			body = "⚠ Verify command failed last turn — fix this before claiming completion:\n" + verifyFailNote + "\n\n---\n\n" + body;
+		}
+		// GG-3: if escalateStuck produced a fresh suggestion, prepend it.
+		if (stuckSuggestion) {
+			body = "💡 Stuck-escalation suggestion (from a stronger model — try this fresh approach next):\n" + stuckSuggestion + "\n\n---\n\n" + body;
+		}
+		return body;
+	}
+
+	/**
+	 * Headless 同步续跑（print-mode 修复，2026-08-06）：
+	 * print-mode 的 session.prompt() 只等当前 agent run 完成，run 结束后立即
+	 * dispose——3s 定时器路径（scheduleContinuation）永远来不及触发，长 goal 会在
+	 * agent 中途停止时被 dispose-abort 误判为 interrupted。
+	 * 机制：agent_end 的 extension emit 窗口内 _isAgentRunActive 仍为 true
+	 * （isStreaming=true），此时同步 pi.sendMessage(followUp) 会直接进入 agent
+	 * 队列；agent loop 的 _handlePostAgentRun 在 emit 后检查 hasQueuedMessages，
+	 * 队列非空 → agent.continue() → print-mode 继续等待。
+	 * 不能走 queueMicrotask：微任务在 emit resolve 之后才执行，会错过检查窗口。
+	 */
+	function sendContinuationNow(ctx: ExtensionContext): void {
+		if (!goal || goal.status !== "active") return;
+		if (userSuspended) return;
+		if (continuationQueued) return;
+		clearTimer();
+		continuationQueued = true;
+		// 注记捕获/清空由 buildContinuationBody 负责。
+		// 护栏：与 scheduleContinuation 相同的 no-progress / maxAutoTurns 限制。
+		if (goal.noProgressCount >= CONFIG.maxNoProgressTurns) {
+			continuationQueued = false;
+			pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
+			return;
+		}
+		const maxAutoTurns = Number(process.env.GOAL_MAX_AUTO_TURNS) || 200;
+		if (goal.autoTurnCount >= maxAutoTurns) {
+			continuationQueued = false;
+			pauseGoal("reached max auto-turns (" + maxAutoTurns + ")", ctx);
+			return;
+		}
+		wasGoalDriven = true;
+		pi.sendMessage(
+			{ customType: GOAL_CONTINUATION_TYPE, content: buildContinuationBody(goal, goalConfig), display: false, details: { goalId: goal.id } },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+		continuationQueued = false;
+	}
+
+	/** agent_end 尾部：headless 走同步续跑（print-mode 不退出），否则走定时器。 */
+	function resumeGoalLoop(ctx: ExtensionContext): void {
+		if (!goal || goal.status !== "active") return;
+		if (goal.headless) { sendContinuationNow(ctx); return; }
+		scheduleContinuation(ctx);
+	}
+
 	function sendContinuation(ctx: ExtensionContext) {
 		if (!goal || goal.status !== "active") { diag(ctx, "sendContinuation: skip (goal=" + (goal ? goal.status : "null") + ")"); return; }
 		if (userSuspended) { diag(ctx, "sendContinuation: skip (userSuspended)"); return; }
@@ -600,14 +679,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		clearTimer();
 		continuationQueued = true;
 		queueMicrotask(() => {
-			// M6: consumed. M3: capture+clear the one-shot notes at the TOP so a
-			// guard early-exit (shutdown/pause/suspend) doesn't leak them into a
-			// later continuation.
+			// M6: consumed。注记捕获/清空由 buildContinuationBody 负责。
 			continuationQueued = false;
-			const suggestion = stuckSuggestion;
-			const verifyFail = verifyFailNote;
-			stuckSuggestion = null;
-			verifyFailNote = null;
 			// session_shutdown sets this and clears the timer, but a microtask
 			// already queued before shutdown still runs — without this guard it
 			// would call pi.sendMessage on a torn-down session.
@@ -622,26 +695,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return;
 			}
 			pi.sendMessage(
-				{ customType: GOAL_CONTINUATION_TYPE, content: (() => {
-					let body = continuationPrompt(goal, goalConfig);
-					// Goal-drift check (audit P0): every DRIFT_CHECK_INTERVAL
-					// auto-turns, ask the agent to compare recent work with the
-					// objective direction; if it has drifted, pause and report.
-					if (goal.autoTurnCount > 0 && goal.autoTurnCount % CONFIG.driftCheckIntervalTurns === 0) {
-						body = "<DRIFT-CHECK>\nCompare your recent work (last actions and recorded evidence) with the objective below. If the work has drifted off-target (wrong direction, wrong scope, solving a different problem), do NOT keep going: call update_goal({ action: \"pause\", reason: \"<what drifted and why>\" }) to report to the user. Otherwise continue; do not mention this check.\n</DRIFT-CHECK>\n\n" + body;
-					}
-					// M2: feed the verify-command failure back so the agent can see WHY
-					// its tests failed (prevents a re-claim-completion loop).
-					if (verifyFail) {
-						body = "⚠ Verify command failed last turn — fix this before claiming completion:\n" + verifyFail + "\n\n---\n\n" + body;
-					}
-					// GG-3: if escalateStuck produced a fresh suggestion, prepend it to the
-					// continuation so the stalled agent gets a stronger model's nudge.
-					if (suggestion) {
-						body = "💡 Stuck-escalation suggestion (from a stronger model — try this fresh approach next):\n" + suggestion + "\n\n---\n\n" + body;
-					}
-					return body;
-				})(), display: false, details: { goalId: goal.id } },
+				{ customType: GOAL_CONTINUATION_TYPE, content: buildContinuationBody(goal, goalConfig), display: false, details: { goalId: goal.id } },
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
 		});
@@ -803,8 +857,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		clearFooterTicker();
 		if (settleCurrentTurnTime() && goal) persist("usage");
 		if (goal?.headless && goal.status === "active") {
-			// 进程退出时 active 的 headless goal 尽力收尾（status=interrupted 语义由调用方读 result 判断）。
-			finalizeHeadlessGoal(goal, nowMs());
+			// 进程退出时 active 的 headless goal 尽力收尾（幂等；aborted 路径可能已 finalize）。
+			finalizeHeadless(ctx);
 			process.exitCode = 1;
 		}
 		currentTurn = null;
@@ -1064,7 +1118,18 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		const goalDriven = wasGoalDriven;
 		wasGoalDriven = false;
 		if (!goal || goal.status !== "active") return;
-		if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
+		if (ctx.signal?.aborted) {
+			if (goal.headless) {
+				// print-mode 进程退出路径的 dispose-abort：不是用户中断，不 pauseGoal。
+				// 正常 headless 续跑由 sendContinuationNow 在 emit 窗口内同步入队 followUp
+				// 让 agent loop 继续，根本不会走到 dispose；此分支只接真正的中止。
+				finalizeHeadless(ctx);
+				process.exitCode = 1;
+				return;
+			}
+			pauseGoal("interrupted", ctx);
+			return;
+		}
 		if (ctx.hasPendingMessages()) return;
 
 		// Completion checks only consume goal-driven turns. V2 evaluates exactly
@@ -1088,7 +1153,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					const v2Run = await runV2CompletionJudge(goal, responseText, ctx, pi, goalConfig, verification, dependencies.complete);
 				progressRuntime.evaluationEnded(nowMs());
 				updateFooter(ctx);
-				if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
+				if (ctx.signal?.aborted) {
+					if (goal.headless) { finalizeHeadless(ctx); process.exitCode = 1; return; }
+					pauseGoal("interrupted", ctx); return;
+				}
 				if (completionPolicy === "shadow") {
 					updateState({ completion: applyShadowCompletionEvaluation(goal, v2Run.evaluation) }, ctx);
 					goalLog(ctx, "completion_evaluated", { decision: goal.completion.lastEvaluation?.decision ?? null, findings: goal.completion.lastEvaluation?.findings ?? [], advisories: goal.completion.lastEvaluation?.advisories ?? [] });
@@ -1127,7 +1195,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			}
 
 			if (completionPolicy === "v2") {
-				scheduleContinuation(ctx);
+				resumeGoalLoop(ctx);
 				return;
 			}
 
@@ -1141,7 +1209,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			// call is only observable now. Do not apply a verdict (e.g. mark the
 			// goal complete) to an aborted turn — treat it like the pre-judge
 			// abort above and pause without applying the verdict.
-			if (ctx.signal?.aborted) { pauseGoal("interrupted", ctx); return; }
+			if (ctx.signal?.aborted) {
+				if (goal.headless) { finalizeHeadless(ctx); process.exitCode = 1; return; }
+				pauseGoal("interrupted", ctx); return;
+			}
 			if (verdict.parseFailed) {
 				judgeParseFailures += 1;
 				if (judgeParseFailures >= 3) {
@@ -1225,7 +1296,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		}
 		// Resume the goal after either a goal-driven turn (continue progress)
 		// or a user-driven turn (apply the user's guidance and keep going).
-		scheduleContinuation(ctx);
+		// Headless 走同步续跑（print-mode 修复）：agent_end 的 emit 窗口内同步入队
+		// followUp，agent loop 检测到队列非空后继续，print-mode 因此保持等待。
+		resumeGoalLoop(ctx);
 	});
 
 	// ═══════════════════════════════════════════════════════════════════

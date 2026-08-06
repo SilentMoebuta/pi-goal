@@ -135,6 +135,76 @@ async function execute(api: HeadlessFakeAPI, name: string, params: unknown, ctx:
 }
 
 describe("headless goal lifecycle", () => {
+	it("synchronously continues the loop at agent_end (print-mode fix)", async () => {
+		// print-mode 的 session.prompt() 只等当前 run 完成；agent_end 的 emit 窗口内
+		// isStreaming=true，同步 sendMessage(followUp) 入队后 agent loop 继续。
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		api.setFlag("goal-run", specPath);
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		await api.emit("agent_end", {}, ctx);
+
+		// 同步出现续跑消息（不依赖 3s 定时器）
+		const continuations = api.sent.filter((entry) => entry.message.customType === "pi-goal:continuation");
+		assert.equal(continuations.length, 1);
+		assert.equal(continuations[0].options.deliverAs, "followUp");
+		assert.match(continuations[0].message.content, /Continue working toward the active goal/);
+		const goal = await execute(api, "get_goal", {}, ctx);
+		assert.equal(JSON.parse(goal.content[0].text).status, "active");
+	});
+
+	it("does not misclassify a dispose abort as interrupted (headless)", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		api.setFlag("goal-run", specPath);
+		piGoalExtension(api as any);
+		const controller = new AbortController();
+		const ctx = context(cwd, api);
+		(ctx as { signal: unknown }).signal = controller.signal;
+		await api.emit("session_start", {}, ctx);
+
+		controller.abort();
+		await api.emit("agent_end", {}, ctx);
+
+		// 不 pauseGoal：goal 保持 active，result 如实写出（exit 1）
+		const goal = await execute(api, "get_goal", {}, ctx);
+		assert.equal(JSON.parse(goal.content[0].text).status, "active");
+		const result = JSON.parse(fs.readFileSync(path.join(cwd, "spec.result.json"), "utf8"));
+		assert.equal(result.status, "active");
+		assert.equal(result.exit.code, 1);
+		// 无续跑消息
+		assert.equal(api.sent.some((entry) => entry.message.customType === "pi-goal:continuation"), false);
+	});
+
+	it("keeps the interactive interrupted pause for non-headless goals", async () => {
+		const cwd = project();
+		const api = new HeadlessFakeAPI();
+		piGoalExtension(api as any);
+		const controller = new AbortController();
+		const ctx = context(cwd, api);
+		(ctx as { signal: unknown }).signal = controller.signal;
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "propose_goal_draft", {
+			objective: "普通目标", criteria: ["完成"], taskKind: "coding",
+			executionPreference: "direct", roleCatalogAvailable: false, assurance: { risk: "low" },
+		}, ctx);
+
+		controller.abort();
+		await api.emit("agent_end", {}, ctx);
+
+		const goal = await execute(api, "get_goal", {}, ctx);
+		const view = JSON.parse(goal.content[0].text);
+		assert.equal(view.status, "paused");
+		assert.equal(view.pausedReason, "interrupted");
+	});
+
 	it("bootstraps a goal from --goal-run at session_start and logs goal_started", async () => {
 		const cwd = project();
 		const specPath = path.join(cwd, "spec.md");
