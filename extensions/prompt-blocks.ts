@@ -225,6 +225,19 @@ export function budgetLimitPrompt(goal: GoalState): string {
 // long-conversation dilution (the user's stated reason these used to live in
 // CLAUDE.md). 深修 C: governance 按 task_type 分流 (config.ts taskGovernanceBlock),
 // 非 coding 任务不套 coding 门,各有自己的 governance 块。
+/** 验证失败后的修复形态引导（UX: 主 agent 倾向主会话缝补，而不是回到 DAG 结构）。
+ *  决策顺序：定位节点 → dag_rerun 重跑；结构问题 → specPatch；反复失败 → 根因
+ *  上溯 + 调研；需要用户决策 → pause 汇报。交互一律前置，执行中不打断用户。 */
+function executionFailureGuidanceBlock(): string {
+	return "\n\n## Execution failure recovery\n" +
+		"When a DAG execution finishes but completion verification fails, recover inside the DAG structure instead of patching files directly in the main session:\n" +
+		"1. If the failure maps to specific nodes, call dag_rerun(checkpoint, { rerunNodes: [...], inject: { nodeId: \"why it failed / what verification rejected\" } }) — it reruns those nodes AND their downstream closure, reusing untouched results.\n" +
+		"2. If the graph itself is wrong (missing nodes, wrong dependencies, wrong roles), call dag_rerun with specPatch { add | remove | modify } to restructure, then rerun.\n" +
+		"3. Only patch directly in the main session for a small, isolated issue that no DAG node owns — and say so explicitly.\n" +
+		"4. When the same class of failure repeats, stop re-running: analyze the ROOT CAUSE upstream — is a preceding step missing (research, design, verification) that would make later steps flow? Run web_search to see how others solve it before changing anything.\n" +
+		"5. If progress is impossible without a user decision, call update_goal({ action: \"pause\", reason: \"<what is blocked, what decision is needed>\" }) — the goal pauses and reports to the user. Never keep patching in circles.";
+}
+
 export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const budgetInfo = goal.tokenBudget != null
@@ -246,6 +259,7 @@ export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_G
 		"The completion evaluator uses the persisted ledger, claims, deterministic verification, and the latest response." +
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
 			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind) : "") +
-			executionDecisionBlock(goal.execution) + reviewerTranscriptContractBlock(goal) + completionFeedbackBlock(goal, config);
+			executionDecisionBlock(goal.execution) + reviewerTranscriptContractBlock(goal) + completionFeedbackBlock(goal, config) +
+		executionFailureGuidanceBlock();
 }
 

@@ -1127,3 +1127,28 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		await api.emit("session_shutdown", {}, ctx);
 	});
 });
+
+describe("goal pause-for-user action (execution failure recovery)", () => {
+	it("pauses the goal with a reason when the agent needs a user decision", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "propose_goal_draft", {
+			objective: "Refactor with unknown external API", criteria: ["Migration done"], taskKind: "coding",
+			executionPreference: "direct", roleCatalogAvailable: false,
+		}, ctx);
+		await Promise.resolve();
+		const result = await execute(api, "update_goal", {
+			action: "pause",
+			reason: "The upstream API was sunset; user must decide whether to switch providers.",
+		}, ctx);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details.status, "paused");
+		const goal = await publicGoal(api, ctx);
+		assert.equal(goal.status, "paused");
+		assert.match(goal.pausedReason ?? "", /user must decide/);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+});

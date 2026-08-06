@@ -1475,6 +1475,11 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						return { content: [{ type: "text", text: "Execution changed to " + execution.selected + "." }], details: { execution } };
 				}
 
+				if (action.action === "pause") {
+					pauseGoal(action.reason, ctx);
+					ctx.ui?.notify?.("Goal paused: needs your input — " + action.reason, "warning");
+					return { content: [{ type: "text", text: "Goal paused for user input: " + action.reason + " (reply to resume with guidance, or /goal resume)" }], details: { status: "paused", reason: action.reason } };
+				}
 				updateState({ status: "unmet", blocker: action.blocker, noProgressCount: 0 }, ctx);
 				return { content: [{ type: "text", text: "Goal marked unmet: " + action.blocker }], details: { status: "unmet" } };
 

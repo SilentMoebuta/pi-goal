@@ -20,7 +20,8 @@ export type UpdateGoalActionName =
 	| "request_completion"
 	| "record_review"
 	| "change_execution"
-	| "mark_unmet";
+	| "mark_unmet"
+	| "pause";
 
 export interface RecordEvidenceAction {
 	action: "record_evidence";
@@ -68,13 +69,20 @@ export interface MarkUnmetAction {
 	blocker: string;
 }
 
+export interface PauseGoalAction {
+	action: "pause";
+	/** 暂停原因：卡在哪里、需要用户做什么决策。用户看到后会回复或 /goal resume。 */
+	reason: string;
+}
+
 export type NormalizedUpdateGoalAction =
 	| RecordEvidenceAction
 	| UpsertClaimAction
 	| RequestCompletionAction
 	| RecordReviewAction
 	| ChangeExecutionAction
-	| MarkUnmetAction;
+	| MarkUnmetAction
+	| PauseGoalAction;
 
 export type NormalizeUpdateGoalActionResult =
 	| { ok: true; action: NormalizedUpdateGoalAction; legacy: boolean; warnings: string[] }
@@ -91,6 +99,7 @@ const ACTIONS = new Set<UpdateGoalActionName>([
 	"record_review",
 	"change_execution",
 	"mark_unmet",
+	"pause",
 ]);
 const EVIDENCE_KINDS = new Set<EvidenceKind>([
 	"source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text",
@@ -171,6 +180,7 @@ function inferredActions(raw: Record<string, unknown>): Set<UpdateGoalActionName
 		|| raw.selected !== undefined || raw.role !== undefined || raw.confidence !== undefined
 		|| raw.reasons !== undefined) result.add("change_execution");
 	if (raw.blocker !== undefined || raw.status === "unmet") result.add("mark_unmet");
+	if (raw.action === "pause" || raw.pausedReason !== undefined) result.add("pause");
 	return result;
 }
 
@@ -478,6 +488,7 @@ function parseAction(raw: Record<string, unknown>, action: UpdateGoalActionName,
 		case "record_review": return parseReview(raw);
 		case "change_execution": return parseChangeExecution(raw);
 		case "mark_unmet": return { action: "mark_unmet", blocker: requiredString(raw.blocker, "blocker") };
+		case "pause": return { action: "pause", reason: requiredString(raw.reason, "reason") };
 	}
 }
 
