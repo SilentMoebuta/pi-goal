@@ -98,4 +98,30 @@ describe("goal spec markdown", () => {
 		assert.equal(slugifyTitle("调研 中文 目标"), "调研-中文-目标");
 		assert.equal(slugifyTitle("!!!"), "goal");
 	});
+
+	it("round-trips the deep-goal implementation structure section", () => {
+		const structure = [
+			"### 模块",
+			"- parser: 输入解析，产出 AST",
+			"- executor: 消费 AST，产出结果",
+			"### 关键路径",
+			"parser → executor，无并行",
+			"### 契约",
+			"AST 格式 v1；错误通过 exit code 暴露",
+			"### 失败模式",
+			"解析失败 → 明确报错，不回滚",
+		].join("\n");
+		const md = proposalToMarkdown({ ...SAMPLE, structure });
+		assert.match(md, /## 实现结构/);
+		assert.match(md, /parser: 输入解析，产出 AST/);
+		const parsed = parseGoalSpecMarkdown(md);
+		assert.equal(parsed.ok, true);
+		assert.equal(parsed.doc!.structure, structure);
+
+		// 用户编辑结构后仍可解析
+		const edited = md.replace("parser → executor，无并行", "parser → validator → executor");
+		const reparsed = parseGoalSpecMarkdown(edited);
+		assert.equal(reparsed.ok, true);
+		assert.match(reparsed.doc!.structure ?? "", /parser → validator → executor/);
+	});
 });

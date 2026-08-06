@@ -659,6 +659,8 @@ interface GoalProposal {
 	claims: ResearchClaim[];
 	/** 澄清对话的 Q/A 轨迹（写入 spec 文档，供用户回溯）。 */
 	decisions?: Array<{ question: string; answer: string }>;
+	/** 深层目标（设计/架构/多子系统）的实现结构理解，原样进出 spec 文档。 */
+	structure?: string;
 }
 
 type ReviewResult = "start" | "edit" | "execution" | "cancel";
@@ -679,6 +681,7 @@ function proposalToSpecInput(proposal: GoalProposal) {
 			evidenceRefs: claim.evidenceRefs ?? [],
 		})),
 		...(proposal.decisions ? { decisions: proposal.decisions } : {}),
+		...(proposal.structure ? { structure: proposal.structure } : {}),
 		machine: {
 			taskKind: proposal.taskKind,
 			execution: {
@@ -738,6 +741,7 @@ function specDocToProposal(doc: NonNullable<ReturnType<typeof parseGoalSpecMarkd
 		execution,
 		assurance,
 		decisions: doc.decisions,
+		...(doc.structure ? { structure: doc.structure } : {}),
 	};
 }
 
@@ -2368,6 +2372,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				evidenceRefs: Type.Optional(Type.Array(Type.String())),
 			}))),
 			tokenBudget: Type.Optional(Type.Number({ minimum: 1 })),
+			// 深层目标（设计/架构/多子系统）的实现结构理解，写入 spec 文档供用户微调。
+			structure: Type.Optional(Type.String({ description: "For deep goals (design/architecture, multiple subsystems, tech selection, contracts): the structural understanding — module breakdown, data flow, critical path, contracts, failure modes. Omit for shallow goals." })),
 			// Spec 澄清：模型判断目标存在真实歧义时，不创建 goal，先返回待确认问题。
 			needsClarification: Type.Optional(Type.Boolean({ description: "Set true when the objective has genuine ambiguity that should be clarified with the user before drafting. Simple, well-scoped goals must omit this." })),
 			openQuestions: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), { description: "Open questions to clarify with the user, ordered by importance. No count limit — ask everything that genuinely matters. Leave empty unless needsClarification is true." })),
@@ -2501,6 +2507,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				objective, criteria, constraints: constraints ?? [], taskKind,
 				executionPreference: preference, execution, assurance,
 				claims,
+				...(typeof raw.structure === "string" && raw.structure.trim() ? { structure: raw.structure.trim() } : {}),
 			};
 			// Spec 澄清（UX: 用户两三句话 → agent 展开的细节可能与意图相左）。
 			// 模型声明存在真实歧义时，不创建 goal，把 1-2 个最关键的问题交给主

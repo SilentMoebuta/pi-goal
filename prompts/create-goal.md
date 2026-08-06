@@ -27,6 +27,14 @@ factual questions it opens, then ask the next round. Repeat until the goal is co
 - high-risk decisions carry the user's explicit opinion
 or until the user says to proceed. Then draft without the clarification flag.
 
+For DEEP goals (design/architecture requests, multiple subsystems/modules, technology
+selection, state migration, or interface contracts), the five surface criteria are not
+enough — also require: structure decomposed (modules + producer/consumer relationships),
+critical path explicit (data flow, dependency order, parallel work, tech choices), and
+contracts/failure modes reviewed (interfaces, formats, schemas, rollback/degradation).
+Write the structural understanding into the spec under `## 实现结构` so the user can
+refine it in markdown before starting.
+
 Simple, well-scoped tasks must not ask — draft directly.
 
 Call propose_goal_draft when ready. The user will review and choose Start, Edit, or Cancel.

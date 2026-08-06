@@ -615,6 +615,28 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		await api.emit("session_shutdown", {}, ctx);
 	});
 
+	it("writes deep-goal structure into the spec markdown", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const structure = "### 模块\n- dispatcher: 队列消费，分配 worker\n- worker: 子进程执行任务\n### 契约\n任务 JSON v1";
+		const result = await execute(api, "propose_goal_draft", {
+			objective: "设计多 agent 任务分发系统", criteria: ["端到端可运行"], taskKind: "coding",
+			executionPreference: "team", roleCatalogAvailable: false,
+			structure,
+		}, ctx);
+		assert.equal(result.isError, undefined);
+		const specPath = result.details?.specDoc;
+		assert.ok(specPath);
+		const text = fs.readFileSync(path.join(cwd, specPath), "utf8");
+		assert.match(text, /## 实现结构/);
+		assert.match(text, /dispatcher: 队列消费，分配 worker/);
+		assert.match(text, /任务 JSON v1/);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+
 	it("judges a pending request even when the turn ended without assistant text", async () => {
 		// UX finding: the agent's last turn was a pure tool call, lastAssistantText
 		// stayed empty, and neither the judge nor scheduleContinuation ever ran.

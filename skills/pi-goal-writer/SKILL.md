@@ -88,6 +88,28 @@ clarifications for simple, well-scoped requests.
 5. **Risk confirmed:** high-risk decisions (irreversible actions, money, privacy, legal)
    have the user's explicit opinion, not an agent default.
 
+**Deep-goal criteria — for goals with internal implementation depth, ALSO require:**
+
+A goal is deep when it asks for design/architecture ("设计", "架构", "怎么实现",
+"implementation approach"), spans multiple subsystems/modules/services, requires
+technology selection (framework, storage, protocol), state migration, or interface
+contracts. For such goals, the surface-level five criteria are not enough — the ambiguity
+lives inside the structure:
+
+6. **Structure decomposed:** the main subsystems/modules/workflows are identified, with
+   their responsibilities and producer/consumer relationships explicit (who produces what,
+   who consumes it).
+7. **Critical path explicit:** the core data flow and dependency order are clear (what runs
+   first, what depends on what, what can run in parallel), and key technology choices are
+   confirmed or listed as alternatives.
+8. **Contracts and failure modes reviewed:** cross-module interfaces, input/output formats,
+   and storage schemas are defined (or explicitly marked TBD); key failure paths (error
+   handling, rollback, degradation) have an agreed approach.
+
+When the goal is deep and converged, write the structural understanding into the spec
+under `## 实现结构` (modules, data flow, critical path, contracts, failure modes) so the
+user can refine it in the markdown before starting.
+
 If any criterion is unmet, keep clarifying. Re-call `propose_goal_draft` (with
 `needsClarification`) until converged, then draft without the flag.
 

@@ -56,6 +56,9 @@ export interface GoalSpecDoc {
 	machine: SpecMachine;
 	/** 决策记录：澄清对话的 Q/A 轨迹。 */
 	decisions: Array<{ question: string; answer: string }>;
+	/** 深层目标（设计/架构/多子系统）的实现结构理解：模块划分、数据流、
+	 *  关键路径、契约、失败模式。markdown 原样保留，供用户在文档里直接微调。 */
+	structure?: string;
 	createdAt?: number;
 }
 
@@ -74,7 +77,8 @@ function sectionLines(lines: string[], heading: string): string[] {
 	const body: string[] = [];
 	for (let i = start + 1; i < lines.length; i++) {
 		const line = lines[i];
-		if (/^#{1,6}\s+\S/.test(line)) break;
+		// 只认二级标题（## X）作为段落边界，允许段落内含 ### 子标题（如实现结构）。
+		if (/^##\s+\S/.test(line)) break;
 		body.push(line);
 	}
 	return body;
@@ -107,6 +111,8 @@ export function proposalToMarkdown(input: {
 	claims: SpecClaim[];
 	decisions?: Array<{ question: string; answer: string }>;
 	machine?: SpecMachine;
+	/** 深层目标的实现结构理解（markdown 原样）。 */
+	structure?: string;
 	createdAt?: number;
 }): string {
 	const title = input.objective.replace(/\s+/g, " ").slice(0, 60) || "Goal";
@@ -161,6 +167,12 @@ export function proposalToMarkdown(input: {
 			lines.push("- **Q:** " + decision.question);
 			lines.push("  - **A:** " + decision.answer);
 		}
+		lines.push("");
+	}
+	if (input.structure && input.structure.trim()) {
+		lines.push("## 实现结构");
+		lines.push("");
+		lines.push(input.structure.trim());
 		lines.push("");
 	}
 	lines.push("## 机器字段");
@@ -240,6 +252,9 @@ export function parseGoalSpecMarkdown(text: string): ParseGoalSpecResult {
 	const rawMachine = extractJsonBlock(text);
 	const machine: SpecMachine = isRecord(rawMachine) ? (rawMachine as SpecMachine) : {};
 
+	const structureLines = sectionLines(lines, "实现结构").map((line) => line.trim());
+	const structure = structureLines.filter(Boolean).join("\n") || undefined;
+
 	return {
 		ok: true,
 		doc: {
@@ -251,6 +266,7 @@ export function parseGoalSpecMarkdown(text: string): ParseGoalSpecResult {
 			claims,
 			decisions,
 			machine,
+			...(structure ? { structure } : {}),
 		},
 	};
 }
