@@ -64,6 +64,8 @@ export interface EvidenceRef {
 	recordedAt: number;
 	origin: EvidenceOrigin;
 	verification: EvidenceVerification;
+	/** 机械验证失败的原因（Proof-or-Stop：artifact 证据由文件系统校验）。 */
+	verificationNote?: string;
 }
 
 /** Compatibility view for the initial embedded-evidence prototype. */

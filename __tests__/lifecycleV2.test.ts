@@ -516,6 +516,10 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		await Promise.resolve();
 		const criterionId = (await publicGoal(api, ctx)).criteria[0].id;
 		await api.emit("turn_start", { turnIndex: 0, timestamp: Date.now() - 10 }, ctx);
+		// Proof-or-Stop: artifact evidence is mechanically verified — the file
+		// must actually exist in the project cwd.
+		fs.mkdirSync(path.join(cwd, "dist"), { recursive: true });
+		fs.writeFileSync(path.join(cwd, "dist", "result"), "artifact-content", "utf8");
 		await execute(api, "update_goal", {
 			action: "record_evidence", criterionId,
 			evidence: { id: "artifact", kind: "artifact", summary: "Artifact inspected", locator: "dist/result", verification: "verified" },
@@ -661,6 +665,10 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		await Promise.resolve();
 		const criterionId = (await publicGoal(api, ctx)).criteria[0].id;
 		await api.emit("turn_start", { turnIndex: 0, timestamp: Date.now() - 10 }, ctx);
+		// Proof-or-Stop: artifact evidence is mechanically verified — the file
+		// must actually exist in the project cwd.
+		fs.mkdirSync(path.join(cwd, "dist"), { recursive: true });
+		fs.writeFileSync(path.join(cwd, "dist", "result"), "artifact-content", "utf8");
 		await execute(api, "update_goal", {
 			action: "record_evidence", criterionId,
 			evidence: { id: "artifact", kind: "artifact", summary: "Artifact inspected", locator: "dist/result", verification: "verified" },
@@ -704,6 +712,10 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		await Promise.resolve();
 		const criterionId = (await publicGoal(api, ctx)).criteria[0].id;
 		await api.emit("turn_start", { turnIndex: 0, timestamp: Date.now() - 10 }, ctx);
+		// Proof-or-Stop: artifact evidence is mechanically verified — the file
+		// must actually exist in the project cwd.
+		fs.mkdirSync(path.join(cwd, "dist"), { recursive: true });
+		fs.writeFileSync(path.join(cwd, "dist", "result"), "artifact-content", "utf8");
 		await execute(api, "update_goal", {
 			action: "record_evidence", criterionId,
 			evidence: { id: "artifact", kind: "artifact", summary: "Artifact inspected", locator: "dist/result", verification: "verified" },
@@ -1149,6 +1161,98 @@ describe("goal pause-for-user action (execution failure recovery)", () => {
 		const goal = await publicGoal(api, ctx);
 		assert.equal(goal.status, "paused");
 		assert.match(goal.pausedReason ?? "", /user must decide/);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+});
+
+describe("goal telemetry (audit P0)", () => {
+	it("writes one telemetry entry when a goal reaches a terminal state", async () => {
+		const cwd = project("v2");
+		const fakeComplete = async (_model: unknown, request: any) => {
+			const prompt = request.messages[0].content[0].text as string;
+			const packet = JSON.parse(prompt.slice(prompt.indexOf("{")));
+			return { role: "assistant", content: [{ type: "text", text: JSON.stringify({
+				schemaVersion: "goal_completion_policy_v2", outcome: "accept",
+				requirements: packet.criteria.map((criterion: any) => ({ id: criterion.id, status: "satisfied", evidenceRefs: criterion.evidenceRefs, reason: "ok" })),
+				claims: [], blockingFailures: [], advisories: [],
+			}) }], usage: { output: 1 } } as any;
+		};
+		const api = new FakeExtensionAPI();
+		createPiGoalExtension({ complete: fakeComplete as any })(api as any);
+		const ctx = context(cwd, api, { id: "fake-evaluator" });
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "propose_goal_draft", {
+			objective: "Telemetry test goal", criteria: ["Done"], taskKind: "coding",
+			constraints: ["No side effects"], executionPreference: "direct",
+			roleCatalogAvailable: false, assurance: { risk: "low" },
+		}, ctx);
+		await Promise.resolve();
+		const criterionId = (await publicGoal(api, ctx)).criteria[0].id;
+		fs.mkdirSync(path.join(cwd, "dist"), { recursive: true });
+		fs.writeFileSync(path.join(cwd, "dist", "result"), "x", "utf8");
+		await api.emit("turn_start", { turnIndex: 0, timestamp: Date.now() - 10 }, ctx);
+		await execute(api, "update_goal", {
+			action: "record_evidence", criterionId,
+			evidence: { id: "artifact", kind: "artifact", summary: "Artifact", locator: "dist/result", verification: "verified" },
+		}, ctx);
+		await execute(api, "update_goal", { action: "request_completion", summary: "Done." }, ctx);
+		await api.emit("turn_end", { message: { role: "assistant", content: [{ type: "text", text: "done" }], usage: { output: 10 } }, toolResults: [{ ok: true }] }, ctx);
+		await api.emit("agent_end", {}, ctx);
+		const completed = await publicGoal(api, ctx);
+		assert.equal(completed.status, "complete");
+		// telemetry.jsonl written next to the spec doc
+		const telemetryPath = path.join(cwd, "docs", "goals", "telemetry.jsonl");
+		assert.equal(fs.existsSync(telemetryPath), true, "telemetry file exists");
+		const entries = fs.readFileSync(telemetryPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(entries.length, 1, "exactly one entry per goal");
+		assert.equal(entries[0].outcome, "complete");
+		assert.equal(entries[0].taskKind, "coding");
+		assert.equal(entries[0].execution.topology, "direct");
+		assert.equal(entries[0].outcomeShape.criteriaTotal, 1);
+		assert.equal(entries[0].resources.tokenBudget, null);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+});
+
+describe("goal drift check (audit P0)", () => {
+	it("injects a DRIFT-CHECK into the continuation every interval turns", async () => {
+		const cwd = project("v2");
+		const rejectingComplete = async (_model: unknown, request: any) => {
+			const prompt = request.messages[0].content[0].text as string;
+			const packet = JSON.parse(prompt.slice(prompt.indexOf("{")));
+			return { role: "assistant", content: [{ type: "text", text: JSON.stringify({
+				schemaVersion: "goal_completion_policy_v2", outcome: "continue",
+				requirements: packet.criteria.map((criterion: any) => ({ id: criterion.id, status: "unsatisfied", evidenceRefs: [], reason: "not yet" })),
+				claims: [], blockingFailures: [], advisories: [],
+			}) }], usage: { output: 1 } } as any;
+		};
+		const api = new FakeExtensionAPI();
+		createPiGoalExtension({ complete: rejectingComplete as any, minContinueIntervalMs: 0 })(api as any);
+		const ctx = context(cwd, api, { id: "rejecting-evaluator" });
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "propose_goal_draft", {
+			objective: "Drift check goal", criteria: ["Done"], taskKind: "coding",
+			executionPreference: "direct", roleCatalogAvailable: false,
+		}, ctx);
+		await Promise.resolve();
+
+		let driftSeen = false;
+		// No completion requests: plain goal-driven turns avoid the
+		// three-identical-rejection pause, so autoTurnCount keeps growing.
+		for (let attempt = 1; attempt <= 9; attempt++) {
+			await api.emit("turn_start", { turnIndex: attempt, timestamp: Date.now() - 5 }, ctx);
+			await api.emit("turn_end", {
+				message: { role: "assistant", content: [{ type: "text", text: "working" }], usage: { output: 30 } },
+				toolResults: [{ ok: true }],
+			}, ctx);
+			await api.emit("agent_end", {}, ctx);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const lastContinuation = [...api.sent].reverse().find(({ message }) => message?.customType === GOAL_CONTINUATION_TYPE)?.message;
+			if (lastContinuation && String(lastContinuation.content).includes("<DRIFT-CHECK>")) driftSeen = true;
+		}
+		assert.equal(driftSeen, true, "a continuation contains the drift check within 9 turns (interval 6)");
+		const goal = await publicGoal(api, ctx);
+		assert.equal(goal.status, "active", "goal still active after plain turns");
 		await api.emit("session_shutdown", {}, ctx);
 	});
 });

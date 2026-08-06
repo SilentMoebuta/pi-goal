@@ -172,6 +172,12 @@ export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT
 	const budgetLine = goal.tokenBudget != null
 		? "- Token budget: " + formatTokens(goal.tokenBudget) + " (" + formatTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) + " remaining)"
 		: "- No token budget set";
+	// 预算感知规划（审计 P0，简化版）：team 执行且设有预算时，引导把全局
+	// 预算按节点分配并写进节点任务，避免单个节点烧掉全部预算。
+	const budgetAwarePlanning = goal.execution.selected === "team" && goal.tokenBudget != null
+		? "\nBudget-aware planning: the goal has a total token budget of " + formatTokens(goal.tokenBudget) +
+			". When building the DAG, estimate each node's token cost and write an explicit budget hint into each node's task (e.g. \"budget: ~X tokens — stop early if the answer is found\"). Do not give one node the whole budget."
+		: "";
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const criteriaInstruction = goal.criteria.length > 0
 		? "\n3. Record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence: {...} }).\n4. Maintain research claims with action: \"upsert_claim\" when applicable.\n5. When blocking outcomes are satisfied, call update_goal({ action: \"request_completion\", summary })."
@@ -194,6 +200,7 @@ export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT
 		budgetLine + "\n" +
 		"- Time spent: " + formatDuration(goal.timeUsedMs) + "\n" +
 		"- Auto-continuation turns: " + goal.autoTurnCount + "/" + maxAutoTurns + "\n" +
+		budgetAwarePlanning + "\n" +
 		criteriaBlock + "\n\n" +
 		"Rules:\n" +
 		"1. Before marking complete, perform a strict completion audit against real evidence:\n" +

@@ -66,6 +66,8 @@ import { runJudge, runV2CompletionJudge, type JudgeVerdict } from "./judge";
 import { formatTokens, formatDuration, escapeXml, extractOutputTokens, extractTextContent, isAssistantMessage, GOAL_STORAGE_TYPE, GOAL_EVENT_TYPE, GOAL_CONTINUATION_TYPE, GOAL_JUDGE_TYPE } from "./util";
 import { buildCriteriaBlock, completionFeedbackBlock, reviewerTranscriptDecision, transcriptBindsFinding, assuranceAfterOutcomeMutation, isTerminalGoalStatus, legacyAcceptedEvaluation, reviewerTranscriptContractBlock, superpowersAdaptationBlock, superpowersDisciplineBlock, continuationPrompt, budgetLimitPrompt, goalSystemPrompt } from "./prompt-blocks";
 import { proposalToSpecInput, specDocToProposal, writeGoalSpecDoc, showGoalReview, type GoalCriterionDraft, type GoalProposal, type ReviewResult } from "./draft-review-ui";
+import { mechanicallyVerifyEvidence } from "./evidence-verify";
+import { appendGoalTelemetry, buildGoalTelemetryEntry, readGoalTelemetry } from "./telemetry";
 import {
 	GoalRuntimeTracker,
 	deriveGoalProgress,
@@ -96,6 +98,8 @@ const CONFIG = {
 	noProgressTokenThreshold: 50,
 	maxNoProgressTurns: 2,
 	minContinueIntervalMs: 3_000,
+	// Goal-drift check cadence (auto turns). 0 disables.
+	driftCheckIntervalTurns: Number(process.env.GOAL_DRIFT_CHECK_TURNS) || 6,
 	// H1: cap a stuck-escalation model call so a hanging provider can't strand
 	// the goal in 'active' forever (escalateStuck falls back to pause on timeout).
 	escalateTimeoutMs: 30_000,
@@ -277,6 +281,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		return true;
 	}
 
+	const telemetryWritten = new Set<string>();
 	function updateState(patch: Partial<GoalState>, ctx: ExtensionContext, options: { preserveFreshEvaluation?: boolean } = {}) {
 		if (!goal) return;
 		const now = nowMs();
@@ -288,6 +293,12 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		Object.assign(goal, patch, { updatedAt: now });
 		if (patch.status) {
 			goal.endedAt = patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked" ? now : null;
+		}
+		// Goal telemetry: 终态时记录一次（同 goalId 幂等），供策略校准。
+		if (patch.status && (patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked") && !telemetryWritten.has(goal.id)) {
+			telemetryWritten.add(goal.id);
+			const entry = buildGoalTelemetryEntry(goal, now);
+			appendGoalTelemetry(entry, goalConfig.goalSpecDir ?? "docs/goals", ctx.cwd);
 		}
 		refreshOutcomeProgress(
 			now,
@@ -497,6 +508,12 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			pi.sendMessage(
 				{ customType: GOAL_CONTINUATION_TYPE, content: (() => {
 					let body = continuationPrompt(goal, goalConfig);
+					// Goal-drift check (audit P0): every DRIFT_CHECK_INTERVAL
+					// auto-turns, ask the agent to compare recent work with the
+					// objective direction; if it has drifted, pause and report.
+					if (goal.autoTurnCount > 0 && goal.autoTurnCount % CONFIG.driftCheckIntervalTurns === 0) {
+						body = "<DRIFT-CHECK>\nCompare your recent work (last actions and recorded evidence) with the objective below. If the work has drifted off-target (wrong direction, wrong scope, solving a different problem), do NOT keep going: call update_goal({ action: \"pause\", reason: \"<what drifted and why>\" }) to report to the user. Otherwise continue; do not mention this check.\n</DRIFT-CHECK>\n\n" + body;
+					}
 					// M2: feed the verify-command failure back so the agent can see WHY
 					// its tests failed (prevents a re-claim-completion loop).
 					if (verifyFail) {
@@ -1255,8 +1272,13 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 							return { content: [{ type: "text", text: "Evidence id \"" + action.evidenceId + "\" already exists with different content." }], isError: true, details: {} };
 						}
 						}
-						const record = existing ?? action.evidence!;
-						let outcomeChanged = !existing;
+						// Proof-or-Stop: artifact 证据由文件系统机械校验，agent 自报的
+						// verification 不再被信任（声称 verified 但文件不存在 → rejected）。
+						const rawRecord = existing ?? action.evidence!;
+						const record = mechanicallyVerifyEvidence(rawRecord, ctx.cwd);
+						let outcomeChanged = !existing
+							|| record.verification !== rawRecord.verification
+							|| (record.verificationNote !== undefined && record.verificationNote !== rawRecord.verificationNote);
 						if (!existing) goal.evidenceLedger.push(record);
 					const conflicts: string[] = [];
 					for (const criterionId of action.criterionIds) {
@@ -1895,7 +1917,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	pi.registerCommand("goal", {
 		description: "Set, view, pause, resume, or clear a long-running autonomous goal",
 		getArgumentCompletions: (prefix) => {
-			return ["status", "pause", "resume", "clear", "help", "apply"].filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
+			return ["status", "pause", "resume", "clear", "help", "apply", "telemetry"].filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
 		},
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
@@ -1918,8 +1940,20 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				);
 				return;
 			}
+			if (trimmed === "telemetry") {
+				const entries = readGoalTelemetry(goalConfig.goalSpecDir ?? "docs/goals", ctx.cwd);
+				if (entries.length === 0) { ctx.ui.notify("No goal telemetry recorded yet.", "info"); return; }
+				const lines = entries.map((entry) =>
+					"- " + new Date(entry.endedAt).toISOString().slice(0, 16) + " [" + entry.outcome + "] " +
+					entry.objective.slice(0, 60) + " | " + entry.taskKind + "/" + entry.execution.topology +
+					" | " + formatTokens(entry.resources.tokensUsed) + " tok" +
+					(entry.rejections.count > 0 ? " | rej=" + entry.rejections.count : ""),
+				);
+				ctx.ui.notify("Goal telemetry (last " + entries.length + "):\n" + lines.join("\n"), "info");
+				return;
+			}
 			if (trimmed === "help") {
-				ctx.ui.notify("/goal <objective> [--tokens N] — set a goal\n/goal status — show current goal\n/goal apply <path> — load & review a goal spec md\n/goal pause — pause\n/goal resume — resume\n/goal clear — remove", "info");
+				ctx.ui.notify("/goal <objective> [--tokens N] — set a goal\n/goal status — show current goal\n/goal apply <path> — load & review a goal spec md\n/goal telemetry — show completed goal statistics\n/goal pause — pause\n/goal resume — resume\n/goal clear — remove", "info");
 				return;
 			}
 			if (trimmed.startsWith("apply ")) {
