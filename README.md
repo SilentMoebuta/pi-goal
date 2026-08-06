@@ -22,6 +22,8 @@ The completion policy, verification strategy, and execution topology are separat
 - [Configuration](#configuration)
 - [Development](#development)
 
+> Why this design? See [docs/advantages.md](docs/advantages.md) — how pi-goal's completion-governance model compares with Claude Code /goal, Codex /goal, and other harness goal features.
+
 ## Install
 
 ```sh
