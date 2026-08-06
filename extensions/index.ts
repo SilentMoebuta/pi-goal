@@ -1162,7 +1162,12 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// Only count no-progress on goal-driven turns. A user-driven turn (an
 		// interrupt with guidance) is engagement, not stagnation — it must not
 		// trip the no-progress auto-pause.
-		if (wasGoalDriven && goal.status === "active") {
+		// In print/headless sessions the host may emit agent_end before turn_end.
+		// agent_end clears wasGoalDriven while queueing the next continuation, so
+		// relying on that flag makes every continuation look user-driven and leaves
+		// autoTurnCount/noProgressCount at zero indefinitely. Headless turns have
+		// no user interaction source; count them directly.
+		if ((wasGoalDriven || goal.headless) && goal.status === "active") {
 			// A turn that executed tool calls made forward progress even when the
 			// final assistant message had <threshold output tokens (e.g. a turn
 			// that ended on a tool-result message). Reset no-progress in that

@@ -248,6 +248,34 @@ describe("headless goal lifecycle", () => {
 		assert.equal(JSON.parse(goal.content[0].text).status, "active");
 	});
 
+	it("counts headless turns when agent_end precedes turn_end", async () => {
+		// The print host can emit agent_end before the accounting turn_end event.
+		// Headless turns must still advance the auto-turn/no-progress guards.
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		api.setFlag("goal-run", specPath);
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		await api.emit("agent_end", {}, ctx);
+		await api.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
+		await api.emit("agent_end", {}, ctx);
+		await api.emit("turn_end", {
+			turnIndex: 1,
+			timestamp: Date.now(),
+			toolResults: [],
+			message: { role: "assistant", content: [{ type: "text", text: "" }], usage: { output: 0 } },
+		}, ctx);
+
+		const settled = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n")
+			.map((line) => JSON.parse(line)).filter((entry) => entry.type === "turn_settled");
+		assert.equal(settled.at(-1)?.autoTurnCount, 1);
+		assert.equal(settled.at(-1)?.noProgressCount, 1);
+	});
+
 	it("does not misclassify a dispose abort as interrupted (headless)", async () => {
 		const cwd = project();
 		const specPath = path.join(cwd, "spec.md");
