@@ -227,11 +227,35 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	function goalLog(ctx: ExtensionContext, type: string, payload: Record<string, unknown>): void {
 		if (!goal || !goal.headless) return;
 		const entry = appendGoalEventLog(goal, type, payload, nowMs());
-		traceRuntimeEvent(entry.type, payload);
+		traceGoalEvent(entry);
 		pi.sendMessage(
 			{ customType: GOAL_HEADLESS_EVENT_TYPE, content: type, display: false, details: { event: entry } },
 			{ triggerTurn: false },
 		);
+	}
+
+	function traceGoalEvent(entry: GoalEventEnvelopeV3): void {
+		if (!goal) return;
+		runtimeEventSeq = Math.max(runtimeEventSeq, entry.seq);
+		try {
+			if (!goalTrace || goalTrace.traceId !== entry.goalId) goalTrace = new GoalTraceCollectorV3(entry.goalId, nowMs);
+			const span = goalTrace.recordGoalEvent(entry);
+			const tracePath = goal.headless?.logPath
+				? goal.headless.logPath + ".trace.jsonl"
+				: path.join(runtimeCwd, goalConfig.goalSpecDir ?? "docs/goals", "trace.jsonl");
+			appendTraceJsonl(span, tracePath);
+		} catch (error) {
+			console.warn("[pi-goal] trace write failed:", error);
+		}
+	}
+
+	function isGoalEventEnvelope(entry: unknown): entry is GoalEventEnvelopeV3 {
+		if (!entry || typeof entry !== "object") return false;
+		const candidate = entry as Partial<GoalEventEnvelopeV3>;
+		return candidate.schemaVersion === 3
+			&& typeof candidate.eventId === "string"
+			&& typeof candidate.seq === "number"
+			&& typeof candidate.runId === "string";
 	}
 
 	function traceRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; causationId?: string | null } = {}): GoalEventEnvelopeV3 | undefined {
@@ -251,16 +275,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			nodeId: options.nodeId,
 			causationId: options.causationId,
 		});
-		try {
-			if (!goalTrace || goalTrace.traceId !== runtime.goalDefinitionId) goalTrace = new GoalTraceCollectorV3(runtime.goalDefinitionId, nowMs);
-			const span = goalTrace.recordGoalEvent(entry);
-			const tracePath = goal.headless?.logPath
-				? goal.headless.logPath + ".trace.jsonl"
-				: path.join(runtimeCwd, goalConfig.goalSpecDir ?? "docs/goals", "trace.jsonl");
-			appendTraceJsonl(span, tracePath);
-		} catch (error) {
-			console.warn("[pi-goal] trace write failed:", error);
-		}
+		traceGoalEvent(entry);
 		return entry;
 	}
 
@@ -447,13 +462,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!goal?.headless || finalizedHeadlessGoals.has(goal.id)) return;
 		finalizedHeadlessGoals.add(goal.id);
 		clearTimer();
-		finalizeHeadlessGoal(goal, nowMs(), ctx.cwd);
+		const entry = finalizeHeadlessGoal(goal, nowMs(), ctx.cwd);
+		if (isGoalEventEnvelope(entry)) traceGoalEvent(entry);
 	}
 
 	function snapshotActiveHeadless(ctx: ExtensionContext): void {
 		if (!goal?.headless || goal.status !== "active") return;
 		clearTimer();
 		const entry = snapshotActiveHeadlessGoal(goal, nowMs(), ctx.cwd);
+		if (isGoalEventEnvelope(entry)) traceGoalEvent(entry);
 		pi.sendMessage(
 			{ customType: GOAL_HEADLESS_EVENT_TYPE, content: "snapshot", display: false, details: { event: entry } },
 			{ triggerTurn: false },
@@ -753,7 +770,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	function pauseGoal(reason: string, ctx: ExtensionContext): boolean {
 		if (!goal || goal.status !== "active") return false;
 		updateState({ status: "paused", pausedReason: reason }, ctx);
-		recordRuntimeEvent("goal.paused", { reason });
+		if (!goal.headless) recordRuntimeEvent("goal.paused", { reason });
 		clearTimer();
 		userSuspended = true;
 		pi.sendMessage(
@@ -772,7 +789,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// resume (autoTurnCount still >= cap) and the loop could never recover.
 		// maxAutoTurns is now per-resume-cycle; no-progress remains the lifetime backstop.
 		updateState({ status: "active", noProgressCount: 0, autoTurnCount: 0, pausedReason: null }, ctx);
-		recordRuntimeEvent("goal.resumed", {});
+		if (!goal.headless) recordRuntimeEvent("goal.resumed", {});
 		pi.sendMessage(
 			{ customType: GOAL_EVENT_TYPE, content: "Goal resumed.\n\nObjective: " + goal.objective, display: true, details: { kind: "resumed", goal: { ...goal }, progress: progressFor(goal) } },
 			{ triggerTurn: false },
@@ -1694,7 +1711,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// Skip our own extension-injected messages (e.g. /goal <objective> drafts
 		// the goal via sendUserMessage) — those are not user interrupts.
 		if (goal?.status === "active" && event.source !== "extension") {
-			recordRuntimeEvent("steering.received", { source: event.source, input: summarizeValue(event, 500) });
+			const payload = { source: event.source, input: summarizeValue(event, 500) };
+			if (goal.headless) goalLog(ctx, "steering_received", payload);
+			else recordRuntimeEvent("steering.received", payload);
 			clearTimer();
 		}
 	});

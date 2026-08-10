@@ -156,6 +156,24 @@ describe("Contract V3 completion runtime", () => {
 		assert.equal(result.ok, true, result.ok ? undefined : result.reason);
 	});
 
+	it("keeps reviewer-observed inputs outside the submitted artifact integrity set", () => {
+		const input = makeInput();
+		const sourceFile = path.join(input.cwd, "README.md");
+		const sourceBytes = Buffer.from("authoritative input\n");
+		fs.writeFileSync(sourceFile, sourceBytes);
+		const sourceDigest = createHash("sha256").update(sourceBytes).digest("hex");
+		(input.reviewerResult.payload as any).artifacts.push({
+			uri: "README.md",
+			digest: sourceDigest,
+			sizeBytes: sourceBytes.length,
+		});
+		const result = prepareCompletionBundleV3(input);
+		assert.equal(result.ok, true, result.ok ? undefined : result.reason);
+		if (!result.ok) return;
+		assert.deepEqual(result.bundle.evaluation.observedArtifacts.map((item) => item.artifactId), ["a1"]);
+		assert.match(result.bundle.evaluation.advisories.join(" "), /observed 1 non-submitted file/);
+	});
+
 	it("normalizes a sha256-prefixed reviewer receipt at the model-facing boundary", () => {
 		const input = makeInput();
 		const payload = input.reviewerResult.payload as { artifacts: Array<{ uri: string; digest: string; sizeBytes: number }> };

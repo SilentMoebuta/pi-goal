@@ -152,6 +152,7 @@ describe("headless goal lifecycle", () => {
 		api.setFlag("goal-run", specPath);
 		const ctx = context(cwd, api);
 		await api.emit("session_start", {}, ctx);
+		await api.emit("input", { source: "user", text: "Use the declared contract." }, ctx);
 
 		// 工具调用日志
 		await api.emit("tool_execution_start", { toolCallId: "t1", toolName: "bash", args: { command: "npm test" } }, ctx);
@@ -174,6 +175,9 @@ describe("headless goal lifecycle", () => {
 		assert.ok(llm, "llm_response logged");
 		assert.equal(llm.stopReason, "tool_use");
 		assert.deepEqual(llm.usage, { input: 10, output: 20 });
+		assert.ok(events.some((entry) => entry.type === "steering_received"), "headless steering is logged, not trace-only");
+		const traces = fs.readFileSync(path.join(cwd, "spec.goal.jsonl.trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.deepEqual(traces.map((span) => span.name), events.map((entry) => `goal.${entry.type}`));
 
 		// 心跳：触发捕获的 interval 回调
 		await api.emit("turn_start", { turnIndex: 3, timestamp: Date.now() }, ctx);
@@ -302,6 +306,14 @@ describe("headless goal lifecycle", () => {
 		assert.equal(view.status, "paused");
 		assert.equal(view.pausedReason, "reached max auto-turns (1)");
 		assert.equal(api.sent.filter((entry) => entry.message.customType === "pi-goal:continuation").length, 1);
+		const events = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const traces = fs.readFileSync(path.join(cwd, "spec.goal.jsonl.trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(traces.length, events.length, "headless lifecycle events and trace spans stay one-to-one");
+		assert.deepEqual(
+			traces.map((span) => span.attributes["goal.event_seq"]),
+			events.map((entry) => entry.seq),
+		);
+		assert.deepEqual(traces.map((span) => span.name), events.map((entry) => `goal.${entry.type}`));
 	});
 
 	for (const order of ["agent_end_first", "turn_end_first"] as const) {

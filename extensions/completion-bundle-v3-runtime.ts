@@ -246,6 +246,24 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 			`Reviewer referenced evidence IDs not submitted in the completion bundle; ignored: ${[...unknownReviewerEvidenceIds].sort().join(", ")}.`,
 		);
 	}
+	const reviewerOnlyArtifactUris: string[] = [];
+	const observedArtifacts: GoalEvaluationV3["observedArtifacts"] = [];
+	for (const observed of payload.value.artifacts) {
+		const artifact = verifiedArtifacts.artifacts.find((item) => item.uri === observed.uri || sameArtifactUri(item.uri, observed.uri, input.cwd));
+		if (!artifact) {
+			reviewerOnlyArtifactUris.push(observed.uri);
+			continue;
+		}
+		observedArtifacts.push({
+			artifactId: artifact.id,
+			digest: { algorithm: "sha256", value: observed.digest },
+		});
+	}
+	if (reviewerOnlyArtifactUris.length > 0) {
+		reviewerAdvisories.push(
+			`Reviewer observed ${reviewerOnlyArtifactUris.length} non-submitted file(s); excluded from completion artifact integrity.`,
+		);
+	}
 	const evaluation: GoalEvaluationV3 = {
 		id: input.reviewerResult.resultId,
 		revisionId: revision.id,
@@ -256,13 +274,7 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 		criterionCoverage,
 		findings: payload.value.findings,
 		advisories: reviewerAdvisories,
-		observedArtifacts: payload.value.artifacts.map((observed) => {
-			const artifact = verifiedArtifacts.artifacts.find((item) => item.uri === observed.uri || sameArtifactUri(item.uri, observed.uri, input.cwd));
-			return {
-				artifactId: artifact?.id ?? `unknown:${observed.uri}`,
-				digest: { algorithm: "sha256" as const, value: observed.digest },
-			};
-		}),
+		observedArtifacts,
 		// The reviewer envelope may predate submission. The authoritative evaluation
 		// becomes current only after this runtime revalidates its digest/artifacts.
 		evaluatedAt: input.now,
