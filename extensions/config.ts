@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { checkCitationTraceability, checkSourceDiversity, checkConfidenceAnnotation } from "./quality-gates";
 import { TASK_KINDS as TASK_KIND_VALUES, type TaskKind as StateTaskKind } from "./state";
+import type { GoalRetryPolicyV3 } from "./runtime-v3";
 
 export type TaskKind = StateTaskKind;
 export type ExecutionPreference = "auto" | "direct" | "specialist" | "team";
@@ -68,6 +69,10 @@ export interface GoalConfig {
 	/** Controls whether the legacy or V2 evaluator may change goal state. */
 	completionPolicy?: CompletionPolicy;
 
+	/** Bounded typed retry defaults for interactive goals and blueprints that do
+	 * not override individual fields. Trusted projects only. */
+	retryPolicy?: Partial<GoalRetryPolicyV3>;
+
 	/** 目录（相对 cwd 或绝对），goal 启动时把完整 spec 写成 md 供用户微调。 */
 	goalSpecDir?: string;
 }
@@ -84,6 +89,7 @@ export const DEFAULT_GOAL_CONFIG: GoalConfig = {
 	reviewPolicy: "risk_based",
 	defaultExecution: "auto",
 	completionPolicy: "v2",
+	retryPolicy: undefined,
 	/** 目录（相对 cwd 或绝对），goal 启动时把完整 spec 写成 md 供用户微调。 */
 	goalSpecDir: "docs/goals",
 };
@@ -988,13 +994,42 @@ export function parseGoalConfig(input: unknown): ParsedGoalConfig {
 	config.reviewPolicy = parseEnum("reviewPolicy", REVIEW_POLICIES, "risk_based");
 	config.defaultExecution = parseEnum("defaultExecution", EXECUTION_PREFERENCES, "auto");
 	config.completionPolicy = parseEnum("completionPolicy", COMPLETION_POLICIES, "v2");
+	if (raw.retryPolicy !== undefined) {
+		if (!raw.retryPolicy || typeof raw.retryPolicy !== "object" || Array.isArray(raw.retryPolicy)) {
+			warnings.push("retryPolicy must be an object; using the default");
+		} else {
+			const retry = raw.retryPolicy as Record<string, unknown>;
+			const parsed: Partial<GoalRetryPolicyV3> = {};
+			const positiveInteger = (field: "maxInfrastructureAttempts"): void => {
+				const value = retry[field];
+				if (value === undefined) return;
+				if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) parsed[field] = value;
+				else warnings.push("retryPolicy." + field + " must be a positive safe integer; ignoring it");
+			};
+			const nonNegativeInteger = (field: "maxSchemaRepairs" | "baseDelayMs" | "maxDelayMs"): void => {
+				const value = retry[field];
+				if (value === undefined) return;
+				if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) parsed[field] = value;
+				else warnings.push("retryPolicy." + field + " must be a non-negative safe integer; ignoring it");
+			};
+			positiveInteger("maxInfrastructureAttempts");
+			nonNegativeInteger("maxSchemaRepairs");
+			nonNegativeInteger("baseDelayMs");
+			nonNegativeInteger("maxDelayMs");
+			if (parsed.baseDelayMs !== undefined && parsed.maxDelayMs !== undefined && parsed.maxDelayMs < parsed.baseDelayMs) {
+				warnings.push("retryPolicy.maxDelayMs must be greater than or equal to baseDelayMs; ignoring maxDelayMs");
+				delete parsed.maxDelayMs;
+			}
+			config.retryPolicy = Object.keys(parsed).length > 0 ? parsed : undefined;
+		}
+	}
 	const specDir = typeof raw.goalSpecDir === "string" ? raw.goalSpecDir.trim() : "";
 	config.goalSpecDir = specDir || "docs/goals";
 
 	const knownKeys = new Set([
 		"schemaVersion", "superpowersIntegration", "evaluatorModel", "judgeModel",
 		"verifyCommand", "stuckEscalateModel", "verifyTimeoutMs", "forceTaskType",
-		"reviewPolicy", "defaultExecution", "completionPolicy", "goalSpecDir",
+		"reviewPolicy", "defaultExecution", "completionPolicy", "retryPolicy", "goalSpecDir",
 	]);
 	for (const key of Object.keys(raw)) {
 		if (!knownKeys.has(key)) warnings.push("unknown goal config key: " + key);

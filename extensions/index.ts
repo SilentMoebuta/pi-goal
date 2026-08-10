@@ -65,7 +65,7 @@ import {
 import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
 import { GOAL_HEADLESS_EVENT_TYPE, appendGoalEventLog, createGoalFromBlueprint, finalizeHeadlessGoal, snapshotActiveHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
 import { inspectCommittedArtifactsV3, prepareCompletionBundleV3, preflightCompletionSubmissionV3 } from "./completion-bundle-v3-runtime";
-import { completionBundleDigest } from "./goal-contract-v3";
+import { completionBundleDigest, type GoalErrorV3 } from "./goal-contract-v3";
 import { resolveRoleResultFromBranch, type RoleResultRefV1 } from "./role-result-v1";
 import { proposalToMarkdown, parseGoalSpecMarkdown, parseBlueprint, slugifyTitle, type SpecCriterion } from "./spec-doc";
 import { runJudge, runV2CompletionJudge, type JudgeVerdict } from "./judge";
@@ -76,7 +76,13 @@ import { mechanicallyVerifyEvidence } from "./evidence-verify";
 import { appendGoalTelemetry, buildGoalTelemetryEntry, readGoalTelemetry } from "./telemetry";
 import { appendTraceJsonl, GoalTraceCollectorV3 } from "./observability-v3";
 import { createInitialRuntimeMetadataV3 } from "./goal-contract-v3";
-import { createGoalEventV3, type GoalEventEnvelopeV3 } from "./runtime-v3";
+import {
+	classifyGoalError,
+	createGoalEventV3,
+	decideGoalRetry,
+	rolloverRuntimeAttempt,
+	type GoalEventEnvelopeV3,
+} from "./runtime-v3";
 import { buildGoalPublicViewV3 } from "./goal-contract-v3-adapter";
 import {
 	GoalRuntimeTracker,
@@ -140,6 +146,8 @@ interface PiGoalRuntimeDependencies {
 	complete: typeof complete;
 	minContinueIntervalMs: number;
 	now: () => number;
+	setTimeout: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
+	clearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
 	setInterval: (callback: () => void, ms: number) => ReturnType<typeof setInterval>;
 	clearInterval: (timer: ReturnType<typeof setInterval>) => void;
 }
@@ -197,6 +205,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	let observedRoleCatalog: string[] | null = null;
 	let activeMaxAutoTurns = CONFIG.maxAutoTurns;
 	let runtimeEventSeq = 0;
+	let providerFailure: { error: GoalErrorV3; retryAfterMs?: number } | null = null;
+	let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
 	type ActiveGoalOperationFence = Readonly<{
 		goalId: string;
@@ -226,6 +236,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	function clearTimer() {
 		if (continuationTimer) { clearTimeout(continuationTimer); continuationTimer = null; }
+	}
+
+	function clearRetryTimer() {
+		if (retryTimer) { dependencies.clearTimeout(retryTimer); retryTimer = null; }
 	}
 
 	function clearFooterTicker() {
@@ -434,6 +448,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			now,
 		});
 		goal = newGoal;
+		providerFailure = null;
+		clearRetryTimer();
 		progressRuntime.reset(now, newGoal.progress.lastOutcomeDeltaAt);
 		lastOutcomeSignature = outcomeSignature(newGoal);
 		currentTurn = null;
@@ -779,6 +795,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		});
 		newGoal.claims = proposal.claims.map((claim) => ({ ...claim, evidenceRefs: [...claim.evidenceRefs] }));
 		goal = newGoal;
+		providerFailure = null;
+		clearRetryTimer();
 		runtimeEventSeq = 0;
 		recordRuntimeEvent("goal.started", { objective: newGoal.objective, entrypoint: "interactive" });
 		progressRuntime.reset(now, newGoal.progress.lastOutcomeDeltaAt);
@@ -796,6 +814,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	function pauseGoal(reason: string, ctx: ExtensionContext): boolean {
 		if (!goal || goal.status !== "active") return false;
+		clearRetryTimer();
 		updateState({ status: "paused", pausedReason: reason }, ctx);
 		if (!goal.headless) recordRuntimeEvent("goal.paused", { reason });
 		clearTimer();
@@ -809,13 +828,25 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	function resumeGoal(ctx: ExtensionContext): boolean {
 		if (!goal || !canResumeGoal(goal.status)) return false;
+		const previousStatus = goal.status;
+		clearRetryTimer();
+		providerFailure = null;
 		userSuspended = false;
 		continuationQueued = false;
 		// reset autoTurnCount: resume = user-granted new quota cycle (mirrors
 		// setGoal). Without this, maxAutoTurns would re-trip immediately after
 		// resume (autoTurnCount still >= cap) and the loop could never recover.
 		// maxAutoTurns is now per-resume-cycle; no-progress remains the lifetime backstop.
-		updateState({ status: "active", noProgressCount: 0, autoTurnCount: 0, pausedReason: null }, ctx);
+		const resumedRuntime = previousStatus === "usage_limited"
+			? rolloverRuntimeAttempt(goal.runtime ?? createInitialRuntimeMetadataV3({ goalId: goal.id, entrypoint: goal.headless ? "headless" : "interactive" }))
+			: goal.runtime;
+		updateState({
+			status: "active",
+			noProgressCount: 0,
+			autoTurnCount: 0,
+			pausedReason: null,
+			...(resumedRuntime ? { runtime: resumedRuntime } : {}),
+		}, ctx);
 		if (!goal.headless) recordRuntimeEvent("goal.resumed", {});
 		pi.sendMessage(
 			{ customType: GOAL_EVENT_TYPE, content: "Goal resumed.\n\nObjective: " + goal.objective, display: true, details: { kind: "resumed", goal: { ...goal }, progress: progressFor(goal) } },
@@ -828,6 +859,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	function cancelGoal(reason: string, ctx: ExtensionContext): boolean {
 		if (!goal || isTerminalGoalStatus(goal.status)) return false;
 		clearTimer();
+		clearRetryTimer();
+		providerFailure = null;
 		clearFooterTicker();
 		userSuspended = true;
 		continuationQueued = false;
@@ -844,6 +877,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!goal) return false;
 		settleCurrentTurnTime();
 		clearTimer();
+		clearRetryTimer();
+		providerFailure = null;
 		clearFooterTicker();
 		const oldGoal = goal;
 		recordRuntimeEvent("goal.cleared", { runId: oldGoal.runtime?.runId ?? null });
@@ -870,6 +905,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		clearTimer();
 		const source = goal;
 		const now = nowMs();
+		clearRetryTimer();
+		providerFailure = null;
 		const sourceRuntime = source.runtime ?? createInitialRuntimeMetadataV3({ goalId: source.id, entrypoint: "interactive" });
 		const runId = `${sourceRuntime.runId}:fork:${randomUUID().slice(0, 8)}`;
 		const forked = structuredClone(source);
@@ -1341,6 +1378,79 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		}, dependencies.minContinueIntervalMs);
 	}
 
+	function retryAfterMilliseconds(headers: Record<string, string>): number | undefined {
+		const raw = headers["retry-after"] ?? headers["Retry-After"];
+		if (!raw) return undefined;
+		const seconds = Number(raw);
+		if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+		const date = Date.parse(raw);
+		return Number.isFinite(date) ? Math.max(0, date - nowMs()) : undefined;
+	}
+
+	/**
+	 * PI's host owns the provider-level retry loop. The response hook can fire
+	 * for an intermediate 429/5xx while that loop is still alive, so it only
+	 * records the latest typed failure. This handler runs at agent_settled, when
+	 * the host has exhausted its own retries, and applies Goal Runtime policy.
+	 */
+	function handleSettledProviderFailure(ctx: ExtensionContext): void {
+		const failure = providerFailure;
+		providerFailure = null;
+		if (!failure || !goal || goal.status !== "active") return;
+		const goalId = goal.id;
+		const runId = goal.runtime?.runId ?? null;
+		const attemptNumber = goal.runtime?.attemptNumber ?? 1;
+		const decision = decideGoalRetry(failure.error, {
+			attemptNumber,
+			retryAfterMs: failure.retryAfterMs,
+			policy: { ...(goalConfig.retryPolicy ?? {}), ...(goal.blueprint?.retry ?? {}) },
+		});
+		const reason = `${failure.error.code}: ${failure.error.message}`;
+		if (decision.action === "retry_attempt") {
+			clearTimer();
+			clearRetryTimer();
+			userSuspended = true;
+			updateState({ pausedReason: `retrying attempt ${attemptNumber + 1}: ${reason}` }, ctx);
+			const payload = {
+				errorCode: failure.error.code,
+				attemptNumber,
+				nextAttemptNumber: attemptNumber + 1,
+				delayMs: decision.delayMs,
+				reason: decision.reason,
+			};
+			if (goal.headless) goalLog(ctx, "retry_scheduled", payload);
+			else recordRuntimeEvent("goal.retry_scheduled", payload);
+			retryTimer = dependencies.setTimeout(() => {
+				retryTimer = null;
+				if (!goal || goal.status !== "active" || goal.id !== goalId || (goal.runtime?.runId ?? null) !== runId) return;
+				const runtime = goal.runtime ?? createInitialRuntimeMetadataV3({ goalId: goal.id, entrypoint: goal.headless ? "headless" : "interactive" });
+				const nextRuntime = rolloverRuntimeAttempt(runtime);
+				userSuspended = false;
+				updateState({ runtime: nextRuntime, pausedReason: null }, ctx);
+				if (!goal || goal.status !== "active") return;
+				if (goal.headless) goalLog(ctx, "retry_attempt_started", {
+					attemptNumber: nextRuntime.attemptNumber,
+					attemptId: nextRuntime.attemptId,
+				});
+				else recordRuntimeEvent("goal.retry_attempt_started", {
+					attemptNumber: nextRuntime.attemptNumber,
+					attemptId: nextRuntime.attemptId,
+				});
+				sendContinuation(ctx);
+			}, decision.delayMs);
+			return;
+		}
+
+		clearTimer();
+		clearRetryTimer();
+		userSuspended = true;
+		const payload = { errorCode: failure.error.code, attemptNumber, reason: decision.reason };
+		if (goal?.headless) goalLog(ctx, "retry_exhausted", payload);
+		else if (goal) recordRuntimeEvent("goal.retry_exhausted", payload);
+		updateState({ status: "usage_limited", pausedReason: reason, noProgressCount: 0 }, ctx);
+		if (ctx.hasUI) ctx.ui.notify("Goal retry limit reached: " + reason + ". Use /goal resume or revise the goal.", "warning");
+	}
+
 	// ═══════════════════════════════════════════════════════════════════
 	// Events
 	// ═══════════════════════════════════════════════════════════════════
@@ -1401,6 +1511,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (isSubagentSession(ctx)) return;
 		shuttingDown = true;
 		clearTimer();
+		clearRetryTimer();
+		providerFailure = null;
 		clearFooterTicker();
 		if (headlessHeartbeatTimer) { dependencies.clearInterval(headlessHeartbeatTimer); headlessHeartbeatTimer = null; }
 		if (settleCurrentTurnTime() && goal) persist("usage");
@@ -1415,25 +1527,31 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		updateFooter(ctx);
 	});
 
-	// Provider rate-limit / server errors → usage_limited (distinct from a
-	// user-set token budget). Pause so the user can /goal resume once the
-	// provider recovers; do not auto-resume (mirrors budget_limited).
 	pi.on("after_provider_response", async (event, ctx) => {
 		if (isSubagentSession(ctx)) return;
 		if (!goal || goal.status !== "active") return;
-		if (event.status !== 429 && event.status < 500) return;
-		const retryAfter = event.headers?.["retry-after"] ?? event.headers?.["Retry-After"];
-		const reason = event.status === 429
-			? "provider rate limited (429)"
-			: "provider error (" + event.status + ")";
-		updateState({ status: "usage_limited", pausedReason: reason + (retryAfter ? "; retry-after " + retryAfter : ""), noProgressCount: 0 }, ctx);
-		clearTimer();
-		userSuspended = true;
-		pi.sendMessage(
-			{ customType: GOAL_EVENT_TYPE, content: "Goal usage-limited: " + reason + "\n\nObjective: " + goal.objective + "\nUse /goal resume to continue once the provider recovers.", display: true, details: { kind: "usage_limited", goal: { ...goal }, progress: progressFor(goal) } },
-			{ triggerTurn: false },
-		);
-		if (ctx.hasUI) ctx.ui.notify("\u26A0\uFE0F Goal paused (usage limited): " + reason, "warning");
+		if (event.status !== 429 && event.status < 500) {
+			if (event.status >= 200 && event.status < 400) providerFailure = null;
+			return;
+		}
+		const reason = event.status === 429 ? "provider rate limited (429)" : "provider error (" + event.status + ")";
+		providerFailure = {
+			error: classifyGoalError({ status: event.status, message: reason }),
+			retryAfterMs: retryAfterMilliseconds(event.headers ?? {}),
+		};
+		if (goal.headless) goalLog(ctx, "provider_failure_observed", {
+			status: event.status,
+			retryAfterMs: providerFailure.retryAfterMs ?? null,
+		});
+		else recordRuntimeEvent("provider.failure_observed", {
+			status: event.status,
+			retryAfterMs: providerFailure.retryAfterMs ?? null,
+		});
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (isSubagentSession(ctx)) return;
+		handleSettledProviderFailure(ctx);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -1581,9 +1699,14 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	// 每轮 LLM 响应完成：记录 usage 与 stopReason（外部 agent 可据此判断推理轮次与异常终止）。
 	pi.on("message_end", async (event, ctx) => {
 		if (isSubagentSession(ctx)) return;
-		if (!goal?.headless) return;
-		const msg = event.message as { role?: string; usage?: unknown; stopReason?: string };
+		const msg = event.message as { role?: string; usage?: unknown; stopReason?: string; errorMessage?: string };
 		if (msg.role !== "assistant") return;
+		if (msg.stopReason !== "error") providerFailure = null;
+		else if (!providerFailure && msg.errorMessage) {
+			const error = classifyGoalError(msg.errorMessage);
+			if (error.retryable) providerFailure = { error };
+		}
+		if (!goal?.headless) return;
 		goalLog(ctx, "llm_response", {
 			...(msg.usage === undefined ? {} : { usage: msg.usage }),
 			...(msg.stopReason === undefined ? {} : { stopReason: msg.stopReason }),
@@ -1769,6 +1892,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// Skip our own extension-injected messages (e.g. /goal <objective> drafts
 		// the goal via sendUserMessage) — those are not user interrupts.
 		if (goal?.status === "active" && event.source !== "extension") {
+			clearRetryTimer();
+			providerFailure = null;
+			userSuspended = false;
 			const payload = { source: event.source, input: summarizeValue(event, 500) };
 			if (goal.headless) goalLog(ctx, "steering_received", payload);
 			else recordRuntimeEvent("steering.received", payload);
@@ -1793,6 +1919,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			pauseGoal("interrupted", ctx);
 			return;
 		}
+		// Let agent_settled apply typed retry after PI has exhausted its own
+		// provider retry loop. Scheduling a continuation here would race the host
+		// retry and create a duplicate attempt.
+		if (providerFailure) return;
 		if (ctx.hasPendingMessages()) return;
 
 		// Completion checks only consume goal-driven turns. V2 evaluates exactly
@@ -3098,6 +3228,8 @@ export function createPiGoalExtension(
 		complete,
 		minContinueIntervalMs: CONFIG.minContinueIntervalMs,
 		now: Date.now,
+		setTimeout,
+		clearTimeout,
 		setInterval,
 		clearInterval,
 		...dependencies,

@@ -22,4 +22,11 @@ describe("published Goal Contract V3 schemas", () => {
 		assert.equal(schema.$defs.digest.properties.algorithm.const, "sha256");
 		assert.deepEqual(schema.$defs.lineage.required, ["goalDefinitionId", "revisionId", "runId", "attemptId"]);
 	});
+
+	it("the project spec publishes the bounded retry policy", () => {
+		const schema = JSON.parse(fs.readFileSync(path.join(root, "schemas", "goal-project-spec-v3.schema.json"), "utf8"));
+		assert.equal(schema.properties.retry.additionalProperties, false);
+		assert.equal(schema.properties.retry.properties.maxInfrastructureAttempts.minimum, 1);
+		assert.equal(schema.properties.retry.properties.maxSchemaRepairs.minimum, 0);
+	});
 });

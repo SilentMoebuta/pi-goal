@@ -139,6 +139,156 @@ async function execute(api: HeadlessFakeAPI, name: string, params: unknown, ctx:
 }
 
 describe("headless goal lifecycle", () => {
+	it("does not pause the goal for an intermediate provider failure that the host recovers", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const retryTimers: Array<{ callback: () => void; delayMs: number }> = [];
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({
+			setTimeout: ((callback: () => void, delayMs: number) => {
+				retryTimers.push({ callback, delayMs });
+				return retryTimers.length;
+			}) as never,
+			clearTimeout: (() => {}) as never,
+		})(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		await api.emit("after_provider_response", { status: 429, headers: { "retry-after": "1" } }, ctx);
+		await api.emit("message_end", { message: { role: "assistant", stopReason: "stop", usage: { output: 1 } } }, ctx);
+		await api.emit("agent_settled", {}, ctx);
+
+		const view = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(view.status, "active");
+		assert.equal(view.runtime.attemptNumber, 1);
+		assert.equal(retryTimers.length, 0, "the host's successful retry must clear the candidate failure");
+	});
+
+	it("starts a fresh Goal attempt only after the host settles with a provider failure", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const retryTimers: Array<{ callback: () => void; delayMs: number }> = [];
+		const cleared: unknown[] = [];
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({
+			setTimeout: ((callback: () => void, delayMs: number) => {
+				retryTimers.push({ callback, delayMs });
+				return retryTimers.length;
+			}) as never,
+			clearTimeout: ((timer: unknown) => { cleared.push(timer); }) as never,
+		})(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		await api.emit("after_provider_response", { status: 503, headers: {} }, ctx);
+		await api.emit("agent_end", { messages: [] }, ctx);
+		assert.equal(retryTimers.length, 0, "agent_end must not race the host retry lifecycle");
+		await api.emit("agent_settled", {}, ctx);
+		assert.equal(retryTimers.length, 1);
+		assert.equal(retryTimers[0].delayMs, 10_000);
+
+		let view = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(view.status, "active");
+		assert.equal(view.runtime.attemptNumber, 1);
+		assert.match(view.pausedReason, /retrying attempt 2/);
+
+		retryTimers[0].callback();
+		await Promise.resolve();
+		view = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(view.status, "active");
+		assert.equal(view.runtime.attemptNumber, 2);
+		assert.equal(view.runtime.previousAttemptId.endsWith(":attempt:1"), true);
+		assert.equal(view.runtime.attemptId.endsWith(":attempt:2"), true);
+		assert.equal(view.pausedReason, null);
+		assert.ok(api.sent.some((entry) => entry.options?.deliverAs === "followUp" && entry.options?.triggerTurn === true));
+
+		const events = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.ok(events.some((entry) => entry.type === "retry_scheduled" && entry.nextAttemptNumber === 2));
+		assert.ok(events.some((entry) => entry.type === "retry_attempt_started" && entry.attemptNumber === 2));
+		assert.deepEqual(cleared, []);
+	});
+
+	it("ends headless recovery only after the typed infrastructure-attempt limit", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const retryTimers: Array<{ callback: () => void; delayMs: number }> = [];
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({
+			setTimeout: ((callback: () => void, delayMs: number) => {
+				retryTimers.push({ callback, delayMs });
+				return retryTimers.length;
+			}) as never,
+			clearTimeout: (() => {}) as never,
+		})(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		for (let nextAttempt = 2; nextAttempt <= 5; nextAttempt++) {
+			await api.emit("after_provider_response", { status: 503, headers: {} }, ctx);
+			await api.emit("agent_settled", {}, ctx);
+			const timer = retryTimers[nextAttempt - 2];
+			assert.ok(timer, `attempt ${nextAttempt} was scheduled`);
+			timer.callback();
+			await Promise.resolve();
+			const active = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+			assert.equal(active.status, "active");
+			assert.equal(active.runtime.attemptNumber, nextAttempt);
+		}
+
+		await api.emit("after_provider_response", { status: 503, headers: {} }, ctx);
+		await api.emit("agent_settled", {}, ctx);
+		const limited = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(limited.status, "usage_limited");
+		assert.equal(limited.runtime.attemptNumber, 5);
+		assert.equal(retryTimers.length, 4, "no sixth automatic attempt is scheduled");
+		assert.equal(ctx.shutdownState.calls, 1);
+		const result = JSON.parse(fs.readFileSync(path.join(cwd, "spec.result.json"), "utf8"));
+		assert.equal(result.status, "usage_limited");
+		assert.equal(result.exit.code, 1);
+		const events = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(events.at(-1).type, "terminal", "terminal remains the final event after retry exhaustion");
+		assert.ok(events.some((entry) => entry.type === "retry_exhausted" && entry.attemptNumber === 5));
+	});
+
+	it("applies the blueprint retry policy to the settled provider runtime", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown({
+			retry: { maxInfrastructureAttempts: 2, maxSchemaRepairs: 0, baseDelayMs: 25, maxDelayMs: 25 },
+		}));
+		const retryTimers: Array<{ callback: () => void; delayMs: number }> = [];
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({
+			setTimeout: ((callback: () => void, delayMs: number) => {
+				retryTimers.push({ callback, delayMs });
+				return retryTimers.length;
+			}) as never,
+			clearTimeout: (() => {}) as never,
+		})(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		await api.emit("after_provider_response", { status: 503, headers: {} }, ctx);
+		await api.emit("agent_settled", {}, ctx);
+		assert.equal(retryTimers[0]?.delayMs, 25);
+		retryTimers[0].callback();
+		await Promise.resolve();
+
+		await api.emit("after_provider_response", { status: 503, headers: {} }, ctx);
+		await api.emit("agent_settled", {}, ctx);
+		const limited = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(limited.status, "usage_limited");
+		assert.equal(limited.runtime.attemptNumber, 2);
+		assert.equal(retryTimers.length, 1, "the custom policy must prevent a third attempt");
+	});
+
 	it("uses the same update_goal action API and state transitions for interactive and headless blueprints", async () => {
 		const headlessCwd = project();
 		const interactiveCwd = project();

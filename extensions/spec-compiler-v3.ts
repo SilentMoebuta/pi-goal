@@ -7,6 +7,7 @@ import {
 	type BlueprintEvidenceExpectation,
 	type BlueprintNodeEvidence,
 	type BlueprintReview,
+	type BlueprintRetry,
 	type BlueprintVerification,
 	type GoalSpecDoc,
 	type HeadlessBlueprint,
@@ -44,6 +45,7 @@ export interface GoalProjectSpecV3 {
 	review?: BlueprintReview;
 	verification?: BlueprintVerification;
 	budget?: BlueprintBudget;
+	retry?: BlueprintRetry;
 	completion?: Omit<BlueprintCompletion, "policy">;
 }
 
@@ -110,6 +112,7 @@ export function parseGoalProjectSpecV3(value: unknown): ParseGoalProjectSpecResu
 		...(value.review === undefined ? {} : { review: value.review }),
 		...(value.verification === undefined ? {} : { verification: value.verification }),
 		...(value.budget === undefined ? {} : { budget: value.budget }),
+		...(value.retry === undefined ? {} : { retry: value.retry }),
 		...(value.completion === undefined ? {} : { completion: { ...(isRecord(value.completion) ? value.completion : {}), policy: "v2" } }),
 	};
 	const parsedBlueprint = parseBlueprint(rawBlueprint);
@@ -148,6 +151,7 @@ export function parseGoalProjectSpecV3(value: unknown): ParseGoalProjectSpecResu
 			...(parsedBlueprint.blueprint.review ? { review: parsedBlueprint.blueprint.review } : {}),
 			...(parsedBlueprint.blueprint.verification ? { verification: parsedBlueprint.blueprint.verification } : {}),
 			...(parsedBlueprint.blueprint.budget ? { budget: parsedBlueprint.blueprint.budget } : {}),
+			...(parsedBlueprint.blueprint.retry ? { retry: parsedBlueprint.blueprint.retry } : {}),
 			...(parsedBlueprint.blueprint.completion ? { completion: { maxAutoTurns: parsedBlueprint.blueprint.completion.maxAutoTurns } } : {}),
 		},
 	};
@@ -164,6 +168,7 @@ export function compileGoalProjectSpecV3(value: unknown): CompiledGoalSpecV3 {
 		...(source.review ? { review: source.review } : {}),
 		...(source.verification ? { verification: source.verification } : {}),
 		...(source.budget ? { budget: source.budget } : {}),
+		...(source.retry ? { retry: source.retry } : {}),
 		completion: { policy: "v2", ...(source.completion ?? {}) },
 	};
 	const doc: GoalSpecDoc = {
@@ -228,6 +233,7 @@ export function migrateGoalSpecMarkdownV2ToV3(markdown: string): MigratedGoalSpe
 			...(blueprint.review ? { review: blueprint.review } : {}),
 			...(blueprint.verification ? { verification: blueprint.verification } : {}),
 			...(blueprint.budget ? { budget: blueprint.budget } : {}),
+			...(blueprint.retry ? { retry: blueprint.retry } : {}),
 			...(blueprint.completion?.maxAutoTurns ? { completion: { maxAutoTurns: blueprint.completion.maxAutoTurns } } : {}),
 		},
 	};

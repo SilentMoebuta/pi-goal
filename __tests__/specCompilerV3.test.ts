@@ -20,6 +20,7 @@ const SOURCE = {
 	outputs: [{ uri: "workspace://brief.md", description: "Research brief" }],
 	execution: { topology: "direct" },
 	review: { requirement: "required", checklist: ["Trace claims to sources"] },
+	retry: { maxInfrastructureAttempts: 3, maxSchemaRepairs: 1, baseDelayMs: 250, maxDelayMs: 2000 },
 };
 
 describe("Goal Project Spec V3 compiler", () => {
@@ -28,9 +29,16 @@ describe("Goal Project Spec V3 compiler", () => {
 		assert.equal(compiled.contractVersion, 3);
 		assert.equal(compiled.doc.machine.contractVersion, 3);
 		assert.equal(compiled.doc.machine.profile, "research/default");
+		assert.deepEqual(compiled.doc.machine.blueprint?.retry, SOURCE.retry);
 		assert.match(compiled.markdown, /submit_completion_bundle/);
 		assert.match(compiled.markdown, /goal-reviewer/);
 		assert.doesNotMatch(JSON.stringify(SOURCE), /submit_completion_bundle|sessionFile|Ready\/Not ready/);
+	});
+
+	it("rejects malformed retry policy at the project-spec boundary", () => {
+		const invalid = parseGoalProjectSpecV3({ ...SOURCE, retry: { maxInfrastructureAttempts: 0, baseDelayMs: 1000, maxDelayMs: 10 } });
+		assert.equal(invalid.ok, false);
+		if (!invalid.ok) assert.ok(invalid.issues.some((entry) => entry.message.includes("blueprint.retry")));
 	});
 
 	it("rejects project instructions that restate legacy completion protocol", () => {
@@ -62,6 +70,7 @@ describe("Goal Project Spec V3 compiler", () => {
 				blueprint: {
 					entry: { prompt: "Call record_review, then request_completion using reviewerSessionFile." },
 					execution: { topology: "direct" },
+					retry: { maxInfrastructureAttempts: 2, baseDelayMs: 500, maxDelayMs: 500 },
 				},
 			},
 		});
@@ -69,6 +78,7 @@ describe("Goal Project Spec V3 compiler", () => {
 		assert.equal(migrated.spec.schemaVersion, 3);
 		assert.equal(migrated.spec.instructions, undefined);
 		assert.equal(migrated.warnings[0]?.code, "legacy_protocol");
+		assert.deepEqual(migrated.spec.retry, { maxInfrastructureAttempts: 2, baseDelayMs: 500, maxDelayMs: 500 });
 		const compiled = compileGoalProjectSpecV3(migrated.spec);
 		assert.match(compiled.markdown, /submit_completion_bundle/);
 		assert.doesNotMatch(compiled.markdown, /reviewerSessionFile/);

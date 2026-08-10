@@ -932,15 +932,15 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		assert.match(ctx.statusUpdates.at(-1) ?? "", /0 tok.*active 1s.*wall 1s/);
 		assert.equal(api.branch.length, snapshotsBeforeTick, "ticker redraws must never append snapshots");
 
-		await api.emit("after_provider_response", { status: 429, headers: {} }, ctx);
-		const usageEvent = api.sent.find(({ message }) => message?.details?.kind === "usage_limited")?.message;
-		assert.equal(usageEvent?.details?.progress?.status, "usage_limited");
-		const eventWall = usageEvent.details.progress.resources.wallMs;
+		await api.commands.get("goal").handler("pause", ctx);
+		const pauseEvent = api.sent.find(({ message }) => message?.details?.kind === "paused")?.message;
+		assert.equal(pauseEvent?.details?.progress?.status, "paused");
+		const eventWall = pauseEvent.details.progress.resources.wallMs;
 		const afterPause = ctx.statusUpdates.length;
 		const wallBefore = (await publicGoal(api, ctx)).usage.wallMs;
 		clock.advance(1_100);
 		assert.equal(ctx.statusUpdates.length, afterPause);
-		assert.equal(usageEvent.details.progress.resources.wallMs, eventWall, "historical event progress does not drift with the live wall clock");
+		assert.equal(pauseEvent.details.progress.resources.wallMs, eventWall, "historical event progress does not drift with the live wall clock");
 		const wallAfter = (await publicGoal(api, ctx)).usage.wallMs;
 		assert.ok(wallAfter > wallBefore, "wall time continues for a resumable pause");
 
@@ -949,7 +949,7 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 			toolResults: [],
 		}, ctx);
 		const paused = await publicGoal(api, ctx);
-		assert.equal(paused.status, "usage_limited");
+		assert.equal(paused.status, "paused");
 		assert.equal(paused.usage.tokensUsed, 33);
 		assert.ok(paused.usage.activeMs >= 1_000 && paused.usage.activeMs < 2_000);
 		await api.emit("session_shutdown", {}, ctx);

@@ -29,6 +29,7 @@ const FULL_BLUEPRINT: HeadlessBlueprint = {
 	review: { requirement: "required", model: "anthropic/sonnet", thinkingLevel: "high", tools: ["read", "bash"], checklist: ["运行契约测试", "确认无新依赖"], maxTurns: 120 },
 	verification: { command: "npm test", timeoutMs: 120000 },
 	budget: { tokens: 500000 },
+	retry: { maxInfrastructureAttempts: 4, maxSchemaRepairs: 1, baseDelayMs: 2500, maxDelayMs: 30000 },
 	completion: { policy: "v2", maxAutoTurns: 200 },
 };
 
@@ -155,12 +156,20 @@ describe("headless blueprint parse", () => {
 	});
 
 	it("rejects invalid verification and budget", () => {
-		const result = parseBlueprint({ verification: { timeoutMs: -1 }, budget: { tokens: 0 }, completion: { policy: "v9" } });
+		const result = parseBlueprint({
+			verification: { timeoutMs: -1 },
+			budget: { tokens: 0 },
+			retry: { maxInfrastructureAttempts: 0, maxSchemaRepairs: -1, baseDelayMs: 200, maxDelayMs: 100 },
+			completion: { policy: "v9" },
+		});
 		assert.equal(result.ok, false);
 		if (!result.ok) {
 			assert.ok(result.errors.some((error) => error.includes("command")));
 			assert.ok(result.errors.some((error) => error.includes("timeoutMs")));
 			assert.ok(result.errors.some((error) => error.includes("tokens")));
+			assert.ok(result.errors.some((error) => error.includes("maxInfrastructureAttempts")));
+			assert.ok(result.errors.some((error) => error.includes("maxSchemaRepairs")));
+			assert.ok(result.errors.some((error) => error.includes("maxDelayMs")));
 			assert.ok(result.errors.some((error) => error.includes("policy")));
 		}
 	});

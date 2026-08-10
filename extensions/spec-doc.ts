@@ -354,6 +354,14 @@ export interface BlueprintBudget {
 	tokens?: number;
 }
 
+export interface BlueprintRetry {
+	/** Total infrastructure attempts, including the initial attempt. */
+	maxInfrastructureAttempts?: number;
+	maxSchemaRepairs?: number;
+	baseDelayMs?: number;
+	maxDelayMs?: number;
+}
+
 export interface BlueprintCompletion {
 	policy?: "legacy" | "shadow" | "v2";
 	maxAutoTurns?: number;
@@ -375,6 +383,7 @@ export interface HeadlessBlueprint {
 	review?: BlueprintReview;
 	verification?: BlueprintVerification;
 	budget?: BlueprintBudget;
+	retry?: BlueprintRetry;
 	completion?: BlueprintCompletion;
 }
 
@@ -672,6 +681,40 @@ export function parseBlueprint(value: unknown): ParseBlueprintResult {
 		}
 	}
 
+	let retry: BlueprintRetry | undefined;
+	if (value.retry !== undefined) {
+		if (!isRecord(value.retry)) {
+			shapeError(errors, "blueprint.retry", "must be an object");
+		} else {
+			const retryValue = value.retry;
+			const positiveInteger = (field: "maxInfrastructureAttempts"): number | undefined => {
+				const raw = retryValue[field];
+				const parsed = typeof raw === "number" && Number.isInteger(raw) && raw > 0 ? raw : undefined;
+				if (raw !== undefined && parsed === undefined) shapeError(errors, `blueprint.retry.${field}`, "must be a positive integer");
+				return parsed;
+			};
+			const nonNegativeInteger = (field: "maxSchemaRepairs" | "baseDelayMs" | "maxDelayMs"): number | undefined => {
+				const raw = retryValue[field];
+				const parsed = typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : undefined;
+				if (raw !== undefined && parsed === undefined) shapeError(errors, `blueprint.retry.${field}`, "must be a non-negative safe integer");
+				return parsed;
+			};
+			const maxInfrastructureAttempts = positiveInteger("maxInfrastructureAttempts");
+			const maxSchemaRepairs = nonNegativeInteger("maxSchemaRepairs");
+			const baseDelayMs = nonNegativeInteger("baseDelayMs");
+			const maxDelayMs = nonNegativeInteger("maxDelayMs");
+			if (baseDelayMs !== undefined && maxDelayMs !== undefined && maxDelayMs < baseDelayMs) {
+				shapeError(errors, "blueprint.retry.maxDelayMs", "must be greater than or equal to baseDelayMs");
+			}
+			retry = {
+				...(maxInfrastructureAttempts !== undefined ? { maxInfrastructureAttempts } : {}),
+				...(maxSchemaRepairs !== undefined ? { maxSchemaRepairs } : {}),
+				...(baseDelayMs !== undefined ? { baseDelayMs } : {}),
+				...(maxDelayMs !== undefined ? { maxDelayMs } : {}),
+			};
+		}
+	}
+
 	let completion: BlueprintCompletion | undefined;
 	if (value.completion !== undefined) {
 		if (!isRecord(value.completion)) {
@@ -721,6 +764,7 @@ export function parseBlueprint(value: unknown): ParseBlueprintResult {
 		...(review ? { review } : {}),
 		...(verification ? { verification } : {}),
 		...(budget && Object.keys(budget).length > 0 ? { budget } : {}),
+		...(retry && Object.keys(retry).length > 0 ? { retry } : {}),
 		...(completion && Object.keys(completion).length > 0 ? { completion } : {}),
 	};
 	return { ok: true, blueprint };

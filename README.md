@@ -225,6 +225,7 @@ A blueprint spec is the regular goal spec markdown plus a `blueprint` JSON block
     },
     "verification": { "command": "npm test", "timeoutMs": 120000 },
     "budget": { "tokens": 500000 },
+    "retry": { "maxInfrastructureAttempts": 5, "maxSchemaRepairs": 2, "baseDelayMs": 10000, "maxDelayMs": 120000 },
     "completion": { "policy": "v2", "maxAutoTurns": 200 }
   }
 }
@@ -245,7 +246,10 @@ Blueprint fields:
 | `review` | Reviewer requirement + checklist + model/thinking. The checklist is injected into the spawned reviewer. |
 | `verification.command` | Deterministic verification command run before each completion evaluation. **Trusted projects only** (pass `--approve` or trust the project). |
 | `budget.tokens` | Token budget; the run stops at `budget_limited` with a result file. |
+| `retry` | Bounded typed retry policy. Infrastructure failures start a fresh attempt after PI's provider retries settle; schema repairs do not consume an infrastructure attempt. Defaults: 5 total infrastructure attempts, 2 schema repairs, 10s base delay, 120s delay cap. |
 | `completion.policy` | `legacy` / `shadow` / `v2`. |
+
+Interactive goals can set the same defaults in trusted `.pi/goal.json` under `retryPolicy`; a blueprint's `retry` fields take precedence for that run.
 
 ### Result file
 

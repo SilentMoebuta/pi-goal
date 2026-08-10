@@ -8,7 +8,22 @@ describe("goal config v2", () => {
 		assert.equal(config.reviewPolicy, "risk_based");
 		assert.equal(config.defaultExecution, "auto");
 		assert.equal(config.completionPolicy, "v2");
+		assert.equal(config.retryPolicy, undefined);
 		assert.deepEqual(warnings, []);
+	});
+
+	it("parses bounded retryPolicy for interactive goals", () => {
+		const { config, warnings } = parseGoalConfig({ retryPolicy: { maxInfrastructureAttempts: 3, maxSchemaRepairs: 1, baseDelayMs: 100, maxDelayMs: 1000 } });
+		assert.deepEqual(config.retryPolicy, { maxInfrastructureAttempts: 3, maxSchemaRepairs: 1, baseDelayMs: 100, maxDelayMs: 1000 });
+		assert.deepEqual(warnings, []);
+	});
+
+	it("rejects malformed retryPolicy fields without disabling other config", () => {
+		const { config, warnings } = parseGoalConfig({ completionPolicy: "legacy", retryPolicy: { maxInfrastructureAttempts: 0, maxDelayMs: 1, baseDelayMs: 10 } });
+		assert.equal(config.completionPolicy, "legacy");
+		assert.deepEqual(config.retryPolicy, { baseDelayMs: 10 });
+		assert.ok(warnings.some((warning) => warning.includes("maxInfrastructureAttempts")));
+		assert.ok(warnings.some((warning) => warning.includes("maxDelayMs")));
 	});
 
 	it("accepts legacy flat keys for one compatibility cycle", () => {
