@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import piGoalExtension, { createPiGoalExtension } from "../extensions/index";
+import { GoalRuntimeHooksV3 } from "../extensions/runtime-v3";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
@@ -51,7 +52,7 @@ afterEach(() => {
 	process.exitCode = 0;
 });
 
-function project() {
+function project(configOverride: Record<string, unknown> = {}) {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-goal-headless-lifecycle-"));
 	cleanupPaths.push(cwd);
 	fs.mkdirSync(path.join(cwd, ".pi"));
@@ -60,6 +61,7 @@ function project() {
 		superpowersIntegration: false,
 		completionPolicy: "v2",
 		reviewPolicy: "risk_based",
+		...configOverride,
 	}));
 	return cwd;
 }
@@ -287,6 +289,118 @@ describe("headless goal lifecycle", () => {
 		assert.equal(limited.status, "usage_limited");
 		assert.equal(limited.runtime.attemptNumber, 2);
 		assert.equal(retryTimers.length, 1, "the custom policy must prevent a third attempt");
+	});
+
+	it("enforces configured capability approval in the live tool_call path", async () => {
+		const cwd = project({
+			capabilityGrants: [{ capability: "filesystem.write", scopes: ["outputs/**"], source: "repository" }],
+			approvalRequiredCapabilities: ["filesystem.write"],
+		});
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({ setTimeout: (() => 1) as never, clearTimeout: (() => {}) as never })(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		const toolCallHandler = api.handlers.get("tool_call")?.[0];
+		assert.ok(toolCallHandler, "tool_call handler registered");
+		const result = await toolCallHandler({ toolName: "write", toolCallId: "write-1", input: { path: "outputs/host-smoke.md", content: "x" } }, ctx);
+		assert.equal((result as { block?: boolean } | undefined)?.block, true);
+		const view = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(view.status, "paused");
+		assert.match(view.pausedReason, /Approval is required/);
+		assert.deepEqual(view.runtimeControl.approvals, []);
+	});
+
+	it("persists side-effect prepare/settle journal across session reconstruction", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension()(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		const prepared = await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "marker-write-1", operation: "write", resource: "outputs/host-smoke.md", request: { content: "x" },
+		}, ctx);
+		const entryId = prepared.details.entry.id;
+		const settled = await execute(api, "settle_goal_side_effect", { entryId, response: { ok: true } }, ctx);
+		assert.equal(settled.details.entry.status, "committed");
+		let view = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(view.runtimeControl.sideEffectJournal[0].status, "committed");
+
+		await api.emit("session_tree", {}, ctx);
+		const reconstructed = await execute(api, "get_goal", {}, ctx);
+		view = JSON.parse(reconstructed.content[0].text);
+		assert.equal(view.runtimeControl.sideEffectJournal[0].status, "committed");
+		const replay = await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "marker-write-1", operation: "write", resource: "outputs/host-smoke.md", request: { content: "x" },
+		}, ctx);
+		assert.equal(replay.details.action, "replay");
+	});
+
+	it("restores an unresolved side effect as reconcile without duplicating the entry", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension()(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const prepared = await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "reconcile-1", operation: "write", resource: "outputs/reconcile.md", request: { content: "x" },
+		}, ctx);
+		await api.emit("session_tree", {}, ctx);
+		const view = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+		assert.equal(view.runtimeControl.sideEffectJournal.length, 1);
+		const retry = await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "reconcile-1", operation: "write", resource: "outputs/reconcile.md", request: { content: "x" },
+		}, ctx);
+		assert.equal(retry.details.action, "reconcile");
+		assert.equal(retry.details.entry.id, prepared.details.entry.id);
+	});
+
+	it("fails closed when a persisted runtime checkpoint is tampered with", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension()(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "tamper-1", operation: "write", resource: "outputs/tampered.md", request: { content: "x" },
+		}, ctx);
+		const runtimeEvent = api.branch.find((entry) => entry.customType === "pi-goal:runtime-event-v3" && entry.data?.type === "goal.side_effect_prepared");
+		assert.ok(runtimeEvent);
+		runtimeEvent.data.payload.checkpoint.sideEffects[0].resource = "outputs/changed.md";
+		await api.emit("session_tree", {}, ctx);
+		const result = await execute(api, "get_goal", {}, ctx);
+		assert.match(result.content[0].text, /Runtime control checkpoint rejected: checkpoint checksum mismatch/);
+	});
+
+	it("runs an injected deterministic pre-tool hook in the live host event path", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const hooks = new GoalRuntimeHooksV3();
+		hooks.register({ id: "deny-writes", target: "tool", phase: "pre", run: (input) => input.operation === "write" ? { deny: true, reason: "write requires an adapter" } : undefined });
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({ runtimeHooks: hooks })(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const toolCallHandler = api.handlers.get("tool_call")?.[0];
+		assert.ok(toolCallHandler);
+		const result = await toolCallHandler({ toolName: "write", toolCallId: "write-hook-1", input: { path: "outputs/host-smoke.md", content: "x" } }, ctx);
+		assert.equal((result as { block?: boolean } | undefined)?.block, true);
+		assert.match((result as { reason?: string }).reason ?? "", /adapter/);
 	});
 
 	it("uses the same update_goal action API and state transitions for interactive and headless blueprints", async () => {

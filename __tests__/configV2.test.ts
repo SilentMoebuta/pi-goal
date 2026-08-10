@@ -26,6 +26,16 @@ describe("goal config v2", () => {
 		assert.ok(warnings.some((warning) => warning.includes("maxDelayMs")));
 	});
 
+	it("parses capability grants and approval requirements only from typed fields", () => {
+		const { config, warnings } = parseGoalConfig({
+			capabilityGrants: [{ capability: "filesystem.write", scopes: ["docs/**"], source: "repository" }],
+			approvalRequiredCapabilities: ["filesystem.write"],
+		});
+		assert.deepEqual(config.capabilityGrants, [{ capability: "filesystem.write", scopes: ["docs/**"], source: "repository" }]);
+		assert.deepEqual(config.approvalRequiredCapabilities, ["filesystem.write"]);
+		assert.deepEqual(warnings, []);
+	});
+
 	it("accepts legacy flat keys for one compatibility cycle", () => {
 		const { config } = parseGoalConfig({ judgeModel: "openai/evaluator", verifyTimeoutMs: 5000 });
 		assert.equal(config.evaluatorModel, "openai/evaluator");

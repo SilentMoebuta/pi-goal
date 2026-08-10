@@ -80,8 +80,17 @@ import {
 	classifyGoalError,
 	createGoalEventV3,
 	decideGoalRetry,
+	authorizeGoalOperation,
+	prepareGoalSideEffect,
+	settleGoalSideEffect,
+	GoalRuntimeHooksV3,
+	createGoalRuntimeCheckpointV3,
+	deserializeGoalRuntimeCheckpointV3,
 	rolloverRuntimeAttempt,
 	type GoalEventEnvelopeV3,
+	type GoalApprovalRecordV3,
+	type GoalSideEffectJournalEntryV3,
+	type GoalCapabilityGrantV3,
 } from "./runtime-v3";
 import { buildGoalPublicViewV3 } from "./goal-contract-v3-adapter";
 import {
@@ -150,6 +159,7 @@ interface PiGoalRuntimeDependencies {
 	clearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
 	setInterval: (callback: () => void, ms: number) => ReturnType<typeof setInterval>;
 	clearInterval: (timer: ReturnType<typeof setInterval>) => void;
+	runtimeHooks?: GoalRuntimeHooksV3;
 }
 
 function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDependencies) {
@@ -169,6 +179,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		});
 	}
 	const nowMs = dependencies.now;
+	const runtimeHooks = dependencies.runtimeHooks ?? new GoalRuntimeHooksV3();
 	let goal: GoalState | null = null;
 	let goalConfig: GoalConfig = DEFAULT_GOAL_CONFIG;
 	let judgeParseFailures = 0;
@@ -207,6 +218,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	let runtimeEventSeq = 0;
 	let providerFailure: { error: GoalErrorV3; retryAfterMs?: number } | null = null;
 	let retryTimer: ReturnType<typeof setTimeout> | null = null;
+	let approvals: GoalApprovalRecordV3[] = [];
+	let sideEffectJournal: GoalSideEffectJournalEntryV3[] = [];
 
 	type ActiveGoalOperationFence = Readonly<{
 		goalId: string;
@@ -323,6 +336,120 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!goal) return;
 		const entry = traceRuntimeEvent(type, payload, options);
 		if (entry) pi.appendEntry(GOAL_RUNTIME_EVENT_TYPE, entry);
+	}
+
+	function currentRuntimeLineage() {
+		if (!goal) return null;
+		const runtime = goal.runtime ?? createInitialRuntimeMetadataV3({ goalId: goal.id, entrypoint: goal.headless ? "headless" : "interactive" });
+		return {
+			goalDefinitionId: runtime.goalDefinitionId,
+			revisionId: runtime.revisionId,
+			runId: runtime.runId,
+			attemptId: runtime.attemptId,
+		};
+	}
+
+	function recordRuntimeControlEvent(type: string, payload: Record<string, unknown>): void {
+		if (!goal) return;
+		const lineage = currentRuntimeLineage();
+		if (!lineage) return;
+		const checkpoint = createGoalRuntimeCheckpointV3({
+			lineage,
+			state: { goalId: goal.id, status: goal.status, objective: goal.objective },
+			artifacts: [],
+			approvals: structuredClone(approvals),
+			sideEffects: structuredClone(sideEffectJournal),
+			lastEventSeq: runtimeEventSeq + 1,
+			createdAt: nowMs(),
+		});
+		recordRuntimeEvent(type, { ...payload, checkpoint });
+	}
+
+	function runRuntimeHook(input: {
+		target: "goal" | "session" | "tool" | "node" | "evaluation" | "error";
+		phase: "pre" | "post";
+		operation: string;
+		payload: Record<string, unknown>;
+		result?: unknown;
+		error?: GoalErrorV3;
+	}): GoalErrorV3 | null {
+		const lineage = currentRuntimeLineage();
+		if (!lineage) return null;
+		const result = runtimeHooks.run({ ...input, lineage });
+		if (result.ok) return null;
+		return result.error;
+	}
+
+	function toolCapability(toolName: string, input: Record<string, unknown>): { capability: string; scope: string } | null {
+		const normalizePathScope = (value: unknown): string => {
+			if (typeof value !== "string" || !value.trim()) return "<unspecified>";
+			const absolute = path.isAbsolute(value) ? value : path.resolve(runtimeCwd, value);
+			const relative = path.relative(runtimeCwd, absolute).replaceAll(path.sep, "/");
+			return relative && !relative.startsWith("..") ? relative : "external:" + absolute;
+		};
+		if (toolName === "write" || toolName === "edit") return { capability: "filesystem.write", scope: normalizePathScope(input.path ?? input.filePath) };
+		if (toolName === "bash") return { capability: "process.exec", scope: typeof input.command === "string" ? input.command : "<unspecified>" };
+		if (toolName === "spawn_role") return { capability: "agent.spawn", scope: typeof input.role === "string" ? input.role : "<unspecified>" };
+		if (toolName === "dag_execute" || toolName === "workflow_execute") return { capability: "workflow.execute", scope: typeof input.workflowId === "string" ? input.workflowId : "<unspecified>" };
+		return null;
+	}
+
+	function addApproval(input: { capability: string; scope: string; decidedBy: string }): GoalApprovalRecordV3 | null {
+		if (!goal || !goal.runtime) return null;
+		const approval: GoalApprovalRecordV3 = {
+			id: `${goal.runtime.runId}:approval:${approvals.length + 1}`,
+			revisionId: goal.runtime.revisionId,
+			capability: input.capability,
+			scope: input.scope,
+			decision: "granted",
+			requestedAt: nowMs(),
+			decidedAt: nowMs(),
+			decidedBy: input.decidedBy,
+		};
+		approvals.push(approval);
+		recordRuntimeControlEvent("goal.approval_decided", { approval });
+		return approval;
+	}
+
+	async function authorizeToolCall(event: { toolName: string; toolCallId: string; input: Record<string, unknown> }, ctx: ExtensionContext): Promise<{ block: boolean; reason?: string; terminate?: boolean }> {
+		if (!goal || goal.status !== "active") return { block: false };
+		const hookError = runRuntimeHook({ target: "tool", phase: "pre", operation: event.toolName, payload: { toolCallId: event.toolCallId, input: event.input } });
+		if (hookError) {
+			recordRuntimeEvent("tool.authorization_denied", { tool: event.toolName, toolCallId: event.toolCallId, error: hookError });
+			return { block: true, reason: hookError.message, terminate: Boolean(goal.headless) };
+		}
+		const access = toolCapability(event.toolName, event.input);
+		const grants = goalConfig.capabilityGrants;
+		if (!access || !grants || grants.length === 0) return { block: false };
+		const requiresApproval = goalConfig.approvalRequiredCapabilities?.includes(access.capability) === true;
+		let authorization = authorizeGoalOperation({
+			capability: access.capability,
+			scope: access.scope,
+			revisionId: goal.runtime?.revisionId ?? "legacy",
+			grants,
+			approvals,
+			requiresApproval,
+		});
+		if (!authorization.allowed && authorization.error.code === "approval_required" && ctx.hasUI && ctx.ui?.confirm) {
+			const approved = await ctx.ui.confirm("Approve Goal capability?", `${access.capability}\n${access.scope}`);
+			if (approved) {
+				addApproval({ capability: access.capability, scope: access.scope, decidedBy: "user" });
+				authorization = authorizeGoalOperation({
+					capability: access.capability,
+					scope: access.scope,
+					revisionId: goal.runtime?.revisionId ?? "legacy",
+					grants,
+					approvals,
+					requiresApproval,
+				});
+			}
+		}
+		if (authorization.allowed) return { block: false };
+		recordRuntimeEvent("tool.authorization_denied", { tool: event.toolName, toolCallId: event.toolCallId, capability: access.capability, scope: access.scope, error: authorization.error });
+		if (authorization.error.code === "approval_required" && goal.status === "active") {
+			updateState({ status: "paused", pausedReason: authorization.error.message }, ctx);
+		}
+		return { block: true, reason: authorization.error.message, terminate: Boolean(goal.headless) };
 	}
 
 	function withBlueprintEvidenceDiagnostics(evaluation: CompletionEvaluation): CompletionEvaluation {
@@ -737,6 +864,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		judgeParseFailures = 0;
 		lastJudgeVerdict = null;
 		runtimeEventSeq = 0;
+		approvals = [];
+		sideEffectJournal = [];
 		const branch = ctx.sessionManager.getBranch();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
@@ -760,11 +889,33 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						progressRuntime.reset(nowMs(), goal.progress.lastOutcomeDeltaAt);
 						lastOutcomeSignature = outcomeSignature(goal);
 						for (const candidate of branch) {
-							if (candidate.type !== "custom" || candidate.customType !== GOAL_RUNTIME_EVENT_TYPE) continue;
-							const data = (candidate as { data?: { runId?: unknown; seq?: unknown } }).data;
+			if (candidate.type !== "custom" || candidate.customType !== GOAL_RUNTIME_EVENT_TYPE) continue;
+			const data = (candidate as { data?: Partial<GoalEventEnvelopeV3> }).data;
+			if (!data) continue;
 							const seq = data?.seq;
 							if (data?.runId === goal.runtime?.runId && typeof seq === "number" && Number.isSafeInteger(seq)) {
 								runtimeEventSeq = Math.max(runtimeEventSeq, seq);
+								if (data.type === "goal.approval_decided" || data.type === "goal.side_effect_prepared" || data.type === "goal.side_effect_settled") {
+									const rawCheckpoint = data.payload?.checkpoint;
+									if (!rawCheckpoint || typeof rawCheckpoint !== "object") {
+										reconstructionError = "Runtime control event is missing its checkpoint.";
+									goal = null;
+									return;
+									}
+									try {
+										const checkpoint = deserializeGoalRuntimeCheckpointV3(JSON.stringify(rawCheckpoint));
+										if (checkpoint.lineage.runId !== goal.runtime?.runId || checkpoint.lineage.attemptId !== goal.runtime?.attemptId) throw new Error("checkpoint lineage does not match the active Goal run");
+										approvals = structuredClone(checkpoint.approvals);
+										sideEffectJournal = structuredClone(checkpoint.sideEffects);
+									} catch (error) {
+										reconstructionError = "Runtime control checkpoint rejected: " + (error instanceof Error ? error.message : String(error));
+										goal = null;
+										return;
+									}
+								}
+								// The verified checkpoint contains the complete control state for
+								// this event. Do not replay the event payload a second time;
+								// doing so would duplicate approvals and prepared entries.
 							}
 						}
 					}
@@ -796,6 +947,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		newGoal.claims = proposal.claims.map((claim) => ({ ...claim, evidenceRefs: [...claim.evidenceRefs] }));
 		goal = newGoal;
 		providerFailure = null;
+		approvals = [];
+		sideEffectJournal = [];
 		clearRetryTimer();
 		runtimeEventSeq = 0;
 		recordRuntimeEvent("goal.started", { objective: newGoal.objective, entrypoint: "interactive" });
@@ -905,6 +1058,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		clearTimer();
 		const source = goal;
 		const now = nowMs();
+		const sourceApprovals = structuredClone(approvals);
 		clearRetryTimer();
 		providerFailure = null;
 		const sourceRuntime = source.runtime ?? createInitialRuntimeMetadataV3({ goalId: source.id, entrypoint: "interactive" });
@@ -945,6 +1099,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// An interactive fork must not overwrite the source headless result/log files.
 		delete forked.headless;
 		goal = forked;
+		approvals = sourceApprovals;
+		sideEffectJournal = [];
 		runtimeEventSeq = 0;
 		recordRuntimeEvent("goal.forked", { parentRunId: sourceRuntime.runId, previousAttemptId: sourceRuntime.attemptId });
 		progressRuntime.reset(now, forked.progress.lastOutcomeDeltaAt);
@@ -1554,8 +1710,25 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		handleSettledProviderFailure(ctx);
 	});
 
+	pi.on("tool_call", async (event, ctx) => {
+		if (isSubagentSession(ctx) || !goal || goal.status !== "active") return;
+		const input = (event as unknown as { input?: Record<string, unknown> }).input ?? {};
+		return authorizeToolCall({ toolName: event.toolName, toolCallId: event.toolCallId, input }, ctx);
+	});
+
 	pi.on("tool_result", async (event, ctx) => {
 		if (isSubagentSession(ctx)) return;
+		if (goal && goal.status === "active") {
+			const hookError = runRuntimeHook({
+				target: "tool",
+				phase: "post",
+				operation: event.toolName,
+				payload: { toolCallId: event.toolCallId, input: event.input, isError: event.isError },
+				result: event.details,
+				error: event.isError ? classifyGoalError(event.content.map((item) => item.type === "text" ? item.text : "").join("\n")) : undefined,
+			});
+			if (hookError) recordRuntimeEvent("tool.post_hook_denied", { tool: event.toolName, toolCallId: event.toolCallId, error: hookError });
+		}
 		if (event.toolName !== "list_roles" || event.isError) return;
 		const details = event.details && typeof event.details === "object"
 			? event.details as { roles?: unknown }
@@ -2089,8 +2262,12 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					...(goal.completionTransaction ? { completionTransaction: goal.completionTransaction } : {}),
 					execution: goal.execution,
 				assurance: goal.assurance,
-				claims: goal.claims,
-				evidenceLedger: goal.evidenceLedger,
+					claims: goal.claims,
+					evidenceLedger: goal.evidenceLedger,
+					runtimeControl: {
+						approvals: structuredClone(approvals),
+						sideEffectJournal: structuredClone(sideEffectJournal),
+					},
 					completion: { ...goal.completion, lastEvaluation: publicEvaluation },
 					contract: buildGoalPublicViewV3(goal, completionIntegrity),
 					integrity: completionIntegrity,
@@ -2115,6 +2292,52 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					content: [{ type: "text", text: JSON.stringify(view, null, 2) }],
 					details: { goal: view, mode },
 				};
+		},
+	});
+
+	pi.registerTool({
+		name: "prepare_goal_side_effect", label: "Prepare Goal Side Effect",
+		description: "Prepare an external side effect under the Goal V3 idempotency journal. Execute only when the returned action is execute; reconcile or replay existing entries instead of blindly repeating them.",
+		parameters: Type.Object({
+			idempotencyKey: Type.String({ minLength: 1 }),
+			operation: Type.String({ minLength: 1 }),
+			resource: Type.String({ minLength: 1 }),
+			request: Type.Unknown(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			if (!goal || goal.status !== "active" || !goal.runtime) return { content: [{ type: "text", text: "No active Goal runtime." }], isError: true, details: {} };
+			const result = prepareGoalSideEffect({
+				journal: sideEffectJournal,
+				idempotencyKey: params.idempotencyKey,
+				operation: params.operation,
+				resource: params.resource,
+				request: params.request,
+				attemptId: goal.runtime.attemptId,
+				now: nowMs(),
+			});
+			if (result.action === "conflict") return { content: [{ type: "text", text: result.error.message }], isError: true, details: { action: result.action, error: result.error } };
+			if (result.action === "execute") recordRuntimeControlEvent("goal.side_effect_prepared", { entry: result.entry });
+			return { content: [{ type: "text", text: JSON.stringify({ action: result.action, entry: result.entry }) }], details: { action: result.action, entry: result.entry } };
+		},
+	});
+
+	pi.registerTool({
+		name: "settle_goal_side_effect", label: "Settle Goal Side Effect",
+		description: "Commit or fail a prepared Goal V3 side effect and persist its response/error receipt.",
+		parameters: Type.Object({
+			entryId: Type.String({ minLength: 1 }),
+			response: Type.Optional(Type.Unknown()),
+			error: Type.Optional(Type.String()),
+		}),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			if (!goal || goal.status !== "active") return { content: [{ type: "text", text: "No active Goal runtime." }], isError: true, details: {} };
+			if (params.response !== undefined && params.error !== undefined) return { content: [{ type: "text", text: "Settle a side effect with response or error, not both." }], isError: true, details: {} };
+			const index = sideEffectJournal.findIndex((entry) => entry.id === params.entryId);
+			if (index < 0) return { content: [{ type: "text", text: "Unknown side-effect entry: " + params.entryId }], isError: true, details: {} };
+			const entry = settleGoalSideEffect(sideEffectJournal[index], { response: params.response, error: params.error, now: nowMs() });
+			sideEffectJournal[index] = entry;
+			recordRuntimeControlEvent("goal.side_effect_settled", { entry });
+			return { content: [{ type: "text", text: JSON.stringify({ action: entry.status, entry }) }], details: { action: entry.status, entry } };
 		},
 	});
 
@@ -3051,7 +3274,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	pi.registerCommand("goal", {
 		description: "Draft, review, start, inspect, steer, pause, resume, cancel, edit, fork, or clear a persistent goal",
 		getArgumentCompletions: (prefix) => {
-			return ["draft", "review", "start", "status", "pause", "resume", "cancel", "edit", "fork", "clear", "help", "run", "apply", "telemetry"]
+			return ["draft", "review", "start", "status", "pause", "resume", "cancel", "approve", "edit", "fork", "clear", "help", "run", "apply", "telemetry"]
 				.filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
 		},
 		handler: async (args, ctx) => {
@@ -3070,7 +3293,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			}
 			if (!trimmed || trimmed === "status") {
 				if (!goal) {
-					ctx.ui.notify("Usage: /goal draft <objective> [--tokens 50k]\n  /goal review <spec> | start <spec-or-objective> | status | pause | resume | cancel | edit | fork | clear\n\nNo goal currently set.", "info");
+					ctx.ui.notify("Usage: /goal draft <objective> [--tokens 50k]\n  /goal review <spec> | start <spec-or-objective> | status | pause | resume | cancel | approve <capability> <scope> | edit | fork | clear\n\nNo goal currently set.", "info");
 					return;
 				}
 				// Inject a persistent, collapsible goal card into the conversation
@@ -3100,7 +3323,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return;
 			}
 			if (trimmed === "help") {
-				ctx.ui.notify("/goal draft <objective> [--tokens N] — draft and review a goal\n/goal review <path> — review an editable goal spec\n/goal start <path-or-objective> — start from a blueprint or enter the draft/review flow\n/goal status — show current goal\n/goal pause | resume | cancel — control execution\n/goal edit — create a new revision in the editor\n/goal fork — create a child run from current evidence\n/goal clear — remove current state\n/goal telemetry — show completed goal statistics", "info");
+				ctx.ui.notify("/goal draft <objective> [--tokens N] — draft and review a goal\n/goal review <path> — review an editable goal spec\n/goal start <path-or-objective> — start from a blueprint or enter the draft/review flow\n/goal status — show current goal\n/goal pause | resume | cancel — control execution\n/goal approve <capability> <scope> — grant a pending capability for this run\n/goal edit — create a new revision in the editor\n/goal fork — create a child run from current evidence\n/goal clear — remove current state\n/goal telemetry — show completed goal statistics", "info");
 				return;
 			}
 			if (trimmed.startsWith("run ")) {
@@ -3189,6 +3412,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			if (trimmed === "pause") { if (!goal || goal.status !== "active") { ctx.ui.notify("No active goal.", "info"); return; } pauseGoal("user pause", ctx); ctx.ui.notify("Goal paused.", "info"); return; }
 			if (trimmed === "resume") { if (!goal || !canResumeGoal(goal.status)) { ctx.ui.notify("No resumable goal (paused/budget-limited/usage-limited only; blocked/unmet/complete require /goal clear).", "info"); return; } resumeGoal(ctx); ctx.ui.notify("Goal resumed: " + goal.objective.slice(0, 80) + (goal.objective.length > 80 ? "…" : ""), "info"); return; }
 			if (trimmed === "cancel") { if (!goal) { ctx.ui.notify("No goal to cancel.", "info"); return; } if (!cancelGoal("user cancel", ctx)) ctx.ui.notify("Goal is already terminal (" + goal.status + ").", "info"); return; }
+			if (trimmed.startsWith("approve ")) {
+				const match = trimmed.match(/^approve\s+(\S+)\s+(.+)$/);
+				if (!match || !goal || !goal.runtime) { ctx.ui.notify("Usage: /goal approve <capability> <scope>", "warning"); return; }
+				const approval = addApproval({ capability: match[1], scope: match[2].trim(), decidedBy: "user" });
+				if (!approval) { ctx.ui.notify("Could not record approval.", "warning"); return; }
+				if (goal.status === "paused" && /approval|required/i.test(goal.pausedReason ?? "")) resumeGoal(ctx);
+				ctx.ui.notify("Capability approved for this run: " + approval.capability + " " + approval.scope, "info");
+				return;
+			}
 			if (trimmed === "edit") {
 				if (!goal) { ctx.ui.notify("No goal to edit.", "info"); return; }
 				if (!ctx.hasUI) { ctx.ui.notify("/goal edit requires the interactive editor; edit the spec file and use /goal review <path> in non-UI mode.", "warning"); return; }

@@ -452,7 +452,10 @@ function stableJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
 	if (value && typeof value === "object") {
 		const object = value as Record<string, unknown>;
-		return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(",")}}`;
+		// Checkpoints are persisted through JSON. Match JSON's omission of
+		// undefined object properties so an in-memory checkpoint and its
+		// session-restored representation have the same digest.
+		return `{${Object.keys(object).filter((key) => object[key] !== undefined).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(",")}}`;
 	}
 	return JSON.stringify(value) ?? "null";
 }

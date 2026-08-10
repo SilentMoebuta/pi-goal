@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { checkCitationTraceability, checkSourceDiversity, checkConfidenceAnnotation } from "./quality-gates";
 import { TASK_KINDS as TASK_KIND_VALUES, type TaskKind as StateTaskKind } from "./state";
-import type { GoalRetryPolicyV3 } from "./runtime-v3";
+import type { GoalRetryPolicyV3, GoalCapabilityGrantV3 } from "./runtime-v3";
 
 export type TaskKind = StateTaskKind;
 export type ExecutionPreference = "auto" | "direct" | "specialist" | "team";
@@ -73,6 +73,11 @@ export interface GoalConfig {
 	 * not override individual fields. Trusted projects only. */
 	retryPolicy?: Partial<GoalRetryPolicyV3>;
 
+	/** Optional live tool authorization policy. When omitted, native PI tools
+	 * retain their historical behavior. Trusted projects only. */
+	capabilityGrants?: GoalCapabilityGrantV3[];
+	approvalRequiredCapabilities?: string[];
+
 	/** 目录（相对 cwd 或绝对），goal 启动时把完整 spec 写成 md 供用户微调。 */
 	goalSpecDir?: string;
 }
@@ -90,6 +95,8 @@ export const DEFAULT_GOAL_CONFIG: GoalConfig = {
 	defaultExecution: "auto",
 	completionPolicy: "v2",
 	retryPolicy: undefined,
+	capabilityGrants: undefined,
+	approvalRequiredCapabilities: undefined,
 	/** 目录（相对 cwd 或绝对），goal 启动时把完整 spec 写成 md 供用户微调。 */
 	goalSpecDir: "docs/goals",
 };
@@ -1023,6 +1030,38 @@ export function parseGoalConfig(input: unknown): ParsedGoalConfig {
 			config.retryPolicy = Object.keys(parsed).length > 0 ? parsed : undefined;
 		}
 	}
+	if (raw.capabilityGrants !== undefined) {
+		if (!Array.isArray(raw.capabilityGrants)) {
+			warnings.push("capabilityGrants must be an array; using the default");
+		} else {
+			const grants: GoalCapabilityGrantV3[] = [];
+			for (const [index, value] of raw.capabilityGrants.entries()) {
+				if (!value || typeof value !== "object" || Array.isArray(value)) {
+					warnings.push(`capabilityGrants[${index}] must be an object; ignoring it`);
+					continue;
+				}
+				const item = value as Record<string, unknown>;
+				const capability = typeof item.capability === "string" ? item.capability.trim() : "";
+				const source = item.source === "host" || item.source === "user" || item.source === "repository" || item.source === "organization" ? item.source : null;
+				const scopes = Array.isArray(item.scopes) && item.scopes.every((scope) => typeof scope === "string" && scope.trim())
+					? item.scopes.map((scope) => String(scope).trim())
+					: null;
+				if (!capability || !source || !scopes || scopes.length === 0) {
+					warnings.push(`capabilityGrants[${index}] requires capability, non-empty scopes, and a valid source; ignoring it`);
+					continue;
+				}
+				grants.push({ capability, scopes, source });
+			}
+			config.capabilityGrants = grants.length > 0 ? grants : undefined;
+		}
+	}
+	if (raw.approvalRequiredCapabilities !== undefined) {
+		if (!Array.isArray(raw.approvalRequiredCapabilities) || raw.approvalRequiredCapabilities.some((value) => typeof value !== "string" || !value.trim())) {
+			warnings.push("approvalRequiredCapabilities must be an array of non-empty strings; using the default");
+		} else {
+			config.approvalRequiredCapabilities = [...new Set(raw.approvalRequiredCapabilities.map((value) => String(value).trim()))];
+		}
+	}
 	const specDir = typeof raw.goalSpecDir === "string" ? raw.goalSpecDir.trim() : "";
 	config.goalSpecDir = specDir || "docs/goals";
 
@@ -1030,6 +1069,7 @@ export function parseGoalConfig(input: unknown): ParsedGoalConfig {
 		"schemaVersion", "superpowersIntegration", "evaluatorModel", "judgeModel",
 		"verifyCommand", "stuckEscalateModel", "verifyTimeoutMs", "forceTaskType",
 		"reviewPolicy", "defaultExecution", "completionPolicy", "retryPolicy", "goalSpecDir",
+		"capabilityGrants", "approvalRequiredCapabilities",
 	]);
 	for (const key of Object.keys(raw)) {
 		if (!knownKeys.has(key)) warnings.push("unknown goal config key: " + key);
