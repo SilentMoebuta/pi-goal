@@ -29,6 +29,7 @@ The completion policy, verification strategy, and execution topology are separat
   - [Result file](#result-file)
   - [Real-time log](#real-time-log)
   - [Example: calling from a program](#example-calling-from-a-program)
+  - [Designing token-efficient headless specs](#designing-token-efficient-headless-specs)
 - [Model Tools](#model-tools)
 - [Evidence And Completion](#evidence-and-completion)
 - [State Machine](#state-machine)
@@ -81,12 +82,16 @@ Goal achieved! ✅
 
 | Command | Description |
 |---|---|
-| `/goal <objective> [--tokens N]` | Draft a Goal V2 for review. `--tokens 50k` / `--tokens=1m` set an optional token budget. |
+| `/goal draft <objective> [--tokens N]` | Draft a Goal V2 for review. `--tokens 50k` / `--tokens=1m` set an optional token budget. |
+| `/goal review <spec>` | Review an editable goal spec without starting it. |
+| `/goal start <spec-or-objective>` | Start a blueprint spec or enter the interactive draft/review flow for an objective. |
 | `/goal` or `/goal status` | Show the unified Goal Progress view (route, outcomes, activity, evidence, assurance, health, resources). |
-| `/goal run <spec.md>` | Start a goal from a headless blueprint spec (same code path as `--goal-run`; confirms once when a goal is active). |
+| `/goal run <spec.md>` | Start a blueprint spec through the interactive runtime. It shares the spec parser and Goal Contract with `--goal-run`, but keeps live steering and does not create headless result/log sidecars. |
 | `/goal apply <spec.md>` | Load and review a goal spec document (edit it, then start). |
 | `/goal pause` | Pause the active goal. |
 | `/goal resume` | Resume a paused or limited goal. |
+| `/goal edit` | Edit the active goal and create a new revision. |
+| `/goal fork` | Create a child run from the active goal's evidence and lineage. |
 | `/goal clear` | Remove the current goal. |
 | `/goal telemetry` | Show completed-goal statistics (routing, review, rejections, tokens) for policy calibration. |
 | `/goal help` | Show usage. |
@@ -229,6 +234,7 @@ Blueprint fields:
 
 | Field | Meaning |
 |---|---|
+| `entry.prompt` | Extra startup instructions injected into the headless goal. Use it for a short, explicit execution protocol when the efficient path is already known. |
 | `execution.topology` | `direct` / `specialist` / `team`. |
 | `execution.role` | A registered role from the pi-roles catalog (specialist topology). |
 | `execution.roleDefs` | Ad-hoc role definitions (compatible with `spawn_role` / `dag_execute` roleDefs): name, description, prompt, tools, maxTurns, model, thinkingLevel. |
@@ -319,6 +325,248 @@ echo "goal status: $status"
 
 For long runs, stream `tail -f "$SPEC.goal.jsonl"` and act on `budget_warning` / `completion_evaluated` / `terminal` lines as they arrive.
 
+### Designing token-efficient headless specs
+
+A headless blueprint can do more than describe the desired outcome. When the
+caller already knows the relevant inputs, output path, review policy, and
+verification command, the spec can also define a **bounded fast path**. This is
+useful for repeatable production work where open-ended repository discovery,
+duplicate self-review, or unnecessary role orchestration would spend tokens
+without improving the result.
+
+The goal is not to script every sentence the model must produce. Specify the
+known control flow and boundaries, while leaving the substantive reasoning to
+the agent:
+
+| Put in the spec | Leave to the agent |
+|---|---|
+| Exact input and output paths | How to synthesize the supplied evidence |
+| Required content blocks and outcome criteria | The clearest wording and local organization |
+| Execution topology and reviewer tools | Reasoning inside the bounded task |
+| When review and deterministic verification happen | How to fix a concrete reviewer finding |
+| Evidence and completion action order | Whether a genuine ambiguity requires a recorded deviation |
+
+#### Efficiency principles
+
+1. **Prefer `direct` for one artifact.** A team or DAG adds value only when
+   there are genuinely independent workstreams. Risk can require a reviewer
+   without requiring team execution.
+2. **Provide an evidence capsule, not a discovery request.** Pre-extract the
+   smallest complete set of facts the task needs. List exact paths and say
+   whether broader discovery is allowed. If a required fact is absent, the
+   agent should record a deviation instead of silently searching unrelated
+   material.
+3. **Use a CLI tool allowlist for hard limits.** `entry.prompt` is guided
+   policy. `pi --tools ...`, `--exclude-tools ...`, and an optional project
+   guard extension are the enforcement layer for tools and paths.
+4. **Review at the first useful checkpoint.** For a new artifact, read the
+   declared inputs, write one draft, then review it. For an existing artifact,
+   review the current file before editing it. Do not spend a full turn on
+   speculative polishing before the reviewer identifies a real defect.
+5. **Patch first.** Findings should include stable IDs and anchors. Fix local
+   or section findings with a targeted edit, then re-review those finding IDs.
+   Reserve full rewrites for an explicit global structural failure.
+6. **Verify once, at completion.** Put deterministic checks in
+   `blueprint.verification`. The completion evaluator runs them when completion
+   is requested. Avoid running the same command before review and after every
+   small edit unless the task genuinely needs an intermediate safety check.
+7. **Record the final outcome once.** Batch one artifact evidence item across
+   all criteria it proves. If evidence changes after a review was recorded,
+   assurance becomes stale, so the reliable final order is:
+
+   ```text
+   final reviewer returns
+     -> record_evidence
+     -> record_review
+     -> request_completion
+   ```
+
+8. **Bound both agent and reviewer loops.** Set a realistic token budget and
+   `maxAutoTurns`; explicitly set reviewer `model`, `thinkingLevel`, and
+   `maxTurns`, and require the parent to pass them in its `spawn_role` call. A
+   focused re-review should receive only the original finding IDs, required
+   fixes, and changed anchors.
+9. **Stop after completion is requested.** Do not read the artifact, reviewer
+   transcript, or goal state again unless completion returns a concrete
+   blocking finding. The result file and JSONL log are the caller's audit
+   channel.
+
+#### Example: one reviewed Markdown artifact from bounded inputs
+
+This generic example creates one section from two prepared inputs. The main
+agent has no shell or discovery tools. A reviewer checks the artifact, the
+final artifact is recorded once against all criteria, and a deterministic
+command runs during completion evaluation.
+
+This example assumes `pi-roles` is installed because a transcript-backed
+independent review requires a real spawned reviewer session. If the task does
+not require independent review, set `review.requirement` to `none` and omit the
+reviewer and `record_review` steps.
+
+````markdown
+# Goal: Produce a reviewed operations section
+
+## Original request
+
+> Write one publishable Markdown section from the approved brief and evidence capsule.
+
+## Objective
+
+Create `outputs/operations.md` from the two declared inputs. The section must
+be concise, traceable to the capsule, and ready for publication after an
+independent review.
+
+## Acceptance criteria
+
+- [ ] `blocking` `outputs/operations.md` exists, starts with `## Operations`, and contains the required Summary, Actions, and Limitations blocks
+- [ ] `blocking` Every factual statement is supported by `inputs/evidence-capsule.md`
+- [ ] `blocking` No internal IDs, source paths, or drafting instructions appear in the output
+
+## Constraints
+
+- Read only `inputs/section-brief.md`, `inputs/evidence-capsule.md`, and an existing `outputs/operations.md`
+- Create or edit only `outputs/operations.md`
+- Do not list directories or search for additional sources; record a deviation if a blocking input is missing
+- Use targeted edits for local findings; rewrite the whole artifact only for an explicit global structural finding
+
+## Machine fields
+
+```json
+{
+  "taskKind": "general",
+  "blueprint": {
+    "entry": {
+      "prompt": "Use the bounded fast path. If outputs/operations.md exists, read the two exact inputs and the existing artifact, then immediately spawn an independent reviewer before editing. Otherwise read the two inputs, write one draft to the exact output path, and immediately spawn the reviewer. Pass model=provider/reviewer-model, thinkingLevel=high, maxTurns=12, and read-only tools explicitly to spawn_role. Fix only structured findings, re-review by finding ID, then call record_evidence, record_review, and request_completion in that order. Do not call get_goal or perform discovery."
+    },
+    "execution": {
+      "topology": "direct"
+    },
+    "evidence": {
+      "criteria": [
+        {
+          "id": "c1",
+          "kinds": ["artifact"],
+          "minCount": 1,
+          "verification": "verified",
+          "note": "Use one final artifact entry and attach it to c1, c2, and c3."
+        },
+        {
+          "id": "c2",
+          "kinds": ["artifact"],
+          "minCount": 1,
+          "verification": "verified"
+        },
+        {
+          "id": "c3",
+          "kinds": ["artifact"],
+          "minCount": 1,
+          "verification": "verified"
+        }
+      ]
+    },
+    "review": {
+      "requirement": "required",
+      "model": "provider/reviewer-model",
+      "thinkingLevel": "high",
+      "tools": ["read"],
+      "checklist": [
+        "Check all required blocks and factual support against the two declared inputs",
+        "Report each blocking issue with a stable ID, target path, anchor, and required fix",
+        "Mark local findings for targeted edits; require a rewrite only for a global structural defect"
+      ],
+      "maxTurns": 12
+    },
+    "verification": {
+      "command": "test -s outputs/operations.md && grep -q '^## Operations' outputs/operations.md",
+      "timeoutMs": 30000
+    },
+    "budget": {
+      "tokens": 30000
+    },
+    "completion": {
+      "policy": "v2",
+      "maxAutoTurns": 16
+    }
+  }
+}
+```
+````
+
+Launch it with a narrow main-agent tool surface:
+
+```bash
+pi \
+  --tools read,write,edit,spawn_role,update_goal \
+  --exclude-tools list_roles,dag_execute,dag_resume \
+  --approve \
+  --goal-run spec.md \
+  -p "Run the goal defined by --goal-run to completion."
+```
+
+After the final reviewer returns, the goal agent should use one artifact entry
+for all three criteria, then record the real reviewer session, then request
+completion:
+
+```ts
+update_goal({
+  action: "record_evidence",
+  evidence: {
+    id: "final-operations-artifact",
+    kind: "artifact",
+    summary: "The reviewed operations section satisfies all three criteria.",
+    locator: "outputs/operations.md",
+    verification: "verified"
+  },
+  criterionIds: ["c1", "c2", "c3"]
+})
+
+update_goal({
+  action: "record_review",
+  review: {
+    status: "passed",
+    reason: "The independent reviewer found no open blocking issues.",
+    evaluator: {
+      kind: "reviewer",
+      agentId: "<spawned-reviewer-agent-id>",
+      sessionId: "<reviewer-session-id>"
+    },
+    sessionFile: "<archived-reviewer-session-file>",
+    findings: [],
+    advisories: []
+  }
+})
+
+update_goal({
+  action: "request_completion",
+  summary: "The artifact is written, independently reviewed, and ready for deterministic verification."
+})
+```
+
+The reviewer identity fields must come from the actual spawned reviewer
+session. Do not invent them, use the parent agent ID as the reviewer session
+ID, or replace the transcript-backed review with an observation.
+
+#### Common sources of wasted work
+
+| Anti-pattern | Better spec |
+|---|---|
+| "Inspect the repository and find the relevant files" when paths are already known | List the exact inputs and say what to do if one is incomplete |
+| Give the agent a large raw corpus | Build a small, verified evidence capsule upstream |
+| Use `team` for one sequential artifact | Use `direct`, with a separate reviewer only when assurance requires it |
+| Run verification before review and after every edit | Configure one deterministic completion verification |
+| Let a re-review repeat the full audit | Pass only open finding IDs, fixes, and changed anchors |
+| Record one evidence item per criterion when one artifact proves all of them | Attach one stable evidence ID to multiple `criterionIds` |
+| Record review before the final evidence mutation | Record final evidence first, then the transcript-backed review |
+| Call `get_goal` after every step | Trust tool responses; use the JSONL log externally for monitoring |
+| Treat an existing artifact as disposable | Review first, then patch only the located defects |
+| Set very high turn limits "just in case" | Use measured limits and increase them only when logs show real work was cut off |
+
+This pattern is intentionally narrow. Use a broader topology and discovery
+tools when the task is genuinely exploratory, the relevant files are unknown,
+or independent workstreams can run in parallel. A false fast path that omits
+necessary evidence saves tokens by lowering quality, which is not an
+optimization.
+
 **Headless gotchas**
 
 - A goal that would pause for user input (e.g., three identical completion rejections, budget exhaustion, rate limiting) **ends the run** in headless mode — the result file records the pause reason and the exit code is non-zero. The caller decides whether to retry with a different spec/budget.
@@ -326,6 +574,25 @@ For long runs, stream `tail -f "$SPEC.goal.jsonl"` and act on `budget_warning` /
 - `verification.command` runs arbitrary shell — only use it in trusted projects (`--approve`).
 
 ## Model Tools
+
+`get_goal` accepts `mode: "compact" | "full" | "delta"`. The interactive
+`/goal` commands and the `--goal-run` headless adapter use the same persisted
+Goal Contract V3 state, event envelope, completion bundle, artifact digest,
+and revision/run/attempt lineage. `draft`, `review`, `start`, `pause`, `resume`,
+`edit`, `fork`, and `clear` are available from the interactive command; user
+guidance is retained as a steering event.
+
+V3 schemas are published under `schemas/`, including the event envelope and
+runtime checkpoint. V2 snapshots and existing headless result/JSONL fields are
+still decoded and emitted as compatibility projections.
+
+The reusable P3 evaluation surface is exported from the extension package:
+four neutral benchmark fixtures (`coding`, `research`, `document`, `business`),
+deterministic checks, LLM-judge/pairwise/human-annotation contracts, historical
+regression reports, OTel-compatible trace spans, runtime metrics, and fault
+injection helpers. Interactive lifecycle events are written to
+`docs/goals/trace.jsonl` (or `<headless-log>.trace.jsonl`); traces can be turned
+into redacted offline trajectory samples without exposing prompt contents.
 
 The agent (and you, in tool-capable setups) manages the goal through three tools:
 
@@ -344,7 +611,7 @@ The agent (and you, in tool-capable setups) manages the goal through three tools
 | `request_completion` | Store a completion summary and request evaluation; does **not** mark the goal complete by itself. |
 | `record_review` | Persist an independent review from a real spawned reviewer session (transcript-verified; findings must bind to criteria/evidence). |
 | `change_execution` | Change or lock the execution preference, selected topology, and optional registered specialist role. |
-| `record_deviation` | Record a blueprint deviation (subjectId/description/reason/impact) — required whenever the agent deviates from a headless blueprint. |
+| `record_deviation` | Record a blueprint deviation (subjectId/description/reason/impact) — required whenever the agent deviates from a declared blueprint in any entrypoint. |
 | `mark_unmet` | End the goal as unmet with a concrete blocker. |
 | `pause` | Pause the goal and report why to the user. |
 
@@ -353,14 +620,15 @@ Example:
 ```ts
 update_goal({
   action: "record_evidence",
-  criterionId: "criterion-1",
   evidence: {
+    id: "full-test-suite",
     kind: "command",
     summary: "The full test suite passed.",
     locator: "npm test",
     origin: "tool",
     verification: "verified"
-  }
+  },
+  criterionIds: ["criterion-1"]
 })
 
 update_goal({

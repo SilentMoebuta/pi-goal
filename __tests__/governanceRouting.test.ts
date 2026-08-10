@@ -22,7 +22,7 @@ describe("injectSuperpowersCoding — goalTaskType 分流 (深修 C)", () => {
 		assert.equal(injectSuperpowersCoding(DEFAULT_GOAL_CONFIG, "coding"), true);
 	});
 
-	for (const t of ["research", "pm", "review"] as const) {
+	for (const t of ["research", "document", "business", "pm", "review"] as const) {
 		it(`suppresses coding gate for ${t} goalTaskType (no competing instructions)`, () => {
 			assert.equal(injectSuperpowersCoding(DEFAULT_GOAL_CONFIG, t), false, `goalTaskType=${t} should suppress coding gate`);
 		});
@@ -63,6 +63,15 @@ describe("taskGovernanceBlock — per-task-type governance (深修 C)", () => {
 		assert.ok(block.includes("reviewer") || block.includes("论证"), `pm governance should mention reviewer/论证, got: ${block.slice(0, 200)}`);
 	});
 
+	it("document and business use their own non-coding workflows", () => {
+		const document = taskGovernanceBlock("document");
+		assert.match(document, /audience|structure|artifact/i);
+		assert.doesNotMatch(document, /TDD/);
+		const business = taskGovernanceBlock("business");
+		assert.match(business, /decision|approval|audit/i);
+		assert.doesNotMatch(business, /TDD/);
+	});
+
 	it("review → 审计清单 + reviewer 复核", () => {
 		const block = taskGovernanceBlock("review");
 		assert.ok(block.includes("审计") || block.includes("复核"), `review governance should mention 审计/复核, got: ${block.slice(0, 200)}`);
@@ -84,5 +93,20 @@ describe("taskGovernanceBlock — per-task-type governance (深修 C)", () => {
 		}
 		// coding governance should NOT carry the reviewer-roleDef hint (no reviewer gate for coding)
 		assert.ok(!taskGovernanceBlock("coding").includes("doom-loop"), "coding governance should not carry reviewer-roleDef hint (no reviewer gate)");
+	});
+
+	it("separates Contract V3 typed reviewer guidance from the legacy transcript protocol", () => {
+		const atomic = taskGovernanceBlock("research", "atomic-v3");
+		assert.match(atomic, /goal-reviewer/);
+		assert.match(atomic, /resultRef/);
+		assert.match(atomic, /submit_completion_bundle/);
+		assert.doesNotMatch(atomic, /✅ Ready|❌ Not ready|sessionFile|session 文件名/);
+
+		const legacy = taskGovernanceBlock("research", "legacy-v2");
+		assert.match(legacy, /✅ Ready/);
+		assert.doesNotMatch(legacy, /submit_completion_bundle/);
+
+		const none = taskGovernanceBlock("research", "none");
+		assert.doesNotMatch(none, /report_role_result|goal-reviewer|doom-loop/);
 	});
 });

@@ -14,7 +14,7 @@ describe("legacy completion compatibility gate", () => {
 	});
 
 	it("does not require review merely because a goal is non-coding", () => {
-		for (const taskType of ["research", "pm", "review"] as const) {
+		for (const taskType of ["research", "document", "business", "pm", "review"] as const) {
 			assert.equal(canComplete(makeGoal({ taskType, reviewerPassed: false })).ok, true);
 		}
 	});

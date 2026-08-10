@@ -1,5 +1,5 @@
 import type { AssuranceDecision, CompletionFinding, CompletionEvaluation, GoalStateV2, StoredGoalCriterionV2 } from "./state";
-import { DEFAULT_GOAL_CONFIG, taskRoutingBlock, taskGovernanceBlock, executionDecisionBlock, injectSuperpowersCoding, type GoalConfig } from "./config";
+import { DEFAULT_GOAL_CONFIG, taskRoutingBlock, taskGovernanceBlock, executionDecisionBlock, injectSuperpowersCoding, type GoalConfig, type ReviewerProtocolHint } from "./config";
 import { escapeXml, formatDuration, formatTokens } from "./util";
 
 export type GoalState = GoalStateV2;
@@ -98,11 +98,31 @@ export function legacyAcceptedEvaluation(goal: GoalState, reason: string, evalua
 
 export function reviewerTranscriptContractBlock(goal: GoalState): string {
 	if (goal.assurance.reviewRequirement === "none") return "";
+	if (usesAtomicCompletionV3(goal)) {
+		return "\n\nGoal Contract V3 completion protocol:\n" +
+			"- Use the read-only goal-reviewer role for the independent completion review. Pass exact criteria, evidence IDs, deterministic checks, and artifact paths.\n" +
+			"- The reviewer returns decision, summary, criterionCoverage, structured findings, artifact SHA-256/size receipts, and an immutable resultRef.\n" +
+			"- Compute the same lowercase SHA-256 digests and byte sizes from current artifact bytes.\n" +
+			"- Submit artifacts, evidence, deterministicChecks, and reviewerResultRef in one update_goal action=submit_completion_bundle call.\n" +
+			"- Do not inspect reviewer session files, parse identifiers from filenames, use symbolic verdict phrases, or separately record review/completion.\n";
+	}
 	return "\n\nReviewer transcript contract:\n" +
 		"- report_role_result.findings[0] must be exactly `✅ Ready` or `❌ Not ready`.\n" +
 		"- Every blocking finding must then name code, subjectId (criterion, claim, or $constraint:n), and either evidenceRefs or missingEvidenceKind.\n" +
 		"- For report/artifact defects also provide scope (local/section/global), targetPath, sectionId, anchor, requiredFix, and rewriteRequired. rewriteRequired may be true only for a global structural defect and must include rewriteReason.\n" +
 		"- Submit those same identifiers through update_goal action=record_review; unbound or contradictory verdicts are rejected.\n";
+}
+
+export function usesAtomicCompletionV3(goal: GoalState): boolean {
+	return goal.runtime?.contractVersion === 3
+		&& goal.assurance.reviewRequirement !== "none"
+		&& goal.completion.requestedAt === null
+		&& goal.completion.lastEvaluation === null;
+}
+
+function reviewerProtocolHint(goal: GoalState): ReviewerProtocolHint {
+	if (goal.assurance.reviewRequirement === "none") return "none";
+	return usesAtomicCompletionV3(goal) ? "atomic-v3" : "legacy-v2";
 }
 
 // continuationPrompt — uses string concatenation (no template literals with backticks)
@@ -148,7 +168,7 @@ export function superpowersDisciplineBlock(): string {
 		"      The user is not present. You make the call.\\n\\n" +
 		"      GOAL: <copy objective from above>\\n" +
 		"      REVIEWING: <the design, plan, or code being evaluated>\\n\\n" +
-			"      Evaluate on THREE dimensions, then call report_role_result. findings[0] must be exactly ✅ Ready or ❌ Not ready:\\n" +
+		"      Evaluate on THREE dimensions, then call report_role_result with findings[0] as an object containing id, decision=approve|reject, reason, and evidenceRefs:\\n" +
 		"      1. PROCESS - was the superpowers process followed?\\n" +
 		"      2. TECHNICAL - does it work? Are there placeholders?\\n" +
 		"      3. USER VALUE - does this deliver what the goal requires?\\n\\n" +
@@ -169,14 +189,26 @@ export function superpowersDisciplineBlock(): string {
 	);
 }
 
-export function headlessBlueprintBlock(goal: GoalState): string {
+function blueprintEntrypoint(goal: GoalState): "interactive" | "headless" | "api" {
+	return goal.runtime?.entrypoint ?? (goal.headless ? "headless" : "interactive");
+}
+
+export function goalBlueprintBlock(goal: GoalState): string {
 	const blueprint = goal.blueprint;
 	if (!blueprint) return "";
-	const lines: string[] = ["\n<HEADLESS-BLUEPRINT>"];
-	lines.push("This goal runs headless from a pre-specified blueprint. Treat it as STRONG guidance.");
+	const entrypoint = blueprintEntrypoint(goal);
+	const lines: string[] = ["\n<GOAL-BLUEPRINT>"];
+	lines.push("Entrypoint: " + entrypoint + ". Treat this pre-specified blueprint as STRONG guidance.");
+	if (entrypoint === "headless") {
+		lines.push("This run runs unattended for an external caller; durable progress and terminal state are projected through the goal log and result artifact.");
+	} else if (entrypoint === "interactive") {
+		lines.push("The user can steer the run in real time and can pause, resume, edit, or fork it from the interactive session.");
+	} else {
+		lines.push("The API caller controls lifecycle and steering; preserve durable state so control can resume from checkpoints.");
+	}
 	lines.push("If you deviate from any declared item (topology, roles, DAG nodes, evidence expectations, review setup),");
 	lines.push("you MUST call update_goal({ action: \"record_deviation\", subjectId?, description, reason, impact }) as you deviate.");
-	lines.push("Unreported deviations are the one unforgivable failure mode in a headless run.");
+	lines.push("An unreported deviation is a blueprint contract violation regardless of entrypoint.");
 	if (blueprint.entry?.prompt) {
 		lines.push("");
 		lines.push("Entry instructions:");
@@ -236,21 +268,29 @@ export function headlessBlueprintBlock(goal: GoalState): string {
 		lines.push("");
 		lines.push("Verification command: " + blueprint.verification.command + (blueprint.verification.timeoutMs ? " (timeout " + blueprint.verification.timeoutMs + "ms)" : ""));
 	}
-	lines.push("</HEADLESS-BLUEPRINT>");
+	lines.push("</GOAL-BLUEPRINT>");
 	return lines.join("\n");
 }
 
-/** 每轮续跑：蓝图指令 + 偏离必报要求 + 证据期望 + reviewer checklist。 */
-export function headlessContinuationBlock(goal: GoalState): string {
+/** Per-turn blueprint guidance, specialized only where entrypoint lifecycle semantics differ. */
+export function goalBlueprintContinuationBlock(goal: GoalState): string {
 	const blueprint = goal.blueprint;
 	if (!blueprint) return "";
-	const block = headlessBlueprintBlock(goal);
+	const block = goalBlueprintBlock(goal);
 	if (!block) return "";
-	return "\n\n" + block + "\n\n" +
-		"This run is headless: every turn, record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence })" +
-		" so the external caller sees durable progress in the goal log. If you must stop for a user decision," +
-		" call update_goal({ action: \"pause\", reason }) — the run ends and reports instead of waiting silently.\n";
+	const entrypoint = blueprintEntrypoint(goal);
+	const lifecycleGuidance = entrypoint === "headless"
+		? "This run runs unattended: every turn, record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence }) so the external caller sees durable progress in the goal log. If a user decision is required, call update_goal({ action: \"pause\", reason }) so the run reports instead of waiting silently."
+		: entrypoint === "interactive"
+			? "The user can steer the run in real time. Reconcile new instructions with the blueprint and durable goal state before continuing. Every turn, record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence }); use pause/resume when execution should stop and continue."
+			: "Accept lifecycle control and steering from the API caller. Every turn, record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence }) so checkpoints and status projections remain durable.";
+	return "\n\n" + block + "\n\n" + lifecycleGuidance + "\n";
 }
+
+/** @deprecated Use goalBlueprintBlock; retained for extension API compatibility. */
+export const headlessBlueprintBlock = goalBlueprintBlock;
+/** @deprecated Use goalBlueprintContinuationBlock; retained for extension API compatibility. */
+export const headlessContinuationBlock = goalBlueprintContinuationBlock;
 
 export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG, maxAutoTurns = Number(process.env.GOAL_MAX_AUTO_TURNS) || 200): string {
 	const budgetLine = goal.tokenBudget != null
@@ -264,17 +304,20 @@ export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT
 		: "";
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const criteriaInstruction = goal.criteria.length > 0
-		? "\n3. Record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence: {...} }).\n4. Maintain research claims with action: \"upsert_claim\" when applicable.\n5. When blocking outcomes are satisfied, call update_goal({ action: \"request_completion\", summary })."
+		? "\n3. Record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence: {...} }).\n4. Maintain research claims with action: \"upsert_claim\" when applicable.\n5. " +
+			(usesAtomicCompletionV3(goal)
+				? "When blocking outcomes are satisfied, obtain a goal-reviewer resultRef and call update_goal({ action: \"submit_completion_bundle\", ... })."
+				: "When blocking outcomes are satisfied, call update_goal({ action: \"request_completion\", summary }).")
 		: "";
 
 	return (
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
 		(injectSuperpowersCoding(config, goal.taskKind) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
-			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind) : "") +
+			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind, reviewerProtocolHint(goal)) : "") +
 			executionDecisionBlock(goal.execution) +
 			reviewerTranscriptContractBlock(goal) +
 			completionFeedbackBlock(goal, config) +
-		headlessContinuationBlock(goal) +
+		goalBlueprintContinuationBlock(goal) +
 		"---\n\n" +
 		"Continue working toward the active goal.\n\n" +
 		"<untrusted_objective>\n" +
@@ -336,6 +379,9 @@ export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_G
 	const budgetInfo = goal.tokenBudget != null
 		? "Token budget: " + formatTokens(goal.tokenBudget) + " (" + formatTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) + " remaining)"
 		: "No token budget";
+	const completionInstruction = usesAtomicCompletionV3(goal)
+		? "When blocking outcomes are satisfied, obtain an independent goal-reviewer resultRef and submit one atomic update_goal action=submit_completion_bundle.\n"
+		: 'When blocking outcomes are satisfied, call update_goal({ action: "request_completion", summary: "..." }).\n';
 
 	return "## Active Goal\n\n" +
 		"<untrusted_objective>\n" +
@@ -348,11 +394,11 @@ export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_G
 		criteriaBlock + "\n\n" +
 		"Use get_goal to check the current state.\n" +
 		"Use update_goal action=record_evidence to add evidence to the ledger.\n" +
-		'When blocking outcomes are satisfied, call update_goal({ action: "request_completion", summary: "..." }).\n' +
+		completionInstruction +
 		"The completion evaluator uses the persisted ledger, claims, deterministic verification, and the latest response." +
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
-			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind) : "") +
+			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind, reviewerProtocolHint(goal)) : "") +
 			executionDecisionBlock(goal.execution) + reviewerTranscriptContractBlock(goal) + completionFeedbackBlock(goal, config) +
-		headlessContinuationBlock(goal) +
+		goalBlueprintContinuationBlock(goal) +
 		executionFailureGuidanceBlock();
 }

@@ -28,7 +28,11 @@ export interface SpecClaim {
 }
 
 export interface SpecMachine {
+	contractVersion?: number;
 	taskKind?: string;
+	profile?: string;
+	inputs?: Array<{ uri: string; description: string; mediaType?: string; required?: boolean }>;
+	outputs?: Array<{ uri: string; description: string; mediaType?: string; required?: boolean }>;
 	execution?: {
 		preference?: string;
 		selected?: string;

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { parseBlueprint, type GoalSpecDoc, type HeadlessBlueprint } from "../extensions/spec-doc";
 import {
 	appendGoalLog,
+	appendGoalEventLog,
 	buildGoalLogEntry,
 	buildGoalResultView,
 	createGoalFromBlueprint,
@@ -114,9 +115,24 @@ describe("validateBlueprint", () => {
 		assert.equal(bareSpecialist.ok, false);
 		if (!bareSpecialist.ok) assert.ok(bareSpecialist.errors.some((error) => error.includes("specialist")));
 	});
+
+	it("accepts document/business task kinds and rejects unsupported kinds before runtime creation", () => {
+		for (const taskKind of ["document", "business"]) {
+			const result = validateBlueprint(BLUEPRINT, doc({ machine: { taskKind } }), { trusted: true });
+			assert.equal(result.ok, true, taskKind);
+		}
+		const unsupported = validateBlueprint(BLUEPRINT, doc({ machine: { taskKind: "legal-report" } }), { trusted: true });
+		assert.equal(unsupported.ok, false);
+		if (!unsupported.ok) assert.ok(unsupported.errors.some((error) => error.includes("machine.taskKind")));
+	});
 });
 
 describe("createGoalFromBlueprint", () => {
+	it("creates document and business goals without falling back to coding", () => {
+		assert.equal(makeGoal(BLUEPRINT, { machine: { taskKind: "document" } }).taskKind, "document");
+		assert.equal(makeGoal(BLUEPRINT, { machine: { taskKind: "business" } }).taskKind, "business");
+	});
+
 	it("builds a locked execution decision from the blueprint topology", () => {
 		const goal = makeGoal(BLUEPRINT);
 		assert.equal(goal.execution.selected, "team");
@@ -132,6 +148,8 @@ describe("createGoalFromBlueprint", () => {
 		assert.equal(goal.criteria[1].id, "c2");
 		assert.equal(goal.claims[0].id, "parity");
 		assert.equal(goal.headless?.logPath.includes("spec.goal.jsonl"), true);
+		assert.equal(goal.runtime?.entrypoint, "headless");
+		assert.equal(goal.runtime?.goalDefinitionId, goal.id);
 	});
 
 	it("defaults assurance to advisory and budget to null when unspecified", () => {
@@ -151,6 +169,9 @@ describe("buildGoalResultView", () => {
 		goal.criteria[0].evidenceRefs.push("e1");
 		const view = buildGoalResultView(goal, 2000);
 		assert.equal(view.status, "active");
+		assert.equal(view.contractVersion, 3);
+		assert.equal((view.lineage as { runId: string }).runId, goal.runtime?.runId);
+		assert.equal((view.contract as { run: { entrypoint: string } }).run.entrypoint, "headless");
 		const criteria = view.criteria as Array<{ id: string; status: string }>;
 		assert.equal(criteria[0].status, "verified");
 		assert.equal(criteria[1].status, "pending");
@@ -201,6 +222,23 @@ describe("summarizeValue", () => {
 });
 
 describe("goal log and result files", () => {
+	it("writes monotonic V3 event envelopes while retaining legacy flat fields", () => {
+		const goal = makeGoal(BLUEPRINT);
+		const first = appendGoalEventLog(goal, "tool_started", { tool: "read" }, 1000, { nodeId: "n1" });
+		const second = appendGoalEventLog(goal, "tool_ended", { tool: "read", ok: true }, 1001, { nodeId: "n1", causationId: first.eventId });
+		assert.equal(first.schemaVersion, 3);
+		assert.equal(first.seq, 1);
+		assert.equal(second.seq, 2);
+		assert.equal(second.causationId, first.eventId);
+		assert.equal(second.goalId, goal.runtime?.goalDefinitionId);
+		assert.equal(second.runId, goal.runtime?.runId);
+		assert.equal(second.attemptId, goal.runtime?.attemptId);
+		assert.equal(second.ts, second.time);
+		assert.equal(second.tool, "read", "V1 readers retain the flat payload projection");
+		const disk = fs.readFileSync(goal.headless!.logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.deepEqual(disk.map((entry) => entry.seq), [1, 2]);
+	});
+
 	it("appends JSONL entries and a terminal result file", () => {
 		const goal = makeGoal(BLUEPRINT);
 		appendGoalLog(goal.headless!.logPath, buildGoalLogEntry(goal.id, "goal_started", { objective: goal.objective }, 1000));

@@ -10,9 +10,13 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createGoalStateV2, type GoalStateV2, type TaskKind } from "./state";
+import { TASK_KINDS, createGoalStateV2, type GoalStateV2, type TaskKind } from "./state";
 import type { ExecutionDecision, AssuranceDecision, EvidenceRef, GoalHeadlessMeta } from "./state";
 import type { GoalSpecDoc, HeadlessBlueprint } from "./spec-doc";
+import { createInitialRuntimeMetadataV3, GOAL_CONTRACT_VERSION } from "./goal-contract-v3";
+import { buildGoalPublicViewV3, runtimeMetadataForGoalV2 } from "./goal-contract-v3-adapter";
+import { inspectCommittedArtifactsV3 } from "./completion-bundle-v3-runtime";
+import { createGoalEventV3, GOAL_EVENT_SCHEMA_VERSION, type GoalEventEnvelopeV3 } from "./runtime-v3";
 
 export const GOAL_HEADLESS_EVENT_TYPE = "pi-goal:headless_event";
 export const GOAL_HEADLESS_RESULT_TYPE = "pi-goal:headless_result";
@@ -57,6 +61,10 @@ export function validateBlueprint(
 ): ValidateBlueprintResult {
 	const errors: string[] = [];
 	const knownIds = knownOutcomeIds(doc);
+	const taskKind = doc.machine.taskKind ?? "general";
+	if (!TASK_KINDS.includes(taskKind as TaskKind)) {
+		errors.push(`machine.taskKind must be one of: ${TASK_KINDS.join(", ")}`);
+	}
 
 	const evidence = blueprint.evidence;
 	if (evidence) {
@@ -111,6 +119,7 @@ export interface CreateGoalFromBlueprintInput {
 	specPath: string;
 	outputPath: string;
 	logPath: string;
+	entrypoint?: "headless" | "interactive";
 	now: number;
 }
 
@@ -121,7 +130,7 @@ function blueprintExecution(blueprint: HeadlessBlueprint): ExecutionDecision {
 		selected: topology,
 		source: "user",
 		confidence: 1,
-		reasons: ["Headless blueprint declares the execution topology."],
+		reasons: ["Blueprint declares the execution topology."],
 		// 蓝图锁定：不因运行期信号自动改道（guided 模式由 agent 记录偏离而非重路由）。
 		reassessOn: [],
 	};
@@ -135,7 +144,7 @@ function blueprintAssurance(blueprint: HeadlessBlueprint, now: number): Assuranc
 		independent: requirement !== "none",
 		depth: requirement === "required" ? "deep" : requirement === "advisory" ? "standard" : "light",
 		source: "user",
-		reasons: ["Headless blueprint declares the assurance policy."],
+		reasons: ["Blueprint declares the assurance policy."],
 		decidedAt: now,
 	};
 }
@@ -143,12 +152,15 @@ function blueprintAssurance(blueprint: HeadlessBlueprint, now: number): Assuranc
 /** 蓝图 + spec 文档 → 新的 GoalStateV2（无 UI、无 LLM 起草）。 */
 export function createGoalFromBlueprint(input: CreateGoalFromBlueprintInput): GoalStateV2 {
 	const doc = input.doc;
-	const headless: GoalHeadlessMeta = {
-		specPath: input.specPath,
-		outputPath: input.outputPath,
-		logPath: input.logPath,
-		startedAt: input.now,
-	};
+	const entrypoint = input.entrypoint ?? "headless";
+	const headless: GoalHeadlessMeta | undefined = entrypoint === "headless"
+		? {
+			specPath: input.specPath,
+			outputPath: input.outputPath,
+			logPath: input.logPath,
+			startedAt: input.now,
+		}
+		: undefined;
 	const goal = createGoalStateV2({
 		id: input.id,
 		objective: doc.objective,
@@ -163,7 +175,8 @@ export function createGoalFromBlueprint(input: CreateGoalFromBlueprintInput): Go
 		assurance: blueprintAssurance(input.blueprint, input.now),
 		tokenBudget: input.blueprint.budget?.tokens ?? null,
 		blueprint: input.blueprint,
-		headless,
+		...(headless ? { headless } : {}),
+		runtime: createInitialRuntimeMetadataV3({ goalId: input.id, entrypoint }),
 		now: input.now,
 	});
 	goal.claims = doc.claims.map((claim) => ({
@@ -194,12 +207,23 @@ function criterionStatus(goal: GoalStateV2, evidenceRefs: readonly string[]): Cr
 }
 
 /** 与 get_goal public view 同构的终态结果视图（§7.1 契约）。 */
-export function buildGoalResultView(goal: GoalStateV2, now: number): Record<string, unknown> {
+export function buildGoalResultView(goal: GoalStateV2, now: number, cwd?: string): Record<string, unknown> {
 	const wallMs = goal.createdAt != null ? Math.max(0, now - goal.createdAt) : 0;
 	const evaluation = goal.completion.lastEvaluation;
-	const complete = goal.status === "complete";
+	const integrity = cwd ? inspectCommittedArtifactsV3(goal, cwd, now) : undefined;
+	const complete = goal.status === "complete" && integrity?.status !== "stale";
+	const runtime = runtimeMetadataForGoalV2(goal);
 	return {
 		schemaVersion: 1,
+		contractVersion: GOAL_CONTRACT_VERSION,
+		lineage: {
+			goalDefinitionId: runtime.goalDefinitionId,
+			revisionId: runtime.revisionId,
+			runId: runtime.runId,
+			attemptId: runtime.attemptId,
+		},
+		contract: buildGoalPublicViewV3(goal, integrity),
+		integrity: integrity ?? { status: goal.completionTransaction ? "unchecked" : "not_applicable", checkedAt: null, staleArtifacts: [] },
 		specPath: goal.headless?.specPath ?? null,
 		startedAt: goal.createdAt,
 		endedAt: goal.endedAt ?? now,
@@ -262,7 +286,9 @@ export function buildGoalResultView(goal: GoalStateV2, now: number): Record<stri
 		},
 		exit: {
 			code: complete ? 0 : 1,
-			message: complete ? "Goal achieved." : `Goal ended with status ${goal.status}${goal.pausedReason ? ": " + goal.pausedReason : goal.blocker ? ": " + goal.blocker : ""}`,
+			message: complete ? "Goal achieved." : integrity?.status === "stale"
+				? "Committed completion artifacts are stale; the evaluation must be rerun."
+				: `Goal ended with status ${goal.status}${goal.pausedReason ? ": " + goal.pausedReason : goal.blocker ? ": " + goal.blocker : ""}`,
 		},
 	};
 }
@@ -292,6 +318,12 @@ export interface GoalLogEntry {
 	[key: string]: unknown;
 }
 
+/** V3 event envelope with the V1 flat fields retained as a read compatibility projection. */
+export interface GoalEventLogEntry extends GoalLogEntry, GoalEventEnvelopeV3 {
+	schemaVersion: typeof GOAL_EVENT_SCHEMA_VERSION;
+	payload: Record<string, unknown>;
+}
+
 /** 工具参数/结果摘要：JSON 安全序列化 + 截断（防日志爆炸，保留关键信息）。 */
 export function summarizeValue(value: unknown, max = 300): string {
 	if (value === undefined || value === null) return "";
@@ -307,6 +339,83 @@ export function summarizeValue(value: unknown, max = 300): string {
 
 export function buildGoalLogEntry(goalId: string, type: string, payload: Record<string, unknown>, ts: number): GoalLogEntry {
 	return { v: 1, ts, goalId, type, ...payload };
+}
+
+const LOG_NEXT_SEQUENCE = new Map<string, number>();
+
+function nextGoalEventSequence(logPath: string): number {
+	const absolute = path.resolve(logPath);
+	const cached = LOG_NEXT_SEQUENCE.get(absolute);
+	if (cached !== undefined) {
+		LOG_NEXT_SEQUENCE.set(absolute, cached + 1);
+		return cached + 1;
+	}
+	let last = 0;
+	try {
+		if (fs.existsSync(absolute)) {
+			for (const line of fs.readFileSync(absolute, "utf8").split(/\r?\n/)) {
+				if (!line.trim()) continue;
+				try {
+					const parsed = JSON.parse(line) as { schemaVersion?: unknown; seq?: unknown };
+					if (parsed.schemaVersion === GOAL_EVENT_SCHEMA_VERSION && typeof parsed.seq === "number" && Number.isSafeInteger(parsed.seq)) {
+						last = Math.max(last, parsed.seq);
+					}
+				} catch { /* ignore legacy/corrupt lines; append remains best effort */ }
+			}
+		}
+	} catch { /* appendGoalLog owns the non-throwing IO contract */ }
+	const next = last + 1;
+	LOG_NEXT_SEQUENCE.set(absolute, next);
+	return next;
+}
+
+/** Build one V3 event and flatten its payload for V1 readers. */
+export function buildGoalEventLogEntry(
+	goal: GoalStateV2,
+	type: string,
+	payload: Record<string, unknown>,
+	time: number,
+	options: { seq?: number; nodeId?: string | null; parentId?: string | null; causationId?: string | null } = {},
+): GoalEventLogEntry {
+	const runtime = runtimeMetadataForGoalV2(goal);
+	const event = createGoalEventV3({
+		lineage: {
+			goalDefinitionId: runtime.goalDefinitionId,
+			revisionId: runtime.revisionId,
+			runId: runtime.runId,
+			attemptId: runtime.attemptId,
+		},
+		seq: options.seq ?? 1,
+		type,
+		time,
+		payload,
+		nodeId: options.nodeId,
+		parentId: options.parentId,
+		causationId: options.causationId,
+	});
+	return {
+		v: 1,
+		ts: event.time,
+		...event,
+		...event.payload,
+	};
+}
+
+/** Append a V3 event with a durable per-log sequence. */
+export function appendGoalEventLog(
+	goal: GoalStateV2,
+	type: string,
+	payload: Record<string, unknown>,
+	time: number,
+	options: { nodeId?: string | null; parentId?: string | null; causationId?: string | null } = {},
+): GoalEventLogEntry {
+	const logPath = goal.headless?.logPath;
+	const entry = buildGoalEventLogEntry(goal, type, payload, time, {
+		...options,
+		seq: logPath ? nextGoalEventSequence(logPath) : 1,
+	});
+	if (logPath) appendGoalLog(logPath, entry);
+	return entry;
 }
 
 /** 追加一条 JSONL 日志；文件超 10MB 后写 log_truncated 标记并停止。IO 失败不抛。 */
@@ -333,19 +442,21 @@ export function appendGoalLog(logPath: string, entry: GoalLogEntry): void {
 }
 
 /** 终态：写结果文件 + terminal 日志条目。返回 terminal 条目供事件回显。 */
-export function finalizeHeadlessGoal(goal: GoalStateV2, now: number): GoalLogEntry {
-	const view = buildGoalResultView(goal, now);
+export function finalizeHeadlessGoal(goal: GoalStateV2, now: number, cwd?: string): GoalLogEntry {
+	const view = buildGoalResultView(goal, now, cwd);
 	if (goal.headless) writeGoalResult(goal.headless.outputPath, view);
-	const entry = buildGoalLogEntry(goal.id, "terminal", { result: view }, now);
-	if (goal.headless) appendGoalLog(goal.headless.logPath, entry);
+	const entry = goal.headless
+		? appendGoalEventLog(goal, "terminal", { result: view }, now)
+		: buildGoalLogEntry(goal.id, "terminal", { result: view }, now);
 	return entry;
 }
 
 /** Persist a non-terminal process-exit snapshot without claiming terminality. */
-export function snapshotActiveHeadlessGoal(goal: GoalStateV2, now: number): GoalLogEntry {
-	const view = buildGoalResultView(goal, now);
+export function snapshotActiveHeadlessGoal(goal: GoalStateV2, now: number, cwd?: string): GoalLogEntry {
+	const view = buildGoalResultView(goal, now, cwd);
 	if (goal.headless) writeGoalResult(goal.headless.outputPath, view);
-	const entry = buildGoalLogEntry(goal.id, "snapshot", { result: view, terminal: false }, now);
-	if (goal.headless) appendGoalLog(goal.headless.logPath, entry);
+	const entry = goal.headless
+		? appendGoalEventLog(goal, "snapshot", { result: view, terminal: false }, now)
+		: buildGoalLogEntry(goal.id, "snapshot", { result: view, terminal: false }, now);
 	return entry;
 }

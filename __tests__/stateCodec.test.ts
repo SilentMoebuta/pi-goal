@@ -11,6 +11,7 @@ import {
 	type DecodeGoalSnapshotResult,
 	type GoalStateV2,
 } from "../extensions/state";
+import { createInitialRuntimeMetadataV3 } from "../extensions/goal-contract-v3";
 
 function makeV1Goal(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
@@ -218,6 +219,44 @@ describe("GoalSnapshotV2 validation and cloning", () => {
 			lastOutcomeDeltaAt: 5_000,
 			lastEvaluatedOutcomeRevision: null,
 		});
+	});
+
+	it("round-trips optional Contract V3 lineage without requiring it on older V2 snapshots", () => {
+		const goal = migratedGoal();
+		goal.runtime = createInitialRuntimeMetadataV3({ goalId: goal.id, entrypoint: "interactive" });
+		const result = decodeGoalSnapshot({ schemaVersion: 2, revision: 2, savedAt: 7_000, action: "update", goal });
+		assertDecoded(result);
+		assert.deepEqual(result.snapshot.goal?.runtime, goal.runtime);
+
+		delete goal.runtime;
+		const legacyV2 = decodeGoalSnapshot({ schemaVersion: 2, revision: 3, savedAt: 8_000, action: "update", goal });
+		assertDecoded(legacyV2);
+		assert.equal(legacyV2.snapshot.goal?.runtime, undefined);
+	});
+
+	it("round-trips an atomic V3 completion receipt", () => {
+		const goal = migratedGoal();
+		goal.runtime = createInitialRuntimeMetadataV3({ goalId: goal.id, entrypoint: "headless" });
+		goal.status = "complete";
+		goal.endedAt = 6_000;
+		goal.completion.requestedAt = 5_500;
+		goal.completion.lastEvaluation = {
+			decision: "accept", evaluatedAt: 5_600, criterionCoverage: [], claimCoverage: [], findings: [], advisories: [], evaluator: { kind: "reviewer", agentId: "r1", reportDigest: "b".repeat(64) }, fingerprint: null,
+		};
+		goal.completionTransaction = {
+			contractVersion: 3,
+			idempotencyKey: "complete-1",
+			requestDigest: "d".repeat(64),
+			bundleDigest: "a".repeat(64),
+			lineage: { goalDefinitionId: goal.runtime.goalDefinitionId, revisionId: goal.runtime.revisionId, runId: goal.runtime.runId, attemptId: goal.runtime.attemptId },
+			artifacts: [{ id: "artifact-1", uri: "result.md", digest: { algorithm: "sha256", value: "c".repeat(64) }, sizeBytes: 1, createdByAttemptId: goal.runtime.attemptId, createdAt: 5_000, verifiedAt: 5_500 }],
+			reviewerResultRef: { resultId: "role-result:r1", agentId: "r1", role: "goal-reviewer", digest: "b".repeat(64) },
+			committedAt: 5_600,
+		};
+		const result = decodeGoalSnapshot({ schemaVersion: 2, revision: 4, savedAt: 6_000, action: "update", goal });
+		assertDecoded(result);
+		assert.equal(result.snapshot.goal?.completionTransaction?.reviewerResultRef.role, "goal-reviewer");
+		assert.equal(result.snapshot.goal?.completionTransaction?.artifacts[0].sizeBytes, 1);
 	});
 
 	it("conservatively marks evaluations stale when an older V2 snapshot has no freshness marker", () => {

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/trace-span-v1.schema.json",
+  "title": "PI OpenTelemetry-Compatible Trace Span V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "traceId", "spanId", "parentSpanId", "name", "kind", "startTimeUnixMs", "endTimeUnixMs", "status", "attributes", "events"],
+  "properties": {
+    "schemaVersion": { "const": 1 }, "traceId": { "type": "string", "minLength": 1 }, "spanId": { "type": "string", "minLength": 1 }, "parentSpanId": { "type": ["string", "null"] }, "name": { "type": "string", "minLength": 1 }, "kind": { "enum": ["internal", "client", "server", "producer", "consumer"] }, "startTimeUnixMs": { "type": "number", "minimum": 0 }, "endTimeUnixMs": { "type": ["number", "null"], "minimum": 0 }, "status": { "enum": ["unset", "ok", "error"] }, "attributes": { "type": "object" }, "events": { "type": "array", "items": { "type": "object", "required": ["name", "timeUnixMs"], "properties": { "name": { "type": "string", "minLength": 1 }, "timeUnixMs": { "type": "number", "minimum": 0 }, "attributes": { "type": "object" } }, "additionalProperties": false } }
+  }
+}

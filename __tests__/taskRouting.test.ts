@@ -29,8 +29,8 @@ describe("injectSuperpowersCoding (rollback cleanliness)", () => {
 		assert.equal(injectSuperpowersCoding(cfg), true);
 	});
 
-	it("suppresses superpowers when forceTaskType is non-coding (research/pm/review) — clean rollback, no competing instructions", () => {
-		for (const t of ["research", "pm", "review"]) {
+	it("suppresses superpowers when forceTaskType is non-coding — clean rollback, no competing instructions", () => {
+		for (const t of ["research", "document", "business", "pm", "review"]) {
 			const cfg: GoalConfig = { ...DEFAULT_GOAL_CONFIG, forceTaskType: t };
 			assert.equal(injectSuperpowersCoding(cfg), false, `forceTaskType=${t} should suppress superpowers`);
 		}

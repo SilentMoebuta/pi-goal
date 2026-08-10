@@ -304,6 +304,78 @@ describe("headless goal lifecycle", () => {
 		assert.equal(api.sent.filter((entry) => entry.message.customType === "pi-goal:continuation").length, 1);
 	});
 
+	for (const order of ["agent_end_first", "turn_end_first"] as const) {
+		it(`completes a flat legacy request once when ${order.replaceAll("_", " ")}`, async () => {
+			const cwd = project();
+			const specPath = path.join(cwd, "legacy.md");
+			fs.writeFileSync(specPath, specMarkdown({
+				review: { requirement: "none", checklist: [] },
+				verification: { command: "true", timeoutMs: 10_000 },
+				completion: { policy: "legacy", maxAutoTurns: 10 },
+			}));
+			let judgeCalls = 0;
+			const api = new HeadlessFakeAPI();
+			createPiGoalExtension({
+				complete: (async () => {
+					judgeCalls += 1;
+					return {
+						role: "assistant",
+						content: [{ type: "text", text: '{"done":true,"reason":"legacy evidence accepted"}' }],
+						usage: { output: 1 },
+					};
+				}) as any,
+			})(api as any);
+			api.setFlag("goal-run", specPath);
+			const ctx = context(cwd, api);
+			(ctx as any).model = { id: "legacy-test-model" };
+			(ctx as any).modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: "test" });
+			await api.emit("session_start", {}, ctx);
+			await api.emit("turn_start", { turnIndex: 1, timestamp: Date.now() }, ctx);
+
+			const evidence = await execute(api, "update_goal", {
+				criterionId: "c1",
+				evidence: "legacy command evidence verified",
+				kind: "command",
+				verification: "verified",
+			}, ctx);
+			assert.equal(evidence.isError, undefined);
+			const completion = await execute(api, "update_goal", {
+				status: "complete",
+				evidence: "legacy V2 completion request",
+			}, ctx);
+			assert.equal(completion.isError, undefined);
+
+			const turnEnd = () => api.emit("turn_end", {
+				turnIndex: 1,
+				timestamp: Date.now(),
+				toolResults: [{ ok: true }],
+				message: { role: "assistant", content: [{ type: "text", text: "Legacy request submitted." }], usage: { output: 5 } },
+			}, ctx);
+			if (order === "agent_end_first") {
+				await api.emit("agent_end", {}, ctx);
+				await turnEnd();
+			} else {
+				await turnEnd();
+				await api.emit("agent_end", {}, ctx);
+			}
+
+			const goal = JSON.parse((await execute(api, "get_goal", {}, ctx)).content[0].text);
+			assert.equal(goal.status, "complete");
+			assert.equal(goal.criteria[0].evidenceRefs.length, 1);
+			assert.equal(goal.completion.lastEvaluation.decision, "accept");
+			assert.equal(judgeCalls, 1, "the same legacy request must be judged exactly once");
+			assert.equal(api.sent.filter((entry) => entry.message.customType === "pi-goal:continuation").length, 0);
+
+			const result = JSON.parse(fs.readFileSync(path.join(cwd, "legacy.result.json"), "utf8"));
+			assert.equal(result.status, "complete");
+			assert.equal(result.criteria[0].status, "verified");
+			assert.equal(result.exit.code, 0);
+			const events = fs.readFileSync(path.join(cwd, "legacy.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+			assert.ok(events.some((entry) => entry.type === "status" && entry.status === "complete"));
+			assert.equal(events.filter((entry) => entry.type === "terminal").length, 1);
+		});
+	}
+
 	it("does not misclassify a dispose abort as interrupted (headless)", async () => {
 		const cwd = project();
 		const specPath = path.join(cwd, "spec.md");

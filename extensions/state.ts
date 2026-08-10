@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
 import { parseBlueprint, type HeadlessBlueprint } from "./spec-doc";
+import {
+	parseGoalCompletionCommitV3,
+	parseGoalRuntimeMetadataV3,
+	type GoalCompletionCommitV3,
+	type GoalRuntimeMetadataV3,
+} from "./goal-contract-v3";
 
 export const GOAL_SNAPSHOT_SCHEMA_VERSION = 2 as const;
 export const SHADOW_COMPLETION_ADVISORY = "completionPolicy=shadow: this evaluation is durable audit data but was not authoritative for completion.";
 
-// Central V2 vocabulary. Other policy/config modules should import these types.
-export type TaskKind = "general" | "coding" | "research" | "pm" | "review";
+// Central task vocabulary shared by interactive, headless, compiler, and eval adapters.
+export const TASK_KINDS = ["general", "coding", "research", "document", "business", "pm", "review"] as const;
+export type TaskKind = typeof TASK_KINDS[number];
 export type Topology = "direct" | "specialist" | "team";
 export type ExecutionPreference = "auto" | Topology;
 export type GateLevel = "blocking" | "advisory";
@@ -259,6 +266,10 @@ export interface GoalStateV2 {
 	blueprint?: HeadlessBlueprint;
 	/** headless 运行元数据；仅 --goal-run 启动的 goal 携带。 */
 	headless?: GoalHeadlessMeta;
+	/** Optional Contract V3 lineage. Older V2 snapshots legitimately omit it. */
+	runtime?: GoalRuntimeMetadataV3;
+	/** Atomic V3 completion receipt. Its absence is valid for V1/V2 completions. */
+	completionTransaction?: GoalCompletionCommitV3;
 	migration: GoalMigrationV2 | null;
 }
 
@@ -283,7 +294,6 @@ export type DecodeGoalSnapshotResult =
 	| { ok: false; kind: "future_version"; message: string; version: number };
 
 const GOAL_STATUSES = ["active", "paused", "budget_limited", "usage_limited", "blocked", "complete", "unmet"] as const;
-const TASK_KINDS = ["general", "coding", "research", "pm", "review"] as const;
 const TOPOLOGIES = ["direct", "specialist", "team"] as const;
 const EXECUTION_PREFERENCES = ["auto", ...TOPOLOGIES] as const;
 const EXECUTION_REASSESSMENT_TRIGGERS = ["scope_expanded", "new_workstream", "conflict", "stalled"] as const;
@@ -746,6 +756,20 @@ function validateReferences(goal: GoalStateV2): void {
 
 function validateSemanticConsistency(goal: GoalStateV2): void {
 	const assurance = goal.assurance;
+	if (goal.completionTransaction) {
+		if (!goal.runtime) throw new SnapshotValidationError("snapshot.goal.completionTransaction requires runtime lineage");
+		if (goal.status !== "complete") throw new SnapshotValidationError("snapshot.goal.completionTransaction requires complete status");
+		const lineage = goal.completionTransaction.lineage;
+		if (lineage.goalDefinitionId !== goal.runtime.goalDefinitionId
+			|| lineage.revisionId !== goal.runtime.revisionId
+			|| lineage.runId !== goal.runtime.runId
+			|| lineage.attemptId !== goal.runtime.attemptId) {
+			throw new SnapshotValidationError("snapshot.goal.completionTransaction lineage conflicts with runtime");
+		}
+		if (goal.endedAt !== null && goal.completionTransaction.committedAt > goal.endedAt) {
+			throw new SnapshotValidationError("snapshot.goal.completionTransaction committedAt exceeds endedAt");
+		}
+	}
 	if (assurance.reviewRequirement === "none") {
 		if (assurance.reviewStatus !== "not_required") {
 			throw new SnapshotValidationError("snapshot.goal.assurance.reviewStatus must be not_required when reviewRequirement is none");
@@ -817,6 +841,14 @@ function parseGoalState(value: unknown, path: string): GoalStateV2 {
 	})();
 	const blueprint = object.blueprint === undefined ? undefined : parseStoredBlueprint(object.blueprint, path + ".blueprint");
 	const headless = object.headless === undefined ? undefined : parseHeadlessMeta(object.headless, path + ".headless");
+	const runtime = object.runtime === undefined ? undefined : (() => {
+		try { return parseGoalRuntimeMetadataV3(object.runtime, path + ".runtime"); }
+		catch (error) { throw new SnapshotValidationError(error instanceof Error ? error.message : String(error)); }
+	})();
+	const completionTransaction = object.completionTransaction === undefined ? undefined : (() => {
+		try { return parseGoalCompletionCommitV3(object.completionTransaction, path + ".completionTransaction"); }
+		catch (error) { throw new SnapshotValidationError(error instanceof Error ? error.message : String(error)); }
+	})();
 	const goal: GoalStateV2 = {
 		id: asString(object.id, path + ".id"),
 		objective: asString(object.objective, path + ".objective"),
@@ -843,6 +875,8 @@ function parseGoalState(value: unknown, path: string): GoalStateV2 {
 		deviations,
 		...(blueprint === undefined ? {} : { blueprint }),
 		...(headless === undefined ? {} : { headless }),
+		...(runtime === undefined ? {} : { runtime }),
+		...(completionTransaction === undefined ? {} : { completionTransaction }),
 		migration: parseMigration(object.migration, path + ".migration"),
 	};
 	if (goal.progress.lastOutcomeDeltaAt < goal.createdAt || goal.progress.lastOutcomeDeltaAt > goal.updatedAt) {
@@ -1165,6 +1199,10 @@ export interface CreateGoalStateV2Input {
 	blueprint?: HeadlessBlueprint;
 	/** headless 运行元数据。 */
 	headless?: GoalHeadlessMeta;
+	/** Contract V3 lineage projection shared by interactive and headless adapters. */
+	runtime?: GoalRuntimeMetadataV3;
+	/** Existing atomic completion receipt, primarily for fixture construction. */
+	completionTransaction?: GoalCompletionCommitV3;
 	now: number;
 }
 
@@ -1202,6 +1240,8 @@ export function createGoalStateV2(input: CreateGoalStateV2Input): GoalStateV2 {
 		deviations: [],
 		...(input.blueprint === undefined ? {} : { blueprint: input.blueprint }),
 		...(input.headless === undefined ? {} : { headless: input.headless }),
+		...(input.runtime === undefined ? {} : { runtime: input.runtime }),
+		...(input.completionTransaction === undefined ? {} : { completionTransaction: input.completionTransaction }),
 		migration: null,
 	};
 	return parseGoalState(raw, "goal");

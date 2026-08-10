@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/goal-contract-v3.schema.json",
+  "title": "PI Goal Contract V3 Public View",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "contractVersion", "lineage", "definition", "revision", "run", "attempt", "integrity", "outcome"],
+  "properties": {
+    "schemaVersion": { "const": 3 },
+    "contractVersion": { "const": 3 },
+    "lineage": { "$ref": "#/$defs/lineage" },
+    "definition": { "$ref": "#/$defs/definition" },
+    "revision": { "$ref": "#/$defs/revision" },
+    "run": { "$ref": "#/$defs/run" },
+    "attempt": { "$ref": "#/$defs/attempt" },
+    "integrity": {
+      "type": "object",
+      "required": ["status", "checkedAt", "staleArtifacts"],
+      "properties": {
+        "status": { "enum": ["not_applicable", "unchecked", "current", "stale"] },
+        "checkedAt": { "type": ["number", "null"], "minimum": 0 },
+        "staleArtifacts": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary", "decision", "findings"],
+      "properties": {
+        "status": { "enum": ["active", "paused", "blocked", "complete", "unmet", "budget_limited", "usage_limited"] },
+        "summary": { "type": ["string", "null"] },
+        "decision": { "enum": ["accept", "revise", "blocked", null] },
+        "findings": { "type": "array", "items": { "type": "object" } }
+      }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1 },
+    "timestamp": { "type": "number", "minimum": 0 },
+    "nullableId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goalDefinitionId", "revisionId", "runId", "attemptId"],
+      "properties": {
+        "goalDefinitionId": { "$ref": "#/$defs/id" },
+        "revisionId": { "$ref": "#/$defs/id" },
+        "runId": { "$ref": "#/$defs/id" },
+        "attemptId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "level"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "description": { "type": "string", "minLength": 1 },
+        "level": { "enum": ["blocking", "advisory"] }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "required", "description"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["deterministic", "reviewer", "human", "dataset"] },
+        "required": { "type": "boolean" },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contractVersion", "id", "objective", "criteria", "constraints", "verification", "risk", "budget", "taskKind", "createdAt"],
+      "properties": {
+        "contractVersion": { "const": 3 },
+        "id": { "$ref": "#/$defs/id" },
+        "objective": { "type": "string", "minLength": 1 },
+        "criteria": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/criterion" } },
+        "constraints": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "verification": { "type": "array", "items": { "$ref": "#/$defs/verification" } },
+        "risk": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["level", "requiredApprovals"],
+          "properties": {
+            "level": { "enum": ["low", "medium", "high"] },
+            "requiredApprovals": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tokens": { "type": "number", "minimum": 0 },
+            "activeTimeMs": { "type": "number", "minimum": 0 },
+            "deadlineAt": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        "taskKind": { "enum": ["general", "coding", "research", "document", "business", "pm", "review"] },
+        "profile": { "type": "string", "minLength": 1 },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "goalDefinitionId", "number", "previousRevisionId", "source", "reason", "definition", "createdAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "goalDefinitionId": { "$ref": "#/$defs/id" },
+        "number": { "type": "integer", "minimum": 1 },
+        "previousRevisionId": { "$ref": "#/$defs/nullableId" },
+        "source": { "enum": ["user", "system", "migration"] },
+        "reason": { "type": "string" },
+        "definition": { "$ref": "#/$defs/definition" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "goalDefinitionId", "revisionId", "entrypoint", "status", "attemptIds", "currentAttemptId", "parentRunId", "previousRunId", "createdAt", "updatedAt", "endedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "goalDefinitionId": { "$ref": "#/$defs/id" },
+        "revisionId": { "$ref": "#/$defs/id" },
+        "entrypoint": { "enum": ["interactive", "headless", "api"] },
+        "status": { "enum": ["created", "active", "waiting_user", "waiting_approval", "paused", "retrying", "completed", "failed", "cancelled", "unmet"] },
+        "attemptIds": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "currentAttemptId": { "$ref": "#/$defs/nullableId" },
+        "parentRunId": { "$ref": "#/$defs/nullableId" },
+        "previousRunId": { "$ref": "#/$defs/nullableId" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "endedAt": { "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "runId", "revisionId", "number", "previousAttemptId", "status", "idempotencyKey", "startedAt", "endedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "runId": { "$ref": "#/$defs/id" },
+        "revisionId": { "$ref": "#/$defs/id" },
+        "number": { "type": "integer", "minimum": 1 },
+        "previousAttemptId": { "$ref": "#/$defs/nullableId" },
+        "status": { "enum": ["active", "succeeded", "failed", "cancelled", "timed_out"] },
+        "idempotencyKey": { "$ref": "#/$defs/id" },
+        "startedAt": { "$ref": "#/$defs/timestamp" },
+        "endedAt": { "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }
+    }
+  }
+}

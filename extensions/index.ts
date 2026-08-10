@@ -48,6 +48,7 @@ import {
 	type ResearchClaim,
 	type StoredGoalCriterionV2,
 	type TaskKind,
+	TASK_KINDS,
 } from "./state";
 import { ExactTurnAccounting, type TurnIdentity } from "./turn-accounting";
 import { routeExecution, type ExecutionRoutingSignals } from "./execution-router-v2";
@@ -62,7 +63,10 @@ import {
 	V2_JUDGE_SYSTEM_PROMPT,
 } from "./completion-runtime-v2";
 import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
-import { GOAL_HEADLESS_EVENT_TYPE, appendGoalLog, buildGoalLogEntry, createGoalFromBlueprint, finalizeHeadlessGoal, snapshotActiveHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
+import { GOAL_HEADLESS_EVENT_TYPE, appendGoalEventLog, createGoalFromBlueprint, finalizeHeadlessGoal, snapshotActiveHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
+import { inspectCommittedArtifactsV3, prepareCompletionBundleV3, preflightCompletionSubmissionV3 } from "./completion-bundle-v3-runtime";
+import { completionBundleDigest } from "./goal-contract-v3";
+import { resolveRoleResultFromBranch, type RoleResultRefV1 } from "./role-result-v1";
 import { proposalToMarkdown, parseGoalSpecMarkdown, parseBlueprint, slugifyTitle, type SpecCriterion } from "./spec-doc";
 import { runJudge, runV2CompletionJudge, type JudgeVerdict } from "./judge";
 import { formatTokens, formatDuration, escapeXml, extractOutputTokens, extractTextContent, isAssistantMessage, GOAL_STORAGE_TYPE, GOAL_EVENT_TYPE, GOAL_CONTINUATION_TYPE, GOAL_JUDGE_TYPE } from "./util";
@@ -70,6 +74,10 @@ import { buildCriteriaBlock, completionFeedbackBlock, reviewerTranscriptDecision
 import { proposalToSpecInput, specDocToProposal, writeGoalSpecDoc, showGoalReview, type GoalCriterionDraft, type GoalProposal, type ReviewResult } from "./draft-review-ui";
 import { mechanicallyVerifyEvidence } from "./evidence-verify";
 import { appendGoalTelemetry, buildGoalTelemetryEntry, readGoalTelemetry } from "./telemetry";
+import { appendTraceJsonl, GoalTraceCollectorV3 } from "./observability-v3";
+import { createInitialRuntimeMetadataV3 } from "./goal-contract-v3";
+import { createGoalEventV3, type GoalEventEnvelopeV3 } from "./runtime-v3";
+import { buildGoalPublicViewV3 } from "./goal-contract-v3-adapter";
 import {
 	GoalRuntimeTracker,
 	deriveGoalProgress,
@@ -87,6 +95,7 @@ import {
 type GoalState = GoalStateV2;
 type Criterion = StoredGoalCriterionV2;
 type GoalSnapshot = GoalSnapshotV2;
+const GOAL_RUNTIME_EVENT_TYPE = "pi-goal:runtime-event-v3";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Configuration
@@ -167,10 +176,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	let currentTurn: TurnIdentity | null = null;
 	let lastOutcomeSignature: string | null = null;
 	let lastAssistantText = "";
+	// turn_end and agent_end can arrive in either order across PI host versions.
+	// Keep legacy completion evaluation idempotent within one model turn.
+	let legacyEvaluationHandledThisTurn = false;
 	// Last judge verdict, surfaced in the goal card / /goal status so the user
 	// can see why the goal is still running (CONTINUE) or was deemed done.
 	let lastJudgeVerdict: JudgeVerdict | null = null;
 	let wasGoalDriven = false;
+	let runtimeCwd = process.cwd();
+	let goalTrace: GoalTraceCollectorV3 | null = null;
 	// GG-3: a fresh next-step suggestion from a stronger model, injected into the
 	// next continuation when the goal stalled. Set by escalateStuck, consumed +
 	// cleared by sendContinuation.
@@ -182,6 +196,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	let footerTicker: ReturnType<typeof setInterval> | null = null;
 	let observedRoleCatalog: string[] | null = null;
 	let activeMaxAutoTurns = CONFIG.maxAutoTurns;
+	let runtimeEventSeq = 0;
 
 	function clearTimer() {
 		if (continuationTimer) { clearTimeout(continuationTimer); continuationTimer = null; }
@@ -211,12 +226,48 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	/** Headless 实时日志 + 事件回显（仅在 goal.headless 时生效）。 */
 	function goalLog(ctx: ExtensionContext, type: string, payload: Record<string, unknown>): void {
 		if (!goal || !goal.headless) return;
-		const entry = buildGoalLogEntry(goal.id, type, payload, nowMs());
-		appendGoalLog(goal.headless.logPath, entry);
+		const entry = appendGoalEventLog(goal, type, payload, nowMs());
+		traceRuntimeEvent(entry.type, payload);
 		pi.sendMessage(
 			{ customType: GOAL_HEADLESS_EVENT_TYPE, content: type, display: false, details: { event: entry } },
 			{ triggerTurn: false },
 		);
+	}
+
+	function traceRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; causationId?: string | null } = {}): GoalEventEnvelopeV3 | undefined {
+		if (!goal) return;
+		const runtime = goal.runtime ?? createInitialRuntimeMetadataV3({ goalId: goal.id, entrypoint: goal.headless ? "headless" : "interactive" });
+		const entry = createGoalEventV3({
+			lineage: {
+				goalDefinitionId: runtime.goalDefinitionId,
+				revisionId: runtime.revisionId,
+				runId: runtime.runId,
+				attemptId: runtime.attemptId,
+			},
+			seq: ++runtimeEventSeq,
+			type,
+			time: nowMs(),
+			payload,
+			nodeId: options.nodeId,
+			causationId: options.causationId,
+		});
+		try {
+			if (!goalTrace || goalTrace.traceId !== runtime.goalDefinitionId) goalTrace = new GoalTraceCollectorV3(runtime.goalDefinitionId, nowMs);
+			const span = goalTrace.recordGoalEvent(entry);
+			const tracePath = goal.headless?.logPath
+				? goal.headless.logPath + ".trace.jsonl"
+				: path.join(runtimeCwd, goalConfig.goalSpecDir ?? "docs/goals", "trace.jsonl");
+			appendTraceJsonl(span, tracePath);
+		} catch (error) {
+			console.warn("[pi-goal] trace write failed:", error);
+		}
+		return entry;
+	}
+
+	function recordRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; causationId?: string | null } = {}): void {
+		if (!goal) return;
+		const entry = traceRuntimeEvent(type, payload, options);
+		if (entry) pi.appendEntry(GOAL_RUNTIME_EVENT_TYPE, entry);
 	}
 
 	function withBlueprintEvidenceDiagnostics(evaluation: CompletionEvaluation): CompletionEvaluation {
@@ -291,11 +342,11 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		budgetWarnedThresholds.set(goal.id, warned);
 	}
 
-	/** 从 spec 文件启动 headless blueprint goal（flag 启动与 /goal run 共用）。 */
+	/** Start a blueprint goal from a spec; the caller selects interactive or headless lifecycle semantics. */
 	async function startGoalFromSpecPath(
 		ctx: ExtensionContext,
 		absolutePath: string,
-		options: { confirmIfUI?: boolean; outputPath?: string; logPath?: string } = {},
+		options: { confirmIfUI?: boolean; outputPath?: string; logPath?: string; entrypoint?: "headless" | "interactive" } = {},
 	): Promise<{ ok: boolean; error?: string }> {
 		let text: string;
 		try {
@@ -310,7 +361,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!blueprintResult.ok) return { ok: false, error: "Blueprint invalid: " + blueprintResult.errors.join("; ") };
 		const validation = validateBlueprint(blueprintResult.blueprint, parsed.doc, { trusted: isTrusted(ctx) });
 		if (!validation.ok) return { ok: false, error: validation.errors.join("; ") };
-		// Blueprint runtime settings are authoritative for this headless run.
+		// Blueprint runtime settings are authoritative for this run regardless of entrypoint.
 		goalConfig = {
 			...goalConfig,
 			...(blueprintResult.blueprint.completion?.policy ? { completionPolicy: blueprintResult.blueprint.completion.policy } : {}),
@@ -330,6 +381,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		}
 		const now = nowMs();
 		const specBase = absolutePath.replace(/\.md$/i, "");
+		const entrypoint = options.entrypoint ?? "headless";
 		const newGoal = createGoalFromBlueprint({
 			id: randomUUID(),
 			doc: parsed.doc,
@@ -337,6 +389,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			specPath: absolutePath,
 			outputPath: options.outputPath ?? specBase + ".result.json",
 			logPath: options.logPath ?? specBase + ".goal.jsonl",
+			entrypoint,
 			now,
 		});
 		goal = newGoal;
@@ -350,15 +403,20 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		syncFooterTicker(ctx);
 		syncHeadlessHeartbeat(ctx);
 		syncTools();
-		goalLog(ctx, "goal_started", {
+		const startPayload = {
 			objective: newGoal.objective,
 			topology: newGoal.execution.selected,
 			criteriaCount: newGoal.criteria.length,
 			tokenBudget: newGoal.tokenBudget,
-		});
+			entrypoint,
+		};
+		if (entrypoint === "headless") goalLog(ctx, "goal_started", startPayload);
+		else recordRuntimeEvent("goal.started", startPayload);
 		// 不立即 sendContinuation：headless print 模式下初始 prompt 的 run 可能已在
 		// 处理中，此时 followUp 会被拒（"Agent is already processing"）。初始 turn
 		// 结束后的 agent_end → scheduleContinuation 会自然启动续跑循环。
+		// 交互式 /goal run 并没有正在执行的初始 prompt，必须主动排入首个 turn。
+		if (entrypoint === "interactive") sendContinuation(ctx);
 		return { ok: true };
 	}
 
@@ -389,27 +447,29 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!goal?.headless || finalizedHeadlessGoals.has(goal.id)) return;
 		finalizedHeadlessGoals.add(goal.id);
 		clearTimer();
-		finalizeHeadlessGoal(goal, nowMs());
+		finalizeHeadlessGoal(goal, nowMs(), ctx.cwd);
 	}
 
 	function snapshotActiveHeadless(ctx: ExtensionContext): void {
 		if (!goal?.headless || goal.status !== "active") return;
 		clearTimer();
-		const entry = snapshotActiveHeadlessGoal(goal, nowMs());
+		const entry = snapshotActiveHeadlessGoal(goal, nowMs(), ctx.cwd);
 		pi.sendMessage(
 			{ customType: GOAL_HEADLESS_EVENT_TYPE, content: "snapshot", display: false, details: { event: entry } },
 			{ triggerTurn: false },
 		);
 	}
 
-	function persist(action: GoalSnapshotActionV2) {
+	function persist(action: GoalSnapshotActionV2, state: GoalState | null = goal, savedAt = nowMs()) {
+		const nextRevision = snapshotRevision + 1;
 		const snapshot = createGoalSnapshotV2({
-			revision: ++snapshotRevision,
-			savedAt: nowMs(),
+			revision: nextRevision,
+			savedAt,
 			action,
-			goal,
+			goal: state,
 		});
 		pi.appendEntry<GoalSnapshot>(GOAL_STORAGE_TYPE, snapshot);
+		snapshotRevision = nextRevision;
 	}
 
 	const GOAL_TOOLS = ["get_goal", "update_goal", "propose_goal_draft"];
@@ -443,27 +503,32 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		);
 	}
 
-	function refreshOutcomeProgress(now: number, evaluationChanged: boolean, preserveFreshEvaluation = false): void {
-		if (!goal) {
-			lastOutcomeSignature = null;
-			return;
-		}
-		const nextSignature = outcomeSignature(goal);
+	function refreshOutcomeProgress(
+		state: GoalState,
+		now: number,
+		evaluationChanged: boolean,
+		preserveFreshEvaluation = false,
+	): { state: GoalState; outcomeChanged: boolean; signature: string } {
+		const nextSignature = outcomeSignature(state);
+		let outcomeChanged = false;
 		if (lastOutcomeSignature !== null && nextSignature !== lastOutcomeSignature) {
-			const evaluationWasFresh = goal.progress.lastEvaluatedOutcomeRevision === goal.progress.outcomeRevision;
-			const nextRevision = goal.progress.outcomeRevision + 1;
-			goal.progress = {
+			outcomeChanged = true;
+			const evaluationWasFresh = state.progress.lastEvaluatedOutcomeRevision === state.progress.outcomeRevision;
+			const nextRevision = state.progress.outcomeRevision + 1;
+			state = { ...state, progress: {
 				outcomeRevision: nextRevision,
 				lastOutcomeDeltaAt: now,
 				lastEvaluatedOutcomeRevision: evaluationChanged || (preserveFreshEvaluation && evaluationWasFresh)
 					? nextRevision
-					: goal.progress.lastEvaluatedOutcomeRevision,
-			};
-			progressRuntime.markOutcomeDelta(now);
+					: state.progress.lastEvaluatedOutcomeRevision,
+			} };
 		} else if (evaluationChanged) {
-			goal.progress.lastEvaluatedOutcomeRevision = goal.progress.outcomeRevision;
+			state = { ...state, progress: {
+				...state.progress,
+				lastEvaluatedOutcomeRevision: state.progress.outcomeRevision,
+			} };
 		}
-		lastOutcomeSignature = outcomeSignature(goal);
+		return { state, outcomeChanged, signature: outcomeSignature(state) };
 	}
 
 	function updateFooter(ctx: ExtensionContext) {
@@ -500,13 +565,37 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		const now = nowMs();
 		const previousEvaluation = JSON.stringify(goal.completion.lastEvaluation);
 		const previousStatus = goal.status;
-		if (patch.status && patch.status !== "active") {
-			settleCurrentTurnTime(now);
-			progressRuntime.turnEnded(now);
-		}
-		Object.assign(goal, patch, { updatedAt: now });
+		const settlesCurrentTurn = Boolean(patch.status && patch.status !== "active" && currentTurn?.goalId === goal.id);
+		const unsettledElapsedMs = settlesCurrentTurn && currentTurn
+			? turnAccounting.activeElapsedMs(currentTurn, now)
+			: 0;
+		let candidate: GoalState = {
+			...goal,
+			...patch,
+			updatedAt: now,
+			...(unsettledElapsedMs === 0 ? {} : { timeUsedMs: goal.timeUsedMs + unsettledElapsedMs }),
+		};
 		if (patch.status) {
-			goal.endedAt = patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked" ? now : null;
+			candidate.endedAt = patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked" ? now : null;
+		}
+		const progressUpdate = refreshOutcomeProgress(
+			candidate,
+			now,
+			previousEvaluation !== JSON.stringify(candidate.completion.lastEvaluation),
+			options.preserveFreshEvaluation === true,
+		);
+		candidate = progressUpdate.state;
+
+		// Validate and append the complete candidate snapshot before making it the
+		// live state. A rejected patch must not leak an uncommitted transaction or
+		// consume an idempotency key in memory.
+		persist("update", candidate, now);
+		goal = candidate;
+		lastOutcomeSignature = progressUpdate.signature;
+		if (progressUpdate.outcomeChanged) progressRuntime.markOutcomeDelta(now);
+		if (settlesCurrentTurn && currentTurn) {
+			turnAccounting.settleTime(currentTurn, now);
+			progressRuntime.turnEnded(now);
 		}
 		// Goal telemetry: 终态时记录一次（同 goalId 幂等），供策略校准。
 		if (patch.status && (patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked") && !telemetryWritten.has(goal.id)) {
@@ -514,12 +603,6 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			const entry = buildGoalTelemetryEntry(goal, now);
 			appendGoalTelemetry(entry, goalConfig.goalSpecDir ?? "docs/goals", ctx.cwd);
 		}
-		refreshOutcomeProgress(
-			now,
-			previousEvaluation !== JSON.stringify(goal.completion.lastEvaluation),
-			options.preserveFreshEvaluation === true,
-		);
-		persist("update");
 		// Headless：状态变更日志 + 非 active 状态收尾（写 result + terminal 日志 + 退出码）。
 		if (goal.headless && patch.status && patch.status !== previousStatus) {
 			if (patch.status === "paused") goalLog(ctx, "paused", { reason: goal.pausedReason ?? "unknown" });
@@ -587,11 +670,13 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		snapshotRevision = 0;
 		reconstructionError = null;
 		lastAssistantText = "";
+		legacyEvaluationHandledThisTurn = false;
 		wasGoalDriven = false;
 		continuationQueued = false;
 		userSuspended = false;
 		judgeParseFailures = 0;
 		lastJudgeVerdict = null;
+		runtimeEventSeq = 0;
 		const branch = ctx.sessionManager.getBranch();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
@@ -611,10 +696,18 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			}
 				snapshotRevision = decoded.snapshot.revision;
 				goal = decoded.snapshot.goal;
-				if (goal) {
-					progressRuntime.reset(nowMs(), goal.progress.lastOutcomeDeltaAt);
-					lastOutcomeSignature = outcomeSignature(goal);
-				}
+					if (goal) {
+						progressRuntime.reset(nowMs(), goal.progress.lastOutcomeDeltaAt);
+						lastOutcomeSignature = outcomeSignature(goal);
+						for (const candidate of branch) {
+							if (candidate.type !== "custom" || candidate.customType !== GOAL_RUNTIME_EVENT_TYPE) continue;
+							const data = (candidate as { data?: { runId?: unknown; seq?: unknown } }).data;
+							const seq = data?.seq;
+							if (data?.runId === goal.runtime?.runId && typeof seq === "number" && Number.isSafeInteger(seq)) {
+								runtimeEventSeq = Math.max(runtimeEventSeq, seq);
+							}
+						}
+					}
 				return;
 		}
 	}
@@ -627,8 +720,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (goal?.status === "active") {
 			updateState({ status: "blocked", blocker: "Replaced by new goal" }, ctx);
 		}
+		const goalId = randomUUID();
 		const newGoal = createGoalStateV2({
-			id: randomUUID(),
+			id: goalId,
 			objective: proposal.objective,
 			criteria: proposal.criteria.map((criterion) => ({ id: "c" + randomUUID().slice(0, 6), ...criterion })),
 			constraints: proposal.constraints,
@@ -636,10 +730,13 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			execution: proposal.execution,
 			assurance: proposal.assurance,
 			tokenBudget: opts.tokenBudget,
+			runtime: createInitialRuntimeMetadataV3({ goalId, entrypoint: "interactive" }),
 			now,
 		});
 		newGoal.claims = proposal.claims.map((claim) => ({ ...claim, evidenceRefs: [...claim.evidenceRefs] }));
 		goal = newGoal;
+		runtimeEventSeq = 0;
+		recordRuntimeEvent("goal.started", { objective: newGoal.objective, entrypoint: "interactive" });
 		progressRuntime.reset(now, newGoal.progress.lastOutcomeDeltaAt);
 		lastOutcomeSignature = outcomeSignature(newGoal);
 		currentTurn = null;
@@ -656,6 +753,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	function pauseGoal(reason: string, ctx: ExtensionContext): boolean {
 		if (!goal || goal.status !== "active") return false;
 		updateState({ status: "paused", pausedReason: reason }, ctx);
+		recordRuntimeEvent("goal.paused", { reason });
 		clearTimer();
 		userSuspended = true;
 		pi.sendMessage(
@@ -674,6 +772,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// resume (autoTurnCount still >= cap) and the loop could never recover.
 		// maxAutoTurns is now per-resume-cycle; no-progress remains the lifetime backstop.
 		updateState({ status: "active", noProgressCount: 0, autoTurnCount: 0, pausedReason: null }, ctx);
+		recordRuntimeEvent("goal.resumed", {});
 		pi.sendMessage(
 			{ customType: GOAL_EVENT_TYPE, content: "Goal resumed.\n\nObjective: " + goal.objective, display: true, details: { kind: "resumed", goal: { ...goal }, progress: progressFor(goal) } },
 			{ triggerTurn: false },
@@ -688,6 +787,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		clearTimer();
 		clearFooterTicker();
 		const oldGoal = goal;
+		recordRuntimeEvent("goal.cleared", { runId: oldGoal.runtime?.runId ?? null });
 		const oldProgress = progressFor(oldGoal);
 		goal = null;
 		progressRuntime.reset(nowMs());
@@ -702,6 +802,142 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			{ customType: GOAL_EVENT_TYPE, content: "Goal cleared.", display: true, details: { kind: "cleared", goal: oldGoal, progress: oldProgress } },
 			{ triggerTurn: false },
 		);
+		return true;
+	}
+
+	function forkGoal(ctx: ExtensionContext): boolean {
+		if (!goal) return false;
+		settleCurrentTurnTime();
+		clearTimer();
+		const source = goal;
+		const now = nowMs();
+		const sourceRuntime = source.runtime ?? createInitialRuntimeMetadataV3({ goalId: source.id, entrypoint: "interactive" });
+		const runId = `${sourceRuntime.runId}:fork:${randomUUID().slice(0, 8)}`;
+		const forked = structuredClone(source);
+		forked.status = "active";
+		forked.tokensUsed = 0;
+		forked.timeUsedMs = 0;
+		forked.createdAt = now;
+		forked.updatedAt = now;
+		forked.endedAt = null;
+		forked.noProgressCount = 0;
+		forked.autoTurnCount = 0;
+		forked.pausedReason = null;
+		forked.blocker = null;
+		forked.completion = { summary: null, requestedAt: null, lastEvaluation: null, rejectionHistory: [], rejectionCount: 0 };
+		forked.progress = {
+			outcomeRevision: source.progress.outcomeRevision + 1,
+			lastOutcomeDeltaAt: now,
+			lastEvaluatedOutcomeRevision: null,
+		};
+		forked.assurance = {
+			...source.assurance,
+			reviewStatus: source.assurance.reviewRequirement === "none" ? "not_required" : "pending",
+			decidedAt: now,
+		};
+		forked.runtime = {
+			...sourceRuntime,
+			runId,
+			attemptId: `${runId}:attempt:1`,
+			attemptNumber: 1,
+			entrypoint: "interactive",
+			parentRunId: sourceRuntime.runId,
+			previousRunId: sourceRuntime.runId,
+			previousAttemptId: sourceRuntime.attemptId,
+		};
+		delete forked.completionTransaction;
+		// An interactive fork must not overwrite the source headless result/log files.
+		delete forked.headless;
+		goal = forked;
+		runtimeEventSeq = 0;
+		recordRuntimeEvent("goal.forked", { parentRunId: sourceRuntime.runId, previousAttemptId: sourceRuntime.attemptId });
+		progressRuntime.reset(now, forked.progress.lastOutcomeDeltaAt);
+		lastOutcomeSignature = outcomeSignature(forked);
+		currentTurn = null;
+		userSuspended = false;
+		continuationQueued = false;
+		persist("set");
+		updateFooter(ctx);
+		syncFooterTicker(ctx);
+		syncTools();
+		sendContinuation(ctx);
+		return true;
+	}
+
+	async function editGoal(ctx: ExtensionContext): Promise<boolean> {
+		if (!goal || !ctx.hasUI) return false;
+		const source = goal;
+		const proposal: GoalProposal = {
+			objective: source.objective,
+			criteria: source.criteria.map(({ description, level }) => ({ description, level })),
+			constraints: [...source.constraints],
+			claims: source.claims.map((claim) => ({ ...claim, evidenceRefs: [] })),
+			taskKind: source.taskKind,
+			executionPreference: source.execution.preference,
+			execution: structuredClone(source.execution),
+			assurance: structuredClone(source.assurance),
+		};
+		const markdown = proposalToMarkdown({ ...proposalToSpecInput(proposal), createdAt: nowMs() });
+		const edited = await ctx.ui.editor("Edit active goal (creates a new revision):", markdown);
+		if (!edited?.trim()) return false;
+		const parsed = parseGoalSpecMarkdown(edited);
+		if (!parsed.ok || !parsed.doc) {
+			ctx.ui.notify("Goal edit rejected: " + (parsed.error ?? "parse failed"), "warning");
+			return false;
+		}
+		const nextProposal = specDocToProposal(parsed.doc, proposal);
+		if (nextProposal.criteria.length === 0) {
+			ctx.ui.notify("Goal edit rejected: at least one criterion is required.", "warning");
+			return false;
+		}
+		settleCurrentTurnTime();
+		clearTimer();
+		const now = nowMs();
+		const previousRuntime = source.runtime ?? createInitialRuntimeMetadataV3({ goalId: source.id, entrypoint: "interactive" });
+		const revisionNumber = previousRuntime.revisionNumber + 1;
+		const revisionId = `${previousRuntime.goalDefinitionId}:revision:${revisionNumber}`;
+		const runId = `${previousRuntime.goalDefinitionId}:run:${revisionNumber}`;
+		const next = createGoalStateV2({
+			id: source.id,
+			objective: nextProposal.objective,
+			criteria: nextProposal.criteria.map((criterion, index) => ({ id: `c${index + 1}`, ...criterion })),
+			constraints: nextProposal.constraints,
+			taskKind: nextProposal.taskKind,
+			execution: nextProposal.execution,
+			assurance: {
+				...nextProposal.assurance,
+				reviewStatus: nextProposal.assurance.reviewRequirement === "none" ? "not_required" : "pending",
+				decidedAt: now,
+			},
+			tokenBudget: parsed.doc.machine.tokenBudget ?? source.tokenBudget,
+			runtime: {
+				...previousRuntime,
+				revisionId,
+				revisionNumber,
+				runId,
+				attemptId: `${runId}:attempt:1`,
+				attemptNumber: 1,
+				entrypoint: "interactive",
+				parentRunId: previousRuntime.runId,
+				previousRunId: previousRuntime.runId,
+				previousAttemptId: previousRuntime.attemptId,
+			},
+			now,
+		});
+		next.claims = nextProposal.claims.map((claim) => ({ ...claim, evidenceRefs: [] }));
+		goal = next;
+		runtimeEventSeq = 0;
+		recordRuntimeEvent("goal.revised", { previousRevisionId: previousRuntime.revisionId, previousRunId: previousRuntime.runId });
+		progressRuntime.reset(now, next.progress.lastOutcomeDeltaAt);
+		lastOutcomeSignature = outcomeSignature(next);
+		currentTurn = null;
+		userSuspended = false;
+		continuationQueued = false;
+		persist("set");
+		updateFooter(ctx);
+		syncFooterTicker(ctx);
+		syncTools();
+		sendContinuation(ctx);
 		return true;
 	}
 
@@ -773,6 +1009,142 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (!goal || goal.status !== "active") return;
 		if (goal.headless) { sendContinuationNow(ctx); return; }
 		scheduleContinuation(ctx);
+	}
+
+	type LegacyEvaluationOutcome = "active" | "complete" | "paused" | "aborted";
+
+	/**
+	 * Run the authoritative legacy judge exactly once for the current turn.
+	 * This remains the compatibility path: deterministic verification first,
+	 * then runJudge, then the persisted-evidence/reviewer canComplete gate.
+	 */
+	async function evaluateLegacyCompletion(
+		responseText: string,
+		ctx: ExtensionContext,
+		precomputedVerification?: VerifyResult,
+	): Promise<LegacyEvaluationOutcome> {
+		if (!goal || goal.status !== "active") return "aborted";
+		legacyEvaluationHandledThisTurn = true;
+		const completionPolicy = goalConfig.completionPolicy ?? "v2";
+		const verification = precomputedVerification ?? (goalConfig.verifyCommand
+			? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
+			: undefined);
+
+		progressRuntime.evaluationStarted(nowMs());
+		updateFooter(ctx);
+		const verdict = await runJudge(
+			goal,
+			responseText,
+			ctx,
+			pi,
+			goalConfig,
+			verification,
+			dependencies.complete,
+			(note) => { verifyFailNote = note; },
+		);
+		progressRuntime.evaluationEnded(nowMs());
+		updateFooter(ctx);
+		lastJudgeVerdict = verdict;
+
+		if (ctx.signal?.aborted) {
+			if (goal.headless) {
+				snapshotActiveHeadless(ctx);
+				process.exitCode = 1;
+				return "aborted";
+			}
+			pauseGoal("interrupted", ctx);
+			return "paused";
+		}
+
+		if (verdict.parseFailed) {
+			judgeParseFailures += 1;
+			if (judgeParseFailures >= 3) {
+				pauseGoal("judge parse failures (3 consecutive)", ctx);
+				ctx.ui.notify("\u23F8 Goal paused (judge parse failures).", "warning");
+				return "paused";
+			}
+		} else {
+			judgeParseFailures = 0;
+		}
+
+		if (completionPolicy === "legacy" && !verdict.done) {
+			const findings = [{
+				code: "external_blocker" as const,
+				subjectId: "$goal",
+				reason: verdict.reason,
+			}];
+			const evaluation: CompletionEvaluation = {
+				decision: "revise",
+				evaluatedAt: nowMs(),
+				criterionCoverage: [],
+				claimCoverage: [],
+				findings,
+				advisories: [],
+				evaluator: { kind: "judge" },
+				fingerprint: rejectionFingerprint(findings),
+			};
+			updateState({ completion: { ...goal.completion, lastEvaluation: evaluation } }, ctx);
+			goalLog(ctx, "completion_evaluated", { decision: "revise", findings, advisories: [] });
+		}
+
+		if (!verdict.done) return "active";
+
+		const gate = canComplete({
+			criteria: goal.criteria
+				.filter((criterion) => criterion.level === "blocking")
+				.map((criterion) => ({ evidence: criterion.evidence.map((item) => item.summary) })),
+			reviewRequired: goal.assurance.reviewRequirement === "required",
+			reviewerPassed: goal.assurance.reviewStatus === "passed",
+			reviewerVerdict: goal.assurance.reviewStatus === "passed" ? {} : undefined,
+		});
+		if (!gate.ok) {
+			ctx.ui.notify("\u26A0\uFE0F Judge says done, but " + gate.reason + ". Continuing...", "warning");
+			const uncovered = goal.criteria.filter((criterion) => criterion.level === "blocking" && criterion.evidenceRefs.length === 0);
+			const findings = uncovered.length > 0
+				? uncovered.map((criterion) => ({
+					code: "blocking_requirement_unsatisfied" as const,
+					subjectId: criterion.id,
+					reason: "The legacy completion gate has no persisted evidence for this blocking criterion.",
+					missingEvidenceKind: "observation" as const,
+				}))
+				: [{ code: "external_blocker" as const, subjectId: "$goal", reason: gate.reason ?? "Legacy completion gate rejected the goal." }];
+			const evaluation: CompletionEvaluation = {
+				decision: "revise",
+				evaluatedAt: nowMs(),
+				criterionCoverage: [],
+				claimCoverage: [],
+				findings,
+				advisories: [],
+				evaluator: { kind: "judge" },
+				fingerprint: rejectionFingerprint(findings),
+			};
+			updateState({ completion: { ...goal.completion, lastEvaluation: evaluation } }, ctx);
+			goalLog(ctx, "completion_evaluated", { decision: "revise", findings, advisories: [] });
+			return "active";
+		}
+
+		const requestedAt = goal.completion.requestedAt ?? nowMs();
+		const evaluatedAt = Math.max(nowMs(), requestedAt, (goal.completion.lastEvaluation?.evaluatedAt ?? -1) + 1);
+		const keepShadowAudit = completionPolicy === "shadow"
+			&& goal.completion.lastEvaluation?.advisories.includes(SHADOW_COMPLETION_ADVISORY);
+		const lastEvaluation = keepShadowAudit
+			? goal.completion.lastEvaluation
+			: legacyAcceptedEvaluation(goal, verdict.reason, evaluatedAt);
+		updateState({
+			status: "complete",
+			completion: { ...goal.completion, summary: verdict.reason, requestedAt, lastEvaluation },
+			noProgressCount: 0,
+		}, ctx, { preserveFreshEvaluation: keepShadowAudit });
+		pi.sendMessage(
+			{
+				customType: GOAL_EVENT_TYPE,
+				content: "Goal achieved! \u2705\n\nObjective: " + goal.objective + "\nJudge: " + verdict.reason + "\nTokens: " + formatTokens(goal.tokensUsed) + "\nTime: " + formatDuration(goal.timeUsedMs),
+				display: true,
+				details: { kind: "complete", goal: { ...goal, status: "complete" }, progress: progressFor(goal) },
+			},
+			{ triggerTurn: false },
+		);
+		return "complete";
 	}
 
 	function sendContinuation(ctx: ExtensionContext) {
@@ -915,6 +1287,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// its own goal-less context.
 		if (isSubagentSession(ctx)) return;
 		shuttingDown = false;
+		runtimeCwd = ctx.cwd;
+		goalTrace = null;
 		observedRoleCatalog = null;
 		// Load project-local config (opt out of superpowers integration).
 		goalConfig = loadGoalConfig(ctx.cwd, isTrusted(ctx));
@@ -1125,6 +1499,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		if (isSubagentSession(ctx)) return;
 		if (!goal || goal.status !== "active") return;
 		const turnId = goal.id + ":" + event.turnIndex + ":" + event.timestamp;
+		legacyEvaluationHandledThisTurn = false;
 		currentTurn = { turnId, goalId: goal.id };
 		turnAccounting.beginTurn({ ...currentTurn, startedAtMs: event.timestamp });
 		progressRuntime.turnStarted(event.timestamp);
@@ -1183,8 +1558,14 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// 得不到 judge 反馈，会在初始 run 里无限循环。
 		if (goal.headless && goal.status === "active") {
 			const headlessPolicy = goalConfig.completionPolicy ?? "v2";
-			const headlessPending = headlessPolicy !== "legacy" && hasPendingCompletionRequest(goal);
-			if (headlessPending) {
+			const headlessPending = hasPendingCompletionRequest(goal);
+			if (headlessPolicy === "legacy" && headlessPending && !legacyEvaluationHandledThisTurn) {
+				const legacyOutcome = await evaluateLegacyCompletion(
+					lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)",
+					ctx,
+				);
+				if (legacyOutcome !== "active") return;
+			} else if (headlessPolicy !== "legacy" && headlessPending) {
 				const verification = goalConfig.verifyCommand
 					? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
 					: undefined;
@@ -1313,6 +1694,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// Skip our own extension-injected messages (e.g. /goal <objective> drafts
 		// the goal via sendUserMessage) — those are not user interrupts.
 		if (goal?.status === "active" && event.source !== "extension") {
+			recordRuntimeEvent("steering.received", { source: event.source, input: summarizeValue(event, 500) });
 			clearTimer();
 		}
 	});
@@ -1342,8 +1724,11 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// tool call with no assistant text (UX finding: lastAssistantText stayed
 		// empty, so neither the judge nor scheduleContinuation ever ran).
 		const responseText = lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)";
-		if (goalDriven) {
-			const completionPolicy = goalConfig.completionPolicy ?? "v2";
+		const completionPolicy = goalConfig.completionPolicy ?? "v2";
+		const pendingHeadlessLegacy = goal.headless
+			&& completionPolicy === "legacy"
+			&& hasPendingCompletionRequest(goal);
+		if (goalDriven || pendingHeadlessLegacy) {
 			const pendingV2Request = completionPolicy !== "legacy" && hasPendingCompletionRequest(goal);
 			if (pendingV2Request) {
 				progressRuntime.evaluationStarted(nowMs());
@@ -1404,99 +1789,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return;
 			}
 
-			progressRuntime.evaluationStarted(nowMs());
-			updateFooter(ctx);
-			const verdict = await runJudge(goal, responseText, ctx, pi, goalConfig, verification, dependencies.complete, (note) => { verifyFailNote = note; });
-			progressRuntime.evaluationEnded(nowMs());
-			updateFooter(ctx);
-			lastJudgeVerdict = verdict;
-			// runJudge's LLM call is not abort-wired, so an ESC during the judge
-			// call is only observable now. Do not apply a verdict (e.g. mark the
-			// goal complete) to an aborted turn — treat it like the pre-judge
-			// abort above and pause without applying the verdict.
-			if (ctx.signal?.aborted) {
-					if (goal.headless) { snapshotActiveHeadless(ctx); process.exitCode = 1; return; }
-				pauseGoal("interrupted", ctx); return;
-			}
-			if (verdict.parseFailed) {
-				judgeParseFailures += 1;
-				if (judgeParseFailures >= 3) {
-					pauseGoal("judge parse failures (3 consecutive)", ctx);
-					ctx.ui.notify("\u23F8 Goal paused (judge parse failures).", "warning");
-					return;
-				}
-			} else { judgeParseFailures = 0; }
-
-			if (completionPolicy === "legacy" && !verdict.done) {
-				const findings = [{
-					code: "external_blocker" as const,
-					subjectId: "$goal",
-					reason: verdict.reason,
-				}];
-				const evaluation: CompletionEvaluation = {
-					decision: "revise",
-					evaluatedAt: nowMs(),
-					criterionCoverage: [],
-					claimCoverage: [],
-					findings,
-					advisories: [],
-					evaluator: { kind: "judge" },
-					fingerprint: rejectionFingerprint(findings),
-				};
-				updateState({ completion: { ...goal.completion, lastEvaluation: evaluation } }, ctx);
-			}
-
-			if (verdict.done) {
-				// 深修 D: route through canComplete gate (evidence + reviewer for non-coding).
-					const gate = canComplete({
-						criteria: goal.criteria
-							.filter((criterion) => criterion.level === "blocking")
-							.map((criterion) => ({ evidence: criterion.evidence.map((item) => item.summary) })),
-						reviewRequired: goal.assurance.reviewRequirement === "required",
-						reviewerPassed: goal.assurance.reviewStatus === "passed",
-						reviewerVerdict: goal.assurance.reviewStatus === "passed" ? {} : undefined,
-					});
-				if (!gate.ok) {
-					ctx.ui.notify("\u26A0\uFE0F Judge says done, but " + gate.reason + ". Continuing...", "warning");
-					const uncovered = goal.criteria.filter((criterion) => criterion.level === "blocking" && criterion.evidenceRefs.length === 0);
-					const findings = uncovered.length > 0
-						? uncovered.map((criterion) => ({
-							code: "blocking_requirement_unsatisfied" as const,
-							subjectId: criterion.id,
-							reason: "The legacy completion gate has no persisted evidence for this blocking criterion.",
-							missingEvidenceKind: "observation" as const,
-						}))
-						: [{ code: "external_blocker" as const, subjectId: "$goal", reason: gate.reason ?? "Legacy completion gate rejected the goal." }];
-					const evaluation: CompletionEvaluation = {
-						decision: "revise",
-						evaluatedAt: nowMs(),
-						criterionCoverage: [],
-						claimCoverage: [],
-						findings,
-						advisories: [],
-						evaluator: { kind: "judge" },
-						fingerprint: rejectionFingerprint(findings),
-					};
-					updateState({ completion: { ...goal.completion, lastEvaluation: evaluation } }, ctx);
-					} else {
-						const requestedAt = goal.completion.requestedAt ?? nowMs();
-						const evaluatedAt = Math.max(nowMs(), requestedAt, (goal.completion.lastEvaluation?.evaluatedAt ?? -1) + 1);
-						const keepShadowAudit = completionPolicy === "shadow"
-							&& goal.completion.lastEvaluation?.advisories.includes(SHADOW_COMPLETION_ADVISORY);
-						const lastEvaluation = keepShadowAudit
-							? goal.completion.lastEvaluation
-							: legacyAcceptedEvaluation(goal, verdict.reason, evaluatedAt);
-						updateState({
-							status: "complete",
-							completion: { ...goal.completion, summary: verdict.reason, requestedAt, lastEvaluation },
-							noProgressCount: 0,
-						}, ctx, { preserveFreshEvaluation: keepShadowAudit });
-					pi.sendMessage(
-						{ customType: GOAL_EVENT_TYPE, content: "Goal achieved! \u2705\n\nObjective: " + goal.objective + "\nJudge: " + verdict.reason + "\nTokens: " + formatTokens(goal.tokensUsed) + "\nTime: " + formatDuration(goal.timeUsedMs), display: true, details: { kind: "complete", goal: { ...goal, status: "complete" }, progress: progressFor(goal) } },
-						{ triggerTurn: false },
-					);
-					return;
-				}
+			if (!legacyEvaluationHandledThisTurn) {
+				const outcome = await evaluateLegacyCompletion(responseText, ctx, verification);
+				if (outcome !== "active") return;
 			}
 		}
 		// Resume the goal after either a goal-driven turn (continue progress)
@@ -1543,15 +1838,19 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	pi.registerTool({
 		name: "get_goal", label: "Get Goal",
-		description: "Read the current Goal V2 public view, including execution, assurance, evidence coverage, and live usage.",
-		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
+		description: "Read the current goal, including the backward-compatible V2 view and Contract V3 lineage/runtime view.",
+		parameters: Type.Object({
+			mode: Type.Optional(StringEnum(["compact", "full", "delta"] as const)),
+			sinceEventSeq: Type.Optional(Type.Integer({ minimum: 0 })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
 			if (!goal) {
 				const text = reconstructionError ? "Goal state is unavailable: " + reconstructionError : "No goal is currently set.";
 				return { content: [{ type: "text", text }], isError: Boolean(reconstructionError), details: { reconstructionError } };
 			}
 			const now = nowMs();
 			const progress = progressFor(goal, now);
+			const completionIntegrity = inspectCommittedArtifactsV3(goal, ctx.cwd, now);
 			const publicEvaluation = goal.completion.lastEvaluation ? {
 				...goal.completion.lastEvaluation,
 				evaluator: {
@@ -1562,7 +1861,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					reportDigest: goal.completion.lastEvaluation.evaluator.reportDigest,
 				},
 			} : null;
-			const view = {
+				const fullView = {
 				apiVersion: 2,
 				id: goal.id,
 				objective: goal.objective,
@@ -1574,27 +1873,68 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				constraints: goal.constraints,
 				deviations: goal.deviations,
 				...(goal.blueprint ? { blueprint: goal.blueprint } : {}),
-				...(goal.headless ? { headless: goal.headless } : {}),
-				execution: goal.execution,
+					...(goal.headless ? { headless: goal.headless } : {}),
+					...(goal.runtime ? { runtime: goal.runtime } : {}),
+					...(goal.completionTransaction ? { completionTransaction: goal.completionTransaction } : {}),
+					execution: goal.execution,
 				assurance: goal.assurance,
 				claims: goal.claims,
 				evidenceLedger: goal.evidenceLedger,
-				completion: { ...goal.completion, lastEvaluation: publicEvaluation },
-				progress,
+					completion: { ...goal.completion, lastEvaluation: publicEvaluation },
+					contract: buildGoalPublicViewV3(goal, completionIntegrity),
+					integrity: completionIntegrity,
+					progress,
 				usage: progress.resources,
 			};
-			return {
-				content: [{ type: "text", text: JSON.stringify(view, null, 2) }],
-				details: { goal: view },
-			};
+				const mode = (params as { mode?: "compact" | "full" | "delta" }).mode ?? "full";
+				const view = mode === "compact"
+					? {
+						apiVersion: 2, view: "compact", id: goal.id, objective: goal.objective, status: goal.status,
+						pausedReason: goal.pausedReason, blocker: goal.blocker, runtime: goal.runtime,
+						progress: fullView.progress, usage: fullView.usage,
+					}
+					: mode === "delta"
+						? {
+							apiVersion: 2, view: "delta", id: goal.id, sinceEventSeq: (params as { sinceEventSeq?: number }).sinceEventSeq ?? null,
+							updatedAt: goal.updatedAt, status: goal.status, runtime: goal.runtime,
+							progress: fullView.progress, completion: fullView.completion, integrity: fullView.integrity,
+						}
+						: { ...fullView, view: "full" };
+				return {
+					content: [{ type: "text", text: JSON.stringify(view, null, 2) }],
+					details: { goal: view, mode },
+				};
 		},
 	});
 
 	pi.registerTool({
 		name: "update_goal", label: "Update Goal",
 		description: "Apply exactly one Goal V2 action. Legacy flat arguments remain accepted for one compatibility cycle.",
-		parameters: Type.Object({
-			action: Type.Optional(StringEnum(["record_evidence", "upsert_claim", "request_completion", "record_review", "change_execution", "mark_unmet", "pause", "record_deviation"] as const)),
+			parameters: Type.Object({
+				action: Type.Optional(StringEnum(["record_evidence", "upsert_claim", "request_completion", "record_review", "change_execution", "mark_unmet", "pause", "record_deviation", "submit_completion_bundle"] as const)),
+					bundle: Type.Optional(Type.Object({
+						idempotencyKey: Type.String({ description: "Stable key for safe retry of this exact completion submission." }),
+						summary: Type.String(),
+						artifacts: Type.Array(Type.Object({
+							id: Type.String(), uri: Type.String(),
+							digest: Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest of the artifact bytes." }),
+							sizeBytes: Type.Number({ minimum: 0 }), mediaType: Type.Optional(Type.String()),
+						})),
+						evidence: Type.Array(Type.Object({
+							id: Type.String(),
+							kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const),
+							summary: Type.String(), criterionIds: Type.Array(Type.String()), claimIds: Type.Optional(Type.Array(Type.String())),
+							artifactId: Type.Optional(Type.String()),
+							digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest when evidence is tied to an artifact." })),
+						})),
+					deterministicChecks: Type.Optional(Type.Array(Type.Object({
+						id: Type.String(), status: StringEnum(["passed", "failed"] as const), summary: Type.String(), evidenceIds: Type.Array(Type.String()),
+					}))),
+						reviewerResultRef: Type.Object({
+							resultId: Type.String(), agentId: Type.String(), role: Type.String(), status: StringEnum(["completed"] as const),
+							digest: Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest of the immutable reviewer result." }),
+						}),
+				}, { description: "Contract V3 atomic completion bundle. Artifacts are re-hashed before commit." })),
 			status: Type.Optional(StringEnum(["complete", "unmet"] as const)),
 				evidence: Type.Optional(Type.Union([Type.String(), Type.Object({
 				id: Type.Optional(Type.String()),
@@ -1733,7 +2073,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				}
 				for (const warning of normalized.warnings) console.warn("[pi-goal] " + warning);
 					const action = normalized.action;
-					if (isTerminalGoalStatus(goal.status)) {
+					if (isTerminalGoalStatus(goal.status) && action.action !== "submit_completion_bundle") {
 						return {
 							content: [{ type: "text", text: "Goal is terminal (" + goal.status + "); clear or replace it before recording new state." }],
 							isError: true,
@@ -2020,6 +2360,64 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						details: { deviation },
 					};
 				}
+				if (action.action === "submit_completion_bundle") {
+					const completionPreflight = preflightCompletionSubmissionV3(goal, action);
+					if (completionPreflight.outcome === "replay") {
+						return {
+							content: [{ type: "text", text: "Completion bundle replay accepted; the goal was already completed." }],
+							details: { replayed: true, transaction: completionPreflight.transaction },
+						};
+					}
+					if (completionPreflight.outcome === "conflict") {
+						return {
+							content: [{ type: "text", text: "The completion idempotency key was already committed with a different payload." }],
+							isError: true,
+							details: { kind: "idempotency_conflict", transaction: completionPreflight.transaction },
+						};
+					}
+					if (completionPreflight.outcome === "terminal") {
+						return { content: [{ type: "text", text: completionPreflight.reason }], isError: true, details: { kind: "completion_bundle_rejected" } };
+					}
+					const branch = ctx.sessionManager.getBranch();
+					const resolved = resolveRoleResultFromBranch(branch, action.reviewerResultRef as RoleResultRefV1);
+					if (!resolved.ok) {
+						return { content: [{ type: "text", text: resolved.reason }], isError: true, details: { kind: "reviewer_result_missing" } };
+					}
+					const verification = goalConfig.verifyCommand
+						? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
+						: undefined;
+					const prepared = prepareCompletionBundleV3({
+						goal,
+						action,
+						reviewerResult: resolved.result,
+						cwd: ctx.cwd,
+						now: nowMs(),
+						...(goalConfig.verifyCommand === undefined ? {} : { verifyCommand: goalConfig.verifyCommand }),
+						...(verification === undefined ? {} : { verifyResult: verification }),
+					});
+					if (!prepared.ok) {
+						if (prepared.reason === "IDEMPOTENT_REPLAY") {
+							return { content: [{ type: "text", text: "Completion bundle replay accepted; the goal was already completed." }], details: { replayed: true, transaction: prepared.details?.transaction } };
+						}
+						if (prepared.reason === "IDEMPOTENCY_CONFLICT") {
+							return { content: [{ type: "text", text: "The completion idempotency key was already committed with a different payload." }], isError: true, details: { kind: "idempotency_conflict", ...(prepared.details ?? {}) } };
+						}
+						return { content: [{ type: "text", text: prepared.reason }], isError: true, details: { kind: "completion_bundle_rejected", ...(prepared.details ?? {}) } };
+					}
+					updateState(prepared.patch, ctx);
+					goalLog(ctx, "completion_bundle_committed", {
+						idempotencyKey: action.idempotencyKey,
+						bundleDigest: completionBundleDigest(prepared.bundle),
+						reviewerResultId: action.reviewerResultRef.resultId,
+					});
+					return {
+						content: [{ type: "text", text: "Completion bundle committed atomically; goal complete." }],
+						details: { status: "complete", replayed: false, transaction: goal.completionTransaction },
+					};
+				}
+				if (action.action !== "mark_unmet") {
+					return { content: [{ type: "text", text: "Unsupported goal action." }], isError: true, details: {} };
+				}
 				updateState({ status: "unmet", blocker: action.blocker, noProgressCount: 0 }, ctx);
 				return { content: [{ type: "text", text: "Goal marked unmet: " + action.blocker }], details: { status: "unmet" } };
 
@@ -2166,7 +2564,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				Type.Object({ description: Type.String(), level: Type.Optional(StringEnum(["blocking", "advisory"] as const)) }),
 			]), { minItems: 1, description: "One or more genuine outcome criteria; do not add workflow/source-count criteria to meet a quota." }),
 			constraints: Type.Optional(Type.Array(Type.String())),
-			taskKind: Type.Optional(StringEnum(["general", "coding", "research", "pm", "review"] as const)),
+			taskKind: Type.Optional(StringEnum(TASK_KINDS)),
 			executionPreference: Type.Optional(StringEnum(["auto", "direct", "specialist", "team"] as const)),
 			role: Type.Optional(Type.String({ description: "Registered specialist role selected from list_roles." })),
 			availableRoles: Type.Optional(Type.Array(Type.String({ description: "Role names returned by list_roles." }))),
@@ -2201,7 +2599,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			needsClarification: Type.Optional(Type.Boolean({ description: "Set true when the objective has genuine ambiguity that should be clarified with the user before drafting. Simple, well-scoped goals must omit this." })),
 			openQuestions: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), { description: "Open questions to clarify with the user, ordered by importance. No count limit — ask everything that genuinely matters. Leave empty unless needsClarification is true." })),
 			// Deprecated aliases.
-			taskType: Type.Optional(StringEnum(["coding", "research", "pm", "review"] as const)),
+			taskType: Type.Optional(StringEnum(["coding", "research", "document", "business", "pm", "review"] as const)),
 			executionMode: Type.Optional(StringEnum(["single", "orchestrated"] as const)),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -2433,15 +2831,28 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	}
 
 	pi.registerCommand("goal", {
-		description: "Set, view, pause, resume, or clear a long-running autonomous goal",
+		description: "Draft, review, start, inspect, steer, pause, resume, edit, fork, or clear a persistent goal",
 		getArgumentCompletions: (prefix) => {
-			return ["status", "pause", "resume", "clear", "help", "apply", "telemetry"].filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
+			return ["draft", "review", "start", "status", "pause", "resume", "edit", "fork", "clear", "help", "run", "apply", "telemetry"]
+				.filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
 		},
 		handler: async (args, ctx) => {
-			const trimmed = args.trim();
+			let trimmed = args.trim();
+			if (trimmed === "review") trimmed = "status";
+			else if (trimmed.startsWith("review ")) trimmed = "apply " + trimmed.slice("review ".length).trim();
+			if (trimmed.startsWith("draft ")) trimmed = trimmed.slice("draft ".length).trim();
+			if (trimmed.startsWith("start ")) {
+				const value = trimmed.slice("start ".length).trim();
+				const candidate = path.isAbsolute(value) ? value : path.join(ctx.cwd, value);
+				trimmed = value && fs.existsSync(candidate) ? "run " + value : value;
+			}
+			if (trimmed === "draft" || trimmed === "start") {
+				ctx.ui.notify("Usage: /goal " + trimmed + " <objective-or-spec-path>", "warning");
+				return;
+			}
 			if (!trimmed || trimmed === "status") {
 				if (!goal) {
-					ctx.ui.notify("Usage: /goal <objective> [--tokens 50k]\n  /goal status | pause | resume | clear | help\n\nNo goal currently set.", "info");
+					ctx.ui.notify("Usage: /goal draft <objective> [--tokens 50k]\n  /goal review <spec> | start <spec-or-objective> | status | pause | resume | edit | fork | clear\n\nNo goal currently set.", "info");
 					return;
 				}
 				// Inject a persistent, collapsible goal card into the conversation
@@ -2471,7 +2882,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return;
 			}
 			if (trimmed === "help") {
-				ctx.ui.notify("/goal <objective> [--tokens N] — set a goal\n/goal status — show current goal\n/goal apply <path> — load & review a goal spec md\n/goal telemetry — show completed goal statistics\n/goal pause — pause\n/goal resume — resume\n/goal clear — remove", "info");
+				ctx.ui.notify("/goal draft <objective> [--tokens N] — draft and review a goal\n/goal review <path> — review an editable goal spec\n/goal start <path-or-objective> — start from a blueprint or enter the draft/review flow\n/goal status — show current goal\n/goal pause | resume — control execution\n/goal edit — create a new revision in the editor\n/goal fork — create a child run from current evidence\n/goal clear — remove current state\n/goal telemetry — show completed goal statistics", "info");
 				return;
 			}
 			if (trimmed.startsWith("run ")) {
@@ -2479,7 +2890,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				const filePath = trimmed.slice("run ".length).trim();
 				if (!filePath) { ctx.ui.notify("Usage: /goal run <path-to-spec.md>", "warning"); return; }
 				const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(ctx.cwd, filePath);
-				const started = await startGoalFromSpecPath(ctx, absolutePath, { confirmIfUI: true });
+				const started = await startGoalFromSpecPath(ctx, absolutePath, { confirmIfUI: true, entrypoint: "interactive" });
 				if (!started.ok) ctx.ui.notify("Blueprint goal failed to start: " + started.error, "error");
 				return;
 			}
@@ -2559,6 +2970,19 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			if (trimmed === "clear") { if (!goal) { ctx.ui.notify("No goal to clear.", "info"); return; } clearGoal(ctx); ctx.ui.notify("Goal cleared.", "info"); return; }
 			if (trimmed === "pause") { if (!goal || goal.status !== "active") { ctx.ui.notify("No active goal.", "info"); return; } pauseGoal("user pause", ctx); ctx.ui.notify("Goal paused.", "info"); return; }
 			if (trimmed === "resume") { if (!goal || !canResumeGoal(goal.status)) { ctx.ui.notify("No resumable goal (paused/budget-limited/usage-limited only; blocked/unmet/complete require /goal clear).", "info"); return; } resumeGoal(ctx); ctx.ui.notify("Goal resumed: " + goal.objective.slice(0, 80) + (goal.objective.length > 80 ? "…" : ""), "info"); return; }
+			if (trimmed === "edit") {
+				if (!goal) { ctx.ui.notify("No goal to edit.", "info"); return; }
+				if (!ctx.hasUI) { ctx.ui.notify("/goal edit requires the interactive editor; edit the spec file and use /goal review <path> in non-UI mode.", "warning"); return; }
+				const edited = await editGoal(ctx);
+				ctx.ui.notify(edited ? "Goal revision started." : "Goal edit cancelled.", "info");
+				return;
+			}
+			if (trimmed === "fork") {
+				if (!goal) { ctx.ui.notify("No goal to fork.", "info"); return; }
+				forkGoal(ctx);
+				ctx.ui.notify("Forked goal run: " + goal!.runtime?.runId, "info");
+				return;
+			}
 
 			const { objective, tokenBudget } = parseTokenBudget(trimmed);
 			if (!objective) { ctx.ui.notify("Usage: /goal <objective> [--tokens 50k]", "warning"); return; }
@@ -2591,5 +3015,10 @@ export function createPiGoalExtension(
 	};
 	return (pi) => registerPiGoalExtension(pi, runtime);
 }
+
+export * from "./evaluation-v3";
+export * from "./benchmark-fixtures-v3";
+export * from "./observability-v3";
+export * from "./fault-injection-v3";
 
 export default createPiGoalExtension();

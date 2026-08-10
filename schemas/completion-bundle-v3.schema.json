@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/completion-bundle-v3.schema.json",
+  "title": "PI Goal Completion Bundle V3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contractVersion", "idempotencyKey", "lineage", "summary", "artifacts", "evidence", "evaluation", "deterministicChecks", "submittedAt"],
+  "properties": {
+    "contractVersion": { "const": 3 },
+    "idempotencyKey": { "type": "string", "minLength": 1 },
+    "lineage": { "$ref": "#/$defs/lineage" },
+    "summary": { "type": "string", "minLength": 1 },
+    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } },
+    "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "evaluation": { "$ref": "#/$defs/evaluation" },
+    "deterministicChecks": { "type": "array", "items": { "$ref": "#/$defs/check" } },
+    "submittedAt": { "$ref": "#/$defs/timestamp" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1 },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "value": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "timestamp": { "type": "number", "minimum": 0 },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goalDefinitionId", "revisionId", "runId", "attemptId"],
+      "properties": {
+        "goalDefinitionId": { "$ref": "#/$defs/id" },
+        "revisionId": { "$ref": "#/$defs/id" },
+        "runId": { "$ref": "#/$defs/id" },
+        "attemptId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uri", "digest", "sizeBytes", "createdByAttemptId", "createdAt", "verifiedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "uri": { "type": "string", "minLength": 1 },
+        "digest": { "$ref": "#/$defs/digest" },
+        "sizeBytes": { "type": "integer", "minimum": 0 },
+        "mediaType": { "type": "string", "minLength": 1 },
+        "createdByAttemptId": { "$ref": "#/$defs/id" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "verifiedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "summary", "criterionIds", "claimIds", "verification", "verifiedAt", "createdByAttemptId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] },
+        "summary": { "type": "string", "minLength": 1 },
+        "criterionIds": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "claimIds": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "artifactId": { "$ref": "#/$defs/id" },
+        "digest": { "$ref": "#/$defs/digest" },
+        "verification": { "enum": ["verified", "rejected"] },
+        "verifiedAt": { "$ref": "#/$defs/timestamp" },
+        "createdByAttemptId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "code", "severity", "subjectId", "reason", "evidenceRefs"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "code": { "$ref": "#/$defs/id" },
+        "severity": { "$ref": "#/$defs/id" },
+        "subjectId": { "$ref": "#/$defs/id" },
+        "reason": { "type": "string", "minLength": 1 },
+        "evidenceRefs": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "missingEvidenceKind": { "type": "string", "minLength": 1 }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criterionId", "status", "evidenceIds"],
+      "properties": {
+        "criterionId": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["satisfied", "unsatisfied", "blocked"] },
+        "evidenceIds": { "type": "array", "items": { "$ref": "#/$defs/id" } }
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revisionId", "runId", "attemptId", "decision", "evaluator", "criterionCoverage", "findings", "advisories", "observedArtifacts", "evaluatedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "revisionId": { "$ref": "#/$defs/id" },
+        "runId": { "$ref": "#/$defs/id" },
+        "attemptId": { "$ref": "#/$defs/id" },
+        "decision": { "enum": ["accept", "revise", "blocked"] },
+        "evaluator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id", "independent"],
+          "properties": {
+            "kind": { "enum": ["deterministic", "reviewer", "human", "dataset"] },
+            "id": { "$ref": "#/$defs/id" },
+            "independent": { "type": "boolean" }
+          }
+        },
+        "criterionCoverage": { "type": "array", "items": { "$ref": "#/$defs/coverage" } },
+        "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+        "advisories": { "type": "array", "items": { "type": "string" } },
+        "observedArtifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["artifactId", "digest"],
+            "properties": {
+              "artifactId": { "$ref": "#/$defs/id" },
+              "digest": { "$ref": "#/$defs/digest" }
+            }
+          }
+        },
+        "evaluatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "summary", "evidenceIds", "checkedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["passed", "failed"] },
+        "summary": { "type": "string", "minLength": 1 },
+        "evidenceIds": { "type": "array", "items": { "$ref": "#/$defs/id" } },
+        "checkedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    }
+  }
+}

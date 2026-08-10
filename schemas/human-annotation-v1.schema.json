@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/human-annotation-v1.schema.json",
+  "title": "PI Human Annotation V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "fixtureId", "annotatorId", "decision", "labels", "comments", "createdAt"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "fixtureId": { "type": "string", "minLength": 1 },
+    "annotatorId": { "type": "string", "minLength": 1 },
+    "decision": { "enum": ["accept", "revise", "blocked"] },
+    "labels": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "string" },
+          { "type": "number" },
+          { "type": "boolean" }
+        ]
+      }
+    },
+    "comments": { "type": "string", "minLength": 1 },
+    "createdAt": { "type": "number", "exclusiveMinimum": 0 }
+  }
+}

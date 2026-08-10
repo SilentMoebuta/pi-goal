@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 
 import piGoalExtension, { createPiGoalExtension } from "../extensions/index";
 import { createGoalSnapshotV2, createGoalStateV2 } from "../extensions/state";
@@ -98,6 +99,40 @@ function project(
 		...overrides,
 	}));
 	return cwd;
+}
+
+function interactiveBlueprintSpec(): string {
+	return `# Goal: Build an interactive blueprint marker
+
+## 目标
+
+Build an interactive blueprint marker
+
+## 验收标准
+
+- [ ] \`blocking\` outputs/interactive-marker.md contains INTERACTIVE_GOAL_OK
+
+## 约束
+
+- Modify only outputs/interactive-marker.md
+
+## 机器字段
+
+\`\`\`json
+${JSON.stringify({
+	contractVersion: 3,
+	taskKind: "document",
+	blueprint: {
+		entry: { prompt: "Create the marker, record verified evidence, and request completion." },
+		execution: { topology: "direct" },
+		evidence: { criteria: [{ id: "c1", kinds: ["artifact"], minCount: 1, verification: "verified" }] },
+		review: { requirement: "none", checklist: [] },
+		verification: { command: "test \"$(cat outputs/interactive-marker.md)\" = INTERACTIVE_GOAL_OK", timeoutMs: 10000 },
+		completion: { policy: "v2", maxAutoTurns: 8 },
+	},
+}, null, 2)}
+\`\`\`
+`;
 }
 
 function context(cwd: string, api: FakeExtensionAPI, model?: any) {
@@ -998,9 +1033,11 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 				message: { role: "assistant", content: [{ type: "text", text: "Requesting completion without filler sources." }], usage: { output: 30 } },
 				toolResults: [{ ok: true }],
 			}, ctx);
-			await api.emit("agent_end", {}, ctx);
-			if (attempt === 1) {
-				const continuation = api.sent.find(({ message }) => message?.customType === GOAL_CONTINUATION_TYPE)?.message;
+				await api.emit("agent_end", {}, ctx);
+				if (attempt === 1) {
+					await new Promise((resolve) => setTimeout(resolve, 1));
+					const continuation = [...api.sent].reverse()
+						.find(({ message }) => message?.customType === GOAL_CONTINUATION_TYPE)?.message;
 				assert.ok(continuation, "a continuation is scheduled after the first rejection");
 				assert.match(continuation.content, /request_completion/, "feedback tells the agent to resubmit a fresh completion request");
 			}
@@ -1210,6 +1247,10 @@ describe("goal telemetry (audit P0)", () => {
 		assert.equal(entries[0].execution.topology, "direct");
 		assert.equal(entries[0].outcomeShape.criteriaTotal, 1);
 		assert.equal(entries[0].resources.tokenBudget, null);
+		const tracePath = path.join(cwd, "docs", "goals", "trace.jsonl");
+		assert.equal(fs.existsSync(tracePath), true, "runtime trace file exists");
+		const spans = fs.readFileSync(tracePath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.ok(spans.some((span: any) => span.name === "goal.goal.started"));
 		await api.emit("session_shutdown", {}, ctx);
 	});
 });
@@ -1253,6 +1294,172 @@ describe("goal drift check (audit P0)", () => {
 		assert.equal(driftSeen, true, "a continuation contains the drift check within 9 turns (interval 6)");
 		const goal = await publicGoal(api, ctx);
 		assert.equal(goal.status, "active", "goal still active after plain turns");
+		await api.emit("session_shutdown", {}, ctx);
+	});
+});
+
+describe("Contract V3 atomic completion action", () => {
+	it("commits one typed reviewer result, verified artifact, evidence, and terminal state", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		const bytes = Buffer.from("atomic output\n");
+		const artifactPath = path.join(cwd, "result.md");
+		fs.writeFileSync(artifactPath, bytes);
+		const artifactDigest = createHash("sha256").update(bytes).digest("hex");
+		const stableJson = (value: unknown): string => {
+			if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+			if (value && typeof value === "object") {
+				const object = value as Record<string, unknown>;
+				return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(",")}}`;
+			}
+			return JSON.stringify(value) ?? "null";
+		};
+		const payload = {
+			decision: "accept",
+			summary: "All blocking criteria are supported.",
+			criterionCoverage: [{ criterionId: "c1", status: "satisfied", evidenceIds: ["e1"] }],
+			findings: [],
+			artifacts: [{ uri: "result.md", digest: artifactDigest, sizeBytes: bytes.length }],
+			advisories: [],
+		};
+		const reviewerCore = { agentId: "review-agent", role: "goal-reviewer", status: "completed", payload, error: null, turnCount: 2 };
+		const reviewerDigest = createHash("sha256").update(stableJson(reviewerCore)).digest("hex");
+		const goal = createGoalStateV2({
+			id: "goal-atomic",
+			objective: "Produce atomic output",
+			criteria: [{ id: "c1", description: "Output exists", level: "blocking" }],
+			taskKind: "general",
+			execution: { preference: "direct", selected: "direct", source: "user", confidence: 1, reasons: [], reassessOn: [] },
+			assurance: { reviewRequirement: "required", reviewStatus: "pending", independent: true, depth: "deep", source: "user", reasons: [], decidedAt: 1 },
+			runtime: {
+				version: 1, contractVersion: 3, goalDefinitionId: "goal-atomic", revisionId: "goal-atomic:revision:1", revisionNumber: 1,
+				runId: "goal-atomic:run:1", attemptId: "goal-atomic:run:1:attempt:1", attemptNumber: 1, entrypoint: "interactive",
+				parentRunId: null, previousRunId: null, previousAttemptId: null,
+			},
+			now: 1,
+		});
+		api.branch.push({ type: "custom", customType: "pi-goal", data: createGoalSnapshotV2({ revision: 1, savedAt: 1, action: "set", goal }), timestamp: 1 });
+		api.branch.push({ type: "custom", customType: "pi-roles:role-result", data: {
+			schemaVersion: 1, resultId: "role-result:review-agent", ...reviewerCore, digest: reviewerDigest, recordedAt: 2,
+		} });
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		await api.commands.get("goal").handler("resume", ctx);
+		const progressiveEvidence = await execute(api, "update_goal", {
+			action: "record_evidence",
+			criterionId: "c1",
+			evidence: {
+				id: "e1",
+				kind: "artifact",
+				summary: "Progress evidence recorded before atomic completion",
+			},
+		}, ctx);
+		assert.equal(progressiveEvidence.isError, undefined, progressiveEvidence.content?.[0]?.text);
+		const result = await execute(api, "update_goal", {
+			action: "submit_completion_bundle",
+			bundle: {
+				idempotencyKey: "atomic-1", summary: "Output is verified",
+				artifacts: [{ id: "a1", uri: "result.md", digest: artifactDigest, sizeBytes: bytes.length }],
+				evidence: [{ id: "e1", kind: "artifact", summary: "Output was checked", criterionIds: ["c1"], claimIds: [], artifactId: "a1", digest: artifactDigest }],
+				reviewerResultRef: { resultId: "role-result:review-agent", agentId: "review-agent", role: "goal-reviewer", status: "completed", digest: reviewerDigest },
+			},
+		}, ctx);
+		assert.equal(result.isError, undefined, result.content?.[0]?.text);
+		const view = await publicGoal(api, ctx);
+		assert.equal(view.status, "complete");
+		assert.equal(view.contract.contractVersion, 3);
+		assert.equal(view.completionTransaction?.idempotencyKey, "atomic-1");
+		assert.equal(view.completion.lastEvaluation.evaluator.kind, "reviewer");
+		await api.emit("session_shutdown", {}, ctx);
+	});
+});
+
+describe("interactive Goal Runtime V3 controls", () => {
+	it("runs a blueprint through the interactive adapter and preserves interactive lineage", async () => {
+		const cwd = project("v2");
+		const specPath = path.join(cwd, "interactive-spec.md");
+		fs.writeFileSync(specPath, interactiveBlueprintSpec());
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+
+		await api.commands.get("goal").handler("run interactive-spec.md", ctx);
+		await Promise.resolve();
+		const started = await publicGoal(api, ctx);
+		assert.equal(started.runtime.entrypoint, "interactive");
+		assert.equal(started.contract.run.entrypoint, "interactive");
+		assert.equal(started.headless, undefined, "interactive runs must not project headless output paths");
+		assert.equal(fs.existsSync(path.join(cwd, "interactive-spec.goal.jsonl")), false);
+		assert.ok(api.sent.some((entry) => entry.message?.customType === GOAL_CONTINUATION_TYPE && entry.options?.triggerTurn), "interactive start queues its first execution turn");
+
+		await api.commands.get("goal").handler("status", ctx);
+		assert.ok(api.sent.some((entry) => entry.message?.details?.kind === "status"));
+		await api.commands.get("goal").handler("pause", ctx);
+		assert.equal((await publicGoal(api, ctx)).status, "paused");
+		await api.commands.get("goal").handler("resume", ctx);
+		assert.equal((await publicGoal(api, ctx)).status, "active");
+		await api.emit("input", { source: "user", text: "Keep the marker exact." }, ctx);
+		assert.ok(api.branch.some((entry) => entry.customType === "pi-goal:runtime-event-v3" && entry.data?.type === "steering.received"));
+
+		const sourceRun = (await publicGoal(api, ctx)).runtime.runId;
+		await api.commands.get("goal").handler("fork", ctx);
+		const forked = await publicGoal(api, ctx);
+		assert.equal(forked.runtime.entrypoint, "interactive");
+		assert.equal(forked.runtime.parentRunId, sourceRun);
+		await api.commands.get("goal").handler("clear", ctx);
+		assert.match((await execute(api, "get_goal", {}, ctx)).content[0].text, /No goal is currently set/);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+
+	it("supports compact/full/delta views, audited steering, and a lineage-preserving fork", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "propose_goal_draft", {
+			objective: "Build an interactive runtime", criteria: ["Runtime works"],
+			taskKind: "coding", executionPreference: "direct", roleCatalogAvailable: false,
+			assurance: { risk: "low" },
+		}, ctx);
+		await Promise.resolve();
+		const full = JSON.parse((await execute(api, "get_goal", { mode: "full" }, ctx)).content[0].text);
+		const compact = JSON.parse((await execute(api, "get_goal", { mode: "compact" }, ctx)).content[0].text);
+		const delta = JSON.parse((await execute(api, "get_goal", { mode: "delta", sinceEventSeq: 0 }, ctx)).content[0].text);
+		assert.equal(full.view, "full");
+		assert.equal(compact.view, "compact");
+		assert.equal(compact.evidenceLedger, undefined);
+		assert.equal(delta.view, "delta");
+		assert.equal(delta.sinceEventSeq, 0);
+
+		await api.emit("input", { source: "user", text: "Keep the public API stable." }, ctx);
+		const steering = api.branch.find((entry) => entry.customType === "pi-goal:runtime-event-v3" && entry.data?.type === "steering.received");
+		assert.ok(steering, "user guidance is persisted as a causal runtime event");
+
+		const sourceRunId = full.runtime.runId;
+		const sourceRevisionId = full.runtime.revisionId;
+		await api.commands.get("goal").handler("fork", ctx);
+		const forked = await publicGoal(api, ctx);
+		assert.equal(forked.runtime.revisionId, sourceRevisionId);
+		assert.notEqual(forked.runtime.runId, sourceRunId);
+		assert.equal(forked.runtime.parentRunId, sourceRunId);
+		assert.equal(forked.completion.lastEvaluation, null);
+		await api.emit("session_shutdown", {}, ctx);
+	});
+
+	it("exposes draft as an explicit interactive command", async () => {
+		const cwd = project("v2");
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		await api.commands.get("goal").handler("draft Build a portable workflow --tokens 10k", ctx);
+		const userMessage = api.sent.find(({ message }) => message?.role === "user")?.message;
+		assert.ok(userMessage);
+		assert.match(userMessage.content, /Build a portable workflow/);
+		assert.match(userMessage.content, /10\.0k/);
 		await api.emit("session_shutdown", {}, ctx);
 	});
 });

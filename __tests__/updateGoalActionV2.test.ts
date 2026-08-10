@@ -165,6 +165,40 @@ describe("canonical update_goal action union", () => {
 		const action = normalized(normalizeUpdateGoalAction({ action: "mark_unmet", blocker: "Needs a user credential." }, { now: 1 }));
 		assert.deepEqual(action, { action: "mark_unmet", blocker: "Needs a user credential." });
 	});
+
+	it("normalizes a Contract V3 atomic completion bundle without inferring legacy actions", () => {
+		const action = normalized(normalizeUpdateGoalAction({
+			action: "submit_completion_bundle",
+			bundle: {
+				idempotencyKey: "complete-1",
+				summary: "Verified output",
+				artifacts: [{ id: "a1", uri: "result.md", digest: "a".repeat(64), sizeBytes: 10 }],
+				evidence: [{ id: "e1", kind: "artifact", summary: "checked", criterionIds: ["c1"], claimIds: [], artifactId: "a1", digest: "a".repeat(64) }],
+				deterministicChecks: [{ id: "checks", status: "passed", summary: "ok", evidenceIds: ["e1"] }],
+				reviewerResultRef: { resultId: "role-result:r1", agentId: "r1", role: "goal-reviewer", status: "completed", digest: "b".repeat(64) },
+			},
+		}, { now: 1 }));
+		assert.equal(action.action, "submit_completion_bundle");
+		if (action.action !== "submit_completion_bundle") return;
+		assert.equal(action.artifacts[0].sizeBytes, 10);
+		assert.equal(action.reviewerResultRef.role, "goal-reviewer");
+	});
+
+	it("defaults omitted bundle evidence claimIds to an empty array", () => {
+		const action = normalized(normalizeUpdateGoalAction({
+			action: "submit_completion_bundle",
+			bundle: {
+				idempotencyKey: "complete-without-claims",
+				summary: "Verified output",
+				artifacts: [{ id: "a1", uri: "result.md", digest: "a".repeat(64), sizeBytes: 10 }],
+				evidence: [{ id: "e1", kind: "artifact", summary: "checked", criterionIds: ["c1"], artifactId: "a1", digest: "a".repeat(64) }],
+				reviewerResultRef: { resultId: "role-result:r1", agentId: "r1", role: "goal-reviewer", status: "completed", digest: "b".repeat(64) },
+			},
+		}, { now: 1 }));
+		assert.equal(action.action, "submit_completion_bundle");
+		if (action.action !== "submit_completion_bundle") return;
+		assert.deepEqual(action.evidence[0].claimIds, []);
+	});
 });
 
 describe("legacy flat update_goal compatibility", () => {

@@ -22,7 +22,51 @@ export type UpdateGoalActionName =
 	| "change_execution"
 	| "mark_unmet"
 	| "pause"
-	| "record_deviation";
+	| "record_deviation"
+	| "submit_completion_bundle";
+
+export interface CompletionArtifactInput {
+	id: string;
+	uri: string;
+	digest: string;
+	sizeBytes: number;
+	mediaType?: string;
+}
+
+export interface CompletionEvidenceInput {
+	id: string;
+	kind: "source" | "artifact" | "command" | "tool_result" | "observation" | "user_confirmation";
+	summary: string;
+	criterionIds: string[];
+	claimIds: string[];
+	artifactId?: string;
+	digest?: string;
+}
+
+export interface CompletionCheckInput {
+	id: string;
+	status: "passed" | "failed";
+	summary: string;
+	evidenceIds: string[];
+}
+
+export interface RoleResultRefInput {
+	resultId: string;
+	agentId: string;
+	role: string;
+	status: "completed";
+	digest: string;
+}
+
+export interface SubmitCompletionBundleAction {
+	action: "submit_completion_bundle";
+	idempotencyKey: string;
+	summary: string;
+	artifacts: CompletionArtifactInput[];
+	evidence: CompletionEvidenceInput[];
+	deterministicChecks: CompletionCheckInput[];
+	reviewerResultRef: RoleResultRefInput;
+}
 
 export interface RecordEvidenceAction {
 	action: "record_evidence";
@@ -94,7 +138,8 @@ export type NormalizedUpdateGoalAction =
 	| ChangeExecutionAction
 	| MarkUnmetAction
 	| PauseGoalAction
-	| RecordDeviationAction;
+	| RecordDeviationAction
+	| SubmitCompletionBundleAction;
 
 export type NormalizeUpdateGoalActionResult =
 	| { ok: true; action: NormalizedUpdateGoalAction; legacy: boolean; warnings: string[] }
@@ -113,6 +158,7 @@ const ACTIONS = new Set<UpdateGoalActionName>([
 	"mark_unmet",
 	"pause",
 	"record_deviation",
+	"submit_completion_bundle",
 ]);
 const EVIDENCE_KINDS = new Set<EvidenceKind>([
 	"source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text",
@@ -196,6 +242,7 @@ function inferredActions(raw: Record<string, unknown>): Set<UpdateGoalActionName
 	if (raw.action === "pause" || raw.pausedReason !== undefined) result.add("pause");
 	// record_deviation 无 legacy 扁平形式：只接受显式 action（避免与旧字段误判）。
 	if (raw.action === "record_deviation") result.add("record_deviation");
+	if (raw.action === "submit_completion_bundle") result.add("submit_completion_bundle");
 	return result;
 }
 
@@ -542,7 +589,73 @@ function parseAction(raw: Record<string, unknown>, action: UpdateGoalActionName,
 		case "mark_unmet": return { action: "mark_unmet", blocker: requiredString(raw.blocker, "blocker") };
 		case "pause": return { action: "pause", reason: requiredString(raw.reason, "reason") };
 		case "record_deviation": return parseRecordDeviation(raw);
+		case "submit_completion_bundle": return parseSubmitCompletionBundle(raw);
 	}
+}
+
+function parseSubmitCompletionBundle(raw: Record<string, unknown>): SubmitCompletionBundleAction {
+	const bundle = isRecord(raw.bundle) ? raw.bundle : raw;
+	const parseArray = <T>(value: unknown, field: string, parser: (item: Record<string, unknown>, index: number) => T): T[] => {
+		if (!Array.isArray(value)) throw new ActionValidationError(`${field} must be an array`);
+		return value.map((item, index) => {
+			if (!isRecord(item)) throw new ActionValidationError(`${field}[${index}] must be an object`);
+			return parser(item, index);
+		});
+	};
+	const digest = (value: unknown, field: string): string => {
+		const parsed = requiredString(value, field);
+		if (!/^[0-9a-f]{64}$/.test(parsed)) throw new ActionValidationError(`${field} must be a lowercase sha256 digest`);
+		return parsed;
+	};
+	const artifacts = parseArray(bundle.artifacts, "bundle.artifacts", (item, index) => {
+		const sizeBytes = finiteNonNegative(item.sizeBytes, Number.NaN, `bundle.artifacts[${index}].sizeBytes`);
+		if (!Number.isInteger(sizeBytes)) throw new ActionValidationError(`bundle.artifacts[${index}].sizeBytes must be an integer`);
+		const mediaType = optionalString(item.mediaType, `bundle.artifacts[${index}].mediaType`);
+		return {
+			id: requiredString(item.id, `bundle.artifacts[${index}].id`),
+			uri: requiredString(item.uri, `bundle.artifacts[${index}].uri`),
+			digest: digest(item.digest, `bundle.artifacts[${index}].digest`),
+			sizeBytes,
+			...(mediaType === undefined ? {} : { mediaType }),
+		};
+	});
+	const evidence = parseArray(bundle.evidence, "bundle.evidence", (item, index) => {
+		const artifactId = optionalString(item.artifactId, `bundle.evidence[${index}].artifactId`);
+		const evidenceDigest = item.digest === undefined ? undefined : digest(item.digest, `bundle.evidence[${index}].digest`);
+		return {
+			id: requiredString(item.id, `bundle.evidence[${index}].id`),
+			kind: enumValue(item.kind, new Set(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const), `bundle.evidence[${index}].kind`),
+			summary: requiredString(item.summary, `bundle.evidence[${index}].summary`),
+			criterionIds: stringArray(item.criterionIds, `bundle.evidence[${index}].criterionIds`),
+			claimIds: stringArray(item.claimIds, `bundle.evidence[${index}].claimIds`),
+			...(artifactId === undefined ? {} : { artifactId }),
+			...(evidenceDigest === undefined ? {} : { digest: evidenceDigest }),
+		};
+	});
+	const deterministicChecks = parseArray(bundle.deterministicChecks ?? [], "bundle.deterministicChecks", (item, index) => ({
+		id: requiredString(item.id, `bundle.deterministicChecks[${index}].id`),
+		status: enumValue(item.status, new Set(["passed", "failed"] as const), `bundle.deterministicChecks[${index}].status`),
+		summary: requiredString(item.summary, `bundle.deterministicChecks[${index}].summary`),
+		evidenceIds: stringArray(item.evidenceIds, `bundle.deterministicChecks[${index}].evidenceIds`),
+	}));
+	const rawRef = bundle.reviewerResultRef;
+	if (!isRecord(rawRef)) throw new ActionValidationError("bundle.reviewerResultRef must be an object");
+	const reviewerResultRef: RoleResultRefInput = {
+		resultId: requiredString(rawRef.resultId, "bundle.reviewerResultRef.resultId"),
+		agentId: requiredString(rawRef.agentId, "bundle.reviewerResultRef.agentId"),
+		role: requiredString(rawRef.role, "bundle.reviewerResultRef.role"),
+		status: enumValue(rawRef.status, new Set(["completed"] as const), "bundle.reviewerResultRef.status"),
+		digest: digest(rawRef.digest, "bundle.reviewerResultRef.digest"),
+	};
+	return {
+		action: "submit_completion_bundle",
+		idempotencyKey: requiredString(bundle.idempotencyKey, "bundle.idempotencyKey"),
+		summary: requiredString(bundle.summary, "bundle.summary"),
+		artifacts,
+		evidence,
+		deterministicChecks,
+		reviewerResultRef,
+	};
 }
 
 const DEVIATION_MAX = { description: 500, reason: 1000, impact: 500, subjectId: 100 } as const;

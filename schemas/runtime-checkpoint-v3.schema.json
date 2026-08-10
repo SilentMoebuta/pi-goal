@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/runtime-checkpoint-v3.schema.json",
+  "title": "PI Goal Runtime Checkpoint V3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "lineage", "state", "artifacts", "approvals", "sideEffects", "lastEventSeq", "createdAt", "checksum"],
+  "properties": {
+    "version": { "const": 3 },
+    "lineage": { "$ref": "goal-contract-v3.schema.json#/$defs/lineage" },
+    "state": {},
+    "artifacts": { "type": "array", "items": { "type": "object", "required": ["id", "uri", "digest", "sizeBytes", "verifiedAt"], "properties": { "id": { "type": "string", "minLength": 1 }, "uri": { "type": "string", "minLength": 1 }, "digest": { "$ref": "goal-contract-v3.schema.json#/$defs/digest" }, "sizeBytes": { "type": "integer", "minimum": 0 }, "verifiedAt": { "type": "number", "minimum": 0 } }, "additionalProperties": false } },
+    "approvals": { "type": "array", "items": { "type": "object" } },
+    "sideEffects": { "type": "array", "items": { "type": "object" } },
+    "lastEventSeq": { "type": "integer", "minimum": 0 },
+    "createdAt": { "type": "number", "minimum": 0 },
+    "checksum": { "$ref": "goal-contract-v3.schema.json#/$defs/digest" }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/pairwise-comparison-v1.schema.json",
+  "title": "PI Pairwise Comparison V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "fixtureId", "leftArtifactId", "rightArtifactId", "winner", "dimensions", "rationale", "evaluatorId", "evaluatedAt"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "fixtureId": { "type": "string", "minLength": 1 },
+    "leftArtifactId": { "type": "string", "minLength": 1 },
+    "rightArtifactId": { "type": "string", "minLength": 1 },
+    "winner": { "enum": ["left", "right", "tie"] },
+    "dimensions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "enum": ["left", "right", "tie"] }
+    },
+    "rationale": { "type": "string", "minLength": 1 },
+    "evaluatorId": { "type": "string", "minLength": 1 },
+    "evaluatedAt": { "type": "number", "exclusiveMinimum": 0 }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/goal-event-v3.schema.json",
+  "title": "PI Goal Event Envelope V3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "eventId", "seq", "goalId", "revisionId", "runId", "attemptId", "nodeId", "parentId", "causationId", "type", "time", "payload"],
+  "properties": {
+    "schemaVersion": { "const": 3 },
+    "eventId": { "type": "string", "minLength": 1 },
+    "seq": { "type": "integer", "minimum": 1 },
+    "goalId": { "type": "string", "minLength": 1 },
+    "revisionId": { "type": "string", "minLength": 1 },
+    "runId": { "type": "string", "minLength": 1 },
+    "attemptId": { "type": "string", "minLength": 1 },
+    "nodeId": { "type": ["string", "null"] },
+    "parentId": { "type": ["string", "null"] },
+    "causationId": { "type": ["string", "null"] },
+    "type": { "type": "string", "minLength": 1 },
+    "time": { "type": "number", "minimum": 0 },
+    "payload": { "type": "object" }
+  }
+}

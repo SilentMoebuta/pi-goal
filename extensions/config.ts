@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { checkCitationTraceability, checkSourceDiversity, checkConfidenceAnnotation } from "./quality-gates";
+import { TASK_KINDS as TASK_KIND_VALUES, type TaskKind as StateTaskKind } from "./state";
 
-export type TaskKind = "general" | "coding" | "research" | "pm" | "review";
+export type TaskKind = StateTaskKind;
 export type ExecutionPreference = "auto" | "direct" | "specialist" | "team";
 export type ReviewPolicy = "risk_based" | "always" | "never";
 export type CompletionPolicy = "legacy" | "shadow" | "v2";
@@ -91,7 +92,7 @@ export const DEFAULT_GOAL_CONFIG: GoalConfig = {
  *  + superpowersDiscipline + GOAL_GOVERNANCE). True when superpowersIntegration
  *  is on AND the task is coding — either forceTaskType is unset (LLM
  *  auto-judges, default) or explicitly "coding". False when forceTaskType is a
- *  non-coding type (research/pm/review) — clean rollback: suppress the coding
+ *  non-coding type (research/document/business/pm/review) — clean rollback: suppress the coding
  *  gates so the LLM does not receive competing instructions ("follow TDD
  *  HARD-GATE" + "use research workflow"). Gating on explicit USER-DECLARED
  *  config is NOT a runtime task-type classifier (no research violated).
@@ -131,7 +132,7 @@ export function taskRoutingBlock(config: GoalConfig = DEFAULT_GOAL_CONFIG): stri
 		"If a specialist role is unavailable, fall back to direct and reassess on scope expansion.\n" +
 		"A new independent workstream may upgrade the route; convergence to one path may downgrade it unless the user locked a preference.\n\n" +
 		"重要: superpowers (brainstorm→plan→TDD→review) 是 coding 专用流程。\n" +
-		"非 coding 任务 (research/pm/review) 不要套 superpowers 的 coding 门 (如强制 TDD) — 按对应 workflow 走。\n" +
+		"非 coding 任务 (research/document/business/pm/review) 不要套 superpowers 的 coding 门 (如强制 TDD) — 按对应 workflow 走。\n" +
 		"</TASK-ROUTING>\n"
 	);
 }
@@ -147,17 +148,25 @@ export function taskRoutingBlock(config: GoalConfig = DEFAULT_GOAL_CONFIG): stri
 /** Per-task-type governance block. Pure + unit-testable.
  *  - coding/undefined → superpowers 阶段门 (existing GOAL_GOVERNANCE content)
  *  - research → 计划→采集→交叉验证→综合→reviewer 验引用 + 质量门清单
+ *  - document → audience/structure/source-boundary/artifact verification
+ *  - business → decision/authority/approval/audit trail
  *  - pm → 盘点→痛点→机会→优先级→reviewer 验论证
  *  - review → 审计清单 + reviewer 复核
  *  Returns the governance text injected into goalSystemPrompt/continuationPrompt. */
-export function taskGovernanceBlock(goalTaskType?: string): string {
+export type ReviewerProtocolHint = "none" | "legacy-v2" | "atomic-v3";
+
+export function taskGovernanceBlock(goalTaskType?: string, reviewerProtocol: ReviewerProtocolHint = "legacy-v2"): string {
 	switch (goalTaskType) {
 		case "research":
-			return RESEARCH_GOVERNANCE;
+			return RESEARCH_GOVERNANCE + reviewerRoleDefHint(reviewerProtocol);
+		case "document":
+			return DOCUMENT_GOVERNANCE;
+		case "business":
+			return BUSINESS_GOVERNANCE;
 		case "pm":
-			return PM_GOVERNANCE;
+			return PM_GOVERNANCE + reviewerRoleDefHint(reviewerProtocol);
 		case "review":
-			return REVIEW_GOVERNANCE;
+			return REVIEW_GOVERNANCE + reviewerRoleDefHint(reviewerProtocol);
 		default: // coding / undefined → backward-compat
 			return CODING_GOVERNANCE;
 	}
@@ -244,8 +253,17 @@ const CODING_GOVERNANCE =
 /** 教训14 (§十三 v2 abort→v3 聚焦): reviewer roleDef prompt 聚焦规范避 doom-loop.
  *  v2 (含 curl/dig URL probing + ls/find 目录探索) 触发 doom-loop detector 误报 abort;
  *  v3 (聚焦: read 指定段 + grep + report_role_result, 无探索) completed 干净. 注入三块非 coding governance. */
-const REVIEWER_ROLEDEF_HINT =
-	"\n   ⚠️ reviewer roleDef 聚焦规范 (教训14, 避 doom-loop): 明确限定工具调用序列 (如 read 指定段 + grep + report_role_result), 禁探索性调用 (curl/dig URL probing / ls/find 目录探索会触发 doom-loop detector 误报 abort), maxTurns 适中 (15-30; 复杂审计≥25). report_role_result.findings[0] 必须精确写 `✅ Ready` 或 `❌ Not ready`; 每条阻塞发现还必须在后续 finding 中写出 code、criterion/claim/constraint subjectId，以及 evidenceRefs 或 missingEvidenceKind，供 Goal V2 绑定审计。";
+function reviewerRoleDefHint(protocol: ReviewerProtocolHint): string {
+	if (protocol === "none") return "";
+	const focus =
+		"\n   ⚠️ reviewer roleDef 聚焦规范 (教训14, 避 doom-loop): 明确限定工具调用序列 (如 read 指定段 + grep + report_role_result), 禁探索性调用 (curl/dig URL probing / ls/find 目录探索会触发 doom-loop detector 误报 abort), maxTurns 适中 (15-30; 复杂审计≥25). ";
+	if (protocol === "atomic-v3") {
+		return focus +
+			"使用只读 `goal-reviewer`，让 report_role_result 按 outputSchema 返回 decision、summary、criterionCoverage、structured findings 和 artifact SHA-256/size；主会话只消费不可变 resultRef，并通过 submit_completion_bundle 原子提交。禁止符号化 verdict、读取 reviewer session 文件或分步写回 review/completion。";
+	}
+	return focus +
+		"report_role_result.findings[0] 必须精确写 `✅ Ready` 或 `❌ Not ready`; 每条阻塞发现还必须在后续 finding 中写出 code、criterion/claim/constraint subjectId，以及 evidenceRefs 或 missingEvidenceKind，供 Goal V2 绑定审计。";
+}
 
 const RESEARCH_GOVERNANCE =
 	"\n\n## Research 模式规则 (taskType=research)\n" +
@@ -253,7 +271,19 @@ const RESEARCH_GOVERNANCE =
 	"普通 claim 可由一个权威 primary source 支持；只有 high-risk、争议、冲突 claim 才要求不同 independenceKey 的独立佐证。\n" +
 	"supporting claim 的证据缺口只产生 advisory，不得阻塞完成。URL 数、引用率和来源数仅是 diagnostics，禁止为凑数量补低质量来源。\n" +
 	"综合时明确区分事实、推断和未知项。只有风险策略触发或用户明确要求时才 spawn 独立 reviewer。\n" +
-	"禁止的反模式：用来源数量代替证据质量、忽略冲突证据、把 advisory 当完成门禁。\n" + REVIEWER_ROLEDEF_HINT;
+		"禁止的反模式：用来源数量代替证据质量、忽略冲突证据、把 advisory 当完成门禁。\n";
+
+const DOCUMENT_GOVERNANCE =
+	"\n\n## Document workflow (taskType=document)\n" +
+	"Identify the audience, required structure, source boundary, and exact artifact path before editing. " +
+	"Keep claims traceable to declared inputs, preserve material meaning, and verify the final artifact bytes. " +
+	"Use targeted revisions for local findings and reserve full rewrites for explicit global structural defects.\n";
+
+const BUSINESS_GOVERNANCE =
+	"\n\n## Business workflow (taskType=business)\n" +
+	"Separate recommendation, authorized decision, approval, and external side effect. " +
+	"Record the decision criteria, accountable actor, resource scope, exceptions, and audit output. " +
+	"Never treat a proposed action as approved or repeat an external side effect without an idempotency key.\n";
 
 const PM_GOVERNANCE =
 	"\n\n## PM 模式规则 (taskType=pm)\n" +
@@ -263,7 +293,7 @@ const PM_GOVERNANCE =
 	"3. 机会：3-5 个，每个含技术可行性/业界现状/差异化/风险\n" +
 	"4. 优先级：用户价值×可行性×差异化，MVP 边界（做/不做）+ 成功指标（领域特化）\n" +
 	"5. assurance：风险策略触发时由独立 reviewer 审机会是否有据、优先级是否合理、假设是否标注\n\n" +
-	"禁止的反模式：纯口号式建议（如\"用 AI 做合同管理\"）、无数据支撑的判断、自评自审。\n" + REVIEWER_ROLEDEF_HINT;
+	"禁止的反模式：纯口号式建议（如\"用 AI 做合同管理\"）、无数据支撑的判断、自评自审。\n";
 
 const REVIEW_GOVERNANCE =
 	"\n\n## Review 模式规则 (taskType=review)\n" +
@@ -272,7 +302,7 @@ const REVIEW_GOVERNANCE =
 	"2. 证据：每条发现附文件行号/源码/测试输出\n" +
 	"3. 分级：critical/major/minor/nit，给修改建议\n" +
 	"4. assurance：风险策略触发或用户要求时由独立 reviewer 复核覆盖度与分级\n\n" +
-	"禁止的反模式：只夸不批、无证据的主观判断、跳过分级。\n" + REVIEWER_ROLEDEF_HINT;
+	"禁止的反模式：只夸不批、无证据的主观判断、跳过分级。\n";
 
 // ═══════════════════════════════════════════════════════════════════════
 // 深修 D: 独立 reviewer gate (非 coding goal 完成前强制 spawn reviewer)
@@ -291,7 +321,7 @@ const REVIEW_GOVERNANCE =
 export interface CompletableGoal {
 	/** Per-goal task type declared at propose_goal_draft time (深修 A).
 	 *  undefined = legacy goal (backward-compat: treated as coding, no gate). */
-	taskType?: "coding" | "research" | "pm" | "review";
+	taskType?: "coding" | "research" | "document" | "business" | "pm" | "review";
 	/** Legacy reviewer result. V2 consults it only when assurance selected required review. */
 	reviewerPassed?: boolean;
 	/** V2 assurance decision. Reviewer is a gate only when this is true. */
@@ -891,7 +921,7 @@ export interface ParsedGoalConfig {
 	warnings: string[];
 }
 
-const TASK_KINDS = new Set<TaskKind>(["general", "coding", "research", "pm", "review"]);
+const TASK_KINDS = new Set<TaskKind>(TASK_KIND_VALUES);
 const EXECUTION_PREFERENCES = new Set<ExecutionPreference>(["auto", "direct", "specialist", "team"]);
 const REVIEW_POLICIES = new Set<ReviewPolicy>(["risk_based", "always", "never"]);
 const COMPLETION_POLICIES = new Set<CompletionPolicy>(["legacy", "shadow", "v2"]);
