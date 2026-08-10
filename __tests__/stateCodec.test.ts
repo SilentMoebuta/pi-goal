@@ -43,6 +43,24 @@ function assertDecoded(result: DecodeGoalSnapshotResult): asserts result is Extr
 }
 
 describe("decodeGoalSnapshot V1 migration", () => {
+	it("round-trips a native cancelled terminal goal", () => {
+		const goal = createGoalStateV2({
+			id: "goal-cancelled",
+			objective: "Stop this run",
+			criteria: [{ id: "c1", description: "No longer needed" }],
+			taskKind: "general",
+			execution: { preference: "direct", selected: "direct", source: "user", confidence: 1, reasons: [], reassessOn: [] },
+			assurance: { reviewRequirement: "none", reviewStatus: "not_required", independent: false, depth: "light", source: "user", reasons: [], decidedAt: 1 },
+			now: 1,
+		});
+		goal.status = "cancelled";
+		goal.pausedReason = "user cancel";
+		goal.endedAt = 2;
+		const decoded = decodeGoalSnapshot(createGoalSnapshotV2({ revision: 1, savedAt: 2, action: "update", goal }));
+		assertDecoded(decoded);
+		assert.equal(decoded.snapshot.goal?.status, "cancelled");
+		assert.equal(decoded.snapshot.goal?.endedAt, 2);
+	});
 	it("migrates unversioned state and preserves terminal complete", () => {
 		const result = decodeGoalSnapshot(makeV1Snapshot({
 			status: "complete",

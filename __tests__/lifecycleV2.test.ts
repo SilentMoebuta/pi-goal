@@ -588,6 +588,67 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		await api.emit("session_shutdown", {}, ctx);
 	});
 
+	it("keeps cancellation terminal when an in-flight V2 evaluator later accepts", async () => {
+		const cwd = project("v2");
+		let announceEvaluatorStarted!: () => void;
+		let releaseEvaluator!: () => void;
+		const evaluatorStarted = new Promise<void>((resolve) => { announceEvaluatorStarted = resolve; });
+		const evaluatorRelease = new Promise<void>((resolve) => { releaseEvaluator = resolve; });
+		const fakeComplete = async (_model: unknown, request: any) => {
+			announceEvaluatorStarted();
+			await evaluatorRelease;
+			const prompt = request.messages[0].content[0].text as string;
+			const packet = JSON.parse(prompt.slice(prompt.indexOf("{")));
+			return { role: "assistant", content: [{ type: "text", text: JSON.stringify({
+				schemaVersion: "goal_completion_policy_v2", outcome: "accept",
+				requirements: packet.criteria.map((criterion: any) => ({ id: criterion.id, status: "satisfied", evidenceRefs: criterion.evidenceRefs, reason: "ok" })),
+				claims: [], blockingFailures: [], advisories: [],
+			}) }], usage: { output: 1 } } as any;
+		};
+		const api = new FakeExtensionAPI();
+		createPiGoalExtension({ complete: fakeComplete as any })(api as any);
+		const ctx = context(cwd, api, { id: "deferred-evaluator" });
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "propose_goal_draft", {
+			objective: "Cancel during completion evaluation", criteria: ["A verified artifact exists"], taskKind: "coding",
+			executionPreference: "direct", roleCatalogAvailable: false, assurance: { risk: "low" },
+		}, ctx);
+		await Promise.resolve();
+		const criterionId = (await publicGoal(api, ctx)).criteria[0].id;
+		fs.mkdirSync(path.join(cwd, "dist"), { recursive: true });
+		fs.writeFileSync(path.join(cwd, "dist", "result"), "artifact-content", "utf8");
+		await api.emit("turn_start", { turnIndex: 0, timestamp: Date.now() - 10 }, ctx);
+		await execute(api, "update_goal", {
+			action: "record_evidence", criterionId,
+			evidence: { id: "artifact", kind: "artifact", summary: "Artifact inspected", locator: "dist/result", verification: "verified" },
+		}, ctx);
+		await execute(api, "update_goal", { action: "request_completion", summary: "Artifact is verified." }, ctx);
+
+		await api.emit("turn_end", {
+			message: { role: "assistant", content: [{ type: "text", text: "The artifact is ready." }], usage: { output: 20 } },
+			toolResults: [{ ok: true }],
+		}, ctx);
+		const agentEnd = api.emit("agent_end", {}, ctx);
+		await evaluatorStarted;
+		await api.commands.get("goal").handler("cancel", ctx);
+		releaseEvaluator();
+		await agentEnd;
+
+		const cancelled = await publicGoal(api, ctx);
+		assert.equal(cancelled.status, "cancelled");
+		assert.equal(cancelled.contract.run.status, "cancelled");
+		assert.equal(cancelled.contract.attempt.status, "cancelled");
+		assert.equal(cancelled.completion.lastEvaluation, null, "the stale evaluator result is not persisted");
+		assert.ok(cancelled.completionTransaction == null, "no completion transaction is committed");
+		assert.equal(api.sent.filter(({ message }) => message?.details?.kind === "complete").length, 0, "no false completion event is emitted");
+		assert.equal(api.sent.filter(({ message }) => message?.details?.kind === "cancelled").length, 1, "cancellation is emitted exactly once");
+		const telemetryPath = path.join(cwd, "docs", "goals", "telemetry.jsonl");
+		const telemetry = fs.readFileSync(telemetryPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(telemetry.length, 1, "the terminal transition produces one telemetry record");
+		assert.equal(telemetry[0].outcome, "cancelled");
+		await api.emit("session_shutdown", {}, ctx);
+	});
+
 	it("defers drafting when the model flags genuine ambiguity", async () => {
 		const cwd = project("v2");
 		const api = new FakeExtensionAPI();
@@ -1408,6 +1469,14 @@ describe("interactive Goal Runtime V3 controls", () => {
 		const forked = await publicGoal(api, ctx);
 		assert.equal(forked.runtime.entrypoint, "interactive");
 		assert.equal(forked.runtime.parentRunId, sourceRun);
+		await api.commands.get("goal").handler("cancel", ctx);
+		const cancelled = await publicGoal(api, ctx);
+		assert.equal(cancelled.status, "cancelled");
+		assert.equal(cancelled.contract.run.status, "cancelled");
+		assert.equal(cancelled.contract.attempt.status, "cancelled");
+		assert.ok(api.branch.some((entry) => entry.customType === "pi-goal:runtime-event-v3" && entry.data?.type === "goal.cancelled"));
+		await api.commands.get("goal").handler("resume", ctx);
+		assert.equal((await publicGoal(api, ctx)).status, "cancelled");
 		await api.commands.get("goal").handler("clear", ctx);
 		assert.match((await execute(api, "get_goal", {}, ctx)).content[0].text, /No goal is currently set/);
 		await api.emit("session_shutdown", {}, ctx);

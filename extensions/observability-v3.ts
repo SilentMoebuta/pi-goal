@@ -83,7 +83,7 @@ export function traceToOfflineDataset(spans: OTelTraceSpanV3[], options: { redac
 }
 
 export interface RuntimeMetricsInputV3 {
-	status: "complete" | "unmet" | "blocked" | "paused" | "failed";
+	status: "complete" | "unmet" | "blocked" | "paused" | "cancelled" | "failed";
 	spans: OTelTraceSpanV3[];
 	schemaValid: boolean;
 	artifactChecks: Array<"correct" | "incorrect" | "unverified">;

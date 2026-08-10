@@ -1025,13 +1025,13 @@ export function loadGoalConfig(cwd: string, trusted: boolean): GoalConfig {
 
 export type GoalStatus =
 	| "active" | "paused" | "budget_limited" | "usage_limited"
-	| "blocked" | "complete" | "unmet";
+	| "blocked" | "complete" | "cancelled" | "unmet";
 
 /** Terminal statuses: a goal in these states cannot be resumed (must clear to
  *  restart). blocked = superseded by a newer goal; unmet = blocker unresolved;
  *  complete = done. */
 export function isTerminalStatus(status: GoalStatus | null | undefined): boolean {
-	return !status || status === "blocked" || status === "unmet" || status === "complete";
+	return !status || status === "blocked" || status === "unmet" || status === "complete" || status === "cancelled";
 }
 
 /** P0-1 fix: update_goal is available in EVERY state where a goal exists, not
@@ -1075,6 +1075,8 @@ export function footerStatusText(status: GoalStatus | null | undefined, info: Fo
 			return fg("error", "🚩 goal unmet" + trunc(info.blocker));
 		case "complete":
 			return fg("success", "✅ goal achieved");
+		case "cancelled":
+			return fg("warning", "⏹ goal cancelled" + trunc(info.pausedReason));
 		default:
 			return "";
 	}

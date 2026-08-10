@@ -58,19 +58,23 @@ describe("canResumeGoal (P0-2: /goal resume coverage)", () => {
   it("false in unmet (terminal — clear to restart)", () => {
     assert.equal(canResumeGoal("unmet"), false);
   });
-  it("false in complete (terminal)", () => {
-    assert.equal(canResumeGoal("complete"), false);
-  });
+	it("false in complete (terminal)", () => {
+		assert.equal(canResumeGoal("complete"), false);
+	});
+	it("false in cancelled (terminal)", () => {
+		assert.equal(canResumeGoal("cancelled"), false);
+	});
   it("false when no goal", () => {
     assert.equal(canResumeGoal(null), false);
   });
 });
 
 describe("isTerminalStatus (shared: terminal = no resume)", () => {
-  it("blocked/unmet/complete are terminal", () => {
+	it("blocked/unmet/complete are terminal", () => {
     assert.equal(isTerminalStatus("blocked"), true);
     assert.equal(isTerminalStatus("unmet"), true);
-    assert.equal(isTerminalStatus("complete"), true);
+		assert.equal(isTerminalStatus("complete"), true);
+		assert.equal(isTerminalStatus("cancelled"), true);
   });
   it("active/paused/budget_limited/usage_limited are NOT terminal", () => {
     assert.equal(isTerminalStatus("active"), false);
@@ -109,10 +113,15 @@ describe("footerStatusText (P1-1/P1-2/P1-3: footer shows reason/summary)", () =>
     assert.ok(t.toLowerCase().includes("unmet") || t.toLowerCase().includes("blocked"));
     assert.ok(t.includes("rejected 3x"));
   });
-  it("complete: shows achieved (P1-3, transient visibility)", () => {
+	it("complete: shows achieved (P1-3, transient visibility)", () => {
     const t = footerStatusText("complete", {});
     assert.ok(t.toLowerCase().includes("achiev") || t.includes("✅"), "complete visible");
-  });
+	});
+	it("cancelled: shows cancelled and reason", () => {
+		const t = footerStatusText("cancelled", { pausedReason: "user cancel" });
+		assert.match(t, /cancelled/i);
+		assert.match(t, /user cancel/);
+	});
   it("budget_limited: shows budget reached", () => {
     const t = footerStatusText("budget_limited", {});
     assert.ok(t.toLowerCase().includes("budget"));

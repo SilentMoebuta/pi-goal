@@ -73,7 +73,7 @@ export function assuranceAfterOutcomeMutation(
 }
 
 export function isTerminalGoalStatus(status: GoalState["status"]): boolean {
-	return status === "complete" || status === "unmet" || status === "blocked";
+	return status === "complete" || status === "unmet" || status === "blocked" || status === "cancelled";
 }
 
 export function legacyAcceptedEvaluation(goal: GoalState, reason: string, evaluatedAt: number): CompletionEvaluation {

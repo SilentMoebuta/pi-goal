@@ -164,6 +164,7 @@ function runStatus(goal: GoalStateV2): GoalRunStatus {
 		case "usage_limited": return "retrying";
 		case "blocked": return "failed";
 		case "complete": return "completed";
+		case "cancelled": return "cancelled";
 		case "unmet": return "unmet";
 	}
 }
@@ -176,6 +177,7 @@ function attemptStatus(goal: GoalStateV2): GoalAttemptStatus {
 		case "usage_limited":
 			return "active";
 		case "complete": return "succeeded";
+		case "cancelled": return "cancelled";
 		case "blocked":
 		case "unmet":
 			return "failed";

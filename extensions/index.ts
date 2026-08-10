@@ -198,6 +198,32 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	let activeMaxAutoTurns = CONFIG.maxAutoTurns;
 	let runtimeEventSeq = 0;
 
+	type ActiveGoalOperationFence = Readonly<{
+		goalId: string;
+		runId: string | null;
+		attemptId: string | null;
+		snapshotRevision: number;
+	}>;
+
+	function captureActiveGoalOperation(): ActiveGoalOperationFence | null {
+		if (!goal || goal.status !== "active") return null;
+		return {
+			goalId: goal.id,
+			runId: goal.runtime?.runId ?? null,
+			attemptId: goal.runtime?.attemptId ?? null,
+			snapshotRevision,
+		};
+	}
+
+	function isActiveGoalOperation(fence: ActiveGoalOperationFence | null): boolean {
+		return fence !== null
+			&& goal?.status === "active"
+			&& goal.id === fence.goalId
+			&& (goal.runtime?.runId ?? null) === fence.runId
+			&& (goal.runtime?.attemptId ?? null) === fence.attemptId
+			&& snapshotRevision === fence.snapshotRevision;
+	}
+
 	function clearTimer() {
 		if (continuationTimer) { clearTimeout(continuationTimer); continuationTimer = null; }
 	}
@@ -576,9 +602,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	}
 
 	const telemetryWritten = new Set<string>();
-	function updateState(patch: Partial<GoalState>, ctx: ExtensionContext, options: { preserveFreshEvaluation?: boolean } = {}) {
+	function updateState(patch: Partial<GoalState>, ctx: ExtensionContext, options: { preserveFreshEvaluation?: boolean } = {}): boolean {
 		let shutdownHeadless = false;
-		if (!goal) return;
+		if (!goal || isTerminalGoalStatus(goal.status)) return false;
 		const now = nowMs();
 		const previousEvaluation = JSON.stringify(goal.completion.lastEvaluation);
 		const previousStatus = goal.status;
@@ -593,7 +619,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			...(unsettledElapsedMs === 0 ? {} : { timeUsedMs: goal.timeUsedMs + unsettledElapsedMs }),
 		};
 		if (patch.status) {
-			candidate.endedAt = patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked" ? now : null;
+			candidate.endedAt = patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked" || patch.status === "cancelled" ? now : null;
 		}
 		const progressUpdate = refreshOutcomeProgress(
 			candidate,
@@ -615,7 +641,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			progressRuntime.turnEnded(now);
 		}
 		// Goal telemetry: 终态时记录一次（同 goalId 幂等），供策略校准。
-		if (patch.status && (patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked") && !telemetryWritten.has(goal.id)) {
+		if (patch.status && (patch.status === "complete" || patch.status === "unmet" || patch.status === "blocked" || patch.status === "cancelled") && !telemetryWritten.has(goal.id)) {
 			telemetryWritten.add(goal.id);
 			const entry = buildGoalTelemetryEntry(goal, now);
 			appendGoalTelemetry(entry, goalConfig.goalSpecDir ?? "docs/goals", ctx.cwd);
@@ -639,6 +665,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// result was written. Request shutdown only after all terminal state and
 		// timer cleanup has completed; interactive /goal run stays open.
 		if (shutdownHeadless) requestHeadlessShutdown(ctx);
+		return true;
 	}
 
 	function reassessGoalExecution(
@@ -795,6 +822,21 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			{ triggerTurn: false },
 		);
 		sendContinuation(ctx);
+		return true;
+	}
+
+	function cancelGoal(reason: string, ctx: ExtensionContext): boolean {
+		if (!goal || isTerminalGoalStatus(goal.status)) return false;
+		clearTimer();
+		clearFooterTicker();
+		userSuspended = true;
+		continuationQueued = false;
+		updateState({ status: "cancelled", pausedReason: reason, blocker: null }, ctx);
+		if (!goal.headless) recordRuntimeEvent("goal.cancelled", { reason });
+		pi.sendMessage(
+			{ customType: GOAL_EVENT_TYPE, content: "Goal cancelled: " + reason + "\n\nObjective: " + goal.objective, display: true, details: { kind: "cancelled", goal: { ...goal }, progress: progressFor(goal) } },
+			{ triggerTurn: false },
+		);
 		return true;
 	}
 
@@ -1040,12 +1082,14 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		ctx: ExtensionContext,
 		precomputedVerification?: VerifyResult,
 	): Promise<LegacyEvaluationOutcome> {
-		if (!goal || goal.status !== "active") return "aborted";
+		const operation = captureActiveGoalOperation();
+		if (!operation || !goal) return "aborted";
 		legacyEvaluationHandledThisTurn = true;
 		const completionPolicy = goalConfig.completionPolicy ?? "v2";
 		const verification = precomputedVerification ?? (goalConfig.verifyCommand
 			? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
 			: undefined);
+		if (!isActiveGoalOperation(operation) || !goal) return "aborted";
 
 		progressRuntime.evaluationStarted(nowMs());
 		updateFooter(ctx);
@@ -1059,6 +1103,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			dependencies.complete,
 			(note) => { verifyFailNote = note; },
 		);
+		if (!isActiveGoalOperation(operation) || !goal) return "aborted";
 		progressRuntime.evaluationEnded(nowMs());
 		updateFooter(ctx);
 		lastJudgeVerdict = verdict;
@@ -1147,11 +1192,11 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		const lastEvaluation = keepShadowAudit
 			? goal.completion.lastEvaluation
 			: legacyAcceptedEvaluation(goal, verdict.reason, evaluatedAt);
-		updateState({
+		if (!updateState({
 			status: "complete",
 			completion: { ...goal.completion, summary: verdict.reason, requestedAt, lastEvaluation },
 			noProgressCount: 0,
-		}, ctx, { preserveFreshEvaluation: keepShadowAudit });
+		}, ctx, { preserveFreshEvaluation: keepShadowAudit })) return "aborted";
 		pi.sendMessage(
 			{
 				customType: GOAL_EVENT_TYPE,
@@ -1205,6 +1250,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// silent stall (scheduleContinuation returned without scheduling). The
 		// complete() call passes timeoutMs so a hanging escalate model can't
 		// strand the goal in 'active' forever.
+		const operation = captureActiveGoalOperation();
+		if (!operation) return;
 		try {
 			if (!goal || !goalConfig.stuckEscalateModel) {
 				pauseGoal("no progress for " + CONFIG.maxNoProgressTurns + " turns", ctx);
@@ -1219,6 +1266,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return;
 			}
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!isActiveGoalOperation(operation) || !goal) return;
 			if (!auth.ok) {
 				pauseGoal("stuck-escalation auth failed: " + auth.error, ctx);
 				return;
@@ -1228,6 +1276,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				systemPrompt: "You are a senior engineer unblocking a stalled autonomous agent. Reply with ONE concrete next step.",
 				messages: [{ role: "user", content: [{ type: "text", text: buildEscalationPrompt({ objective: goal.objective, criteriaSummary }) }], timestamp: nowMs() }],
 			}, { apiKey: auth.apiKey, headers: auth.headers, temperature: 0.4, maxTokens: 512, timeoutMs: CONFIG.escalateTimeoutMs });
+			if (!isActiveGoalOperation(operation)) return;
 			const suggestion = extractTextContent(result).trim();
 			if (!suggestion) {
 				pauseGoal("stuck-escalation returned no suggestion", ctx);
@@ -1238,6 +1287,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			ctx.ui.notify("🔁 Goal stuck — escalated to " + goalConfig.stuckEscalateModel + " for a fresh approach.", "info");
 			sendContinuation(ctx);
 		} catch (err) {
+			if (!isActiveGoalOperation(operation)) return;
 			pauseGoal("stuck-escalation failed: " + (err instanceof Error ? err.message : String(err)), ctx);
 		}
 	}
@@ -1583,11 +1633,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				);
 				if (legacyOutcome !== "active") return;
 			} else if (headlessPolicy !== "legacy" && headlessPending) {
+				const operation = captureActiveGoalOperation();
+				if (!operation) return;
 				const verification = goalConfig.verifyCommand
 					? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
 					: undefined;
+				if (!isActiveGoalOperation(operation) || !goal) return;
 				progressRuntime.evaluationStarted(nowMs());
 				const v2Run = await runV2CompletionJudge(goal, lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)", ctx, pi, goalConfig, verification, dependencies.complete);
+				if (!isActiveGoalOperation(operation) || !goal) return;
 				progressRuntime.evaluationEnded(nowMs());
 				updateFooter(ctx);
 				const transition = applyAuthoritativeCompletionEvaluation(goal, v2Run.evaluation);
@@ -1647,11 +1701,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					// finished work was stranded at budget_limited. Evaluate once before
 					// closing the goal; a revise still falls through to budget_limited.
 					// A pure tool-call turn has no text: judge from the evidence packet.
+					const operation = captureActiveGoalOperation();
+					if (!operation) return;
 					const verification = goalConfig.verifyCommand
 						? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
 						: undefined;
+					if (!isActiveGoalOperation(operation) || !goal) return;
 					progressRuntime.evaluationStarted(nowMs());
 					const v2Run = await runV2CompletionJudge(goal, lastAssistantText.trim() || "(No assistant text this turn; evaluating from the persisted evidence packet.)", ctx, pi, goalConfig, verification, dependencies.complete);
+					if (!isActiveGoalOperation(operation) || !goal) return;
 					progressRuntime.evaluationEnded(nowMs());
 					updateFooter(ctx);
 					const transition = applyAuthoritativeCompletionEvaluation(goal, v2Run.evaluation);
@@ -1749,21 +1807,25 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			&& hasPendingCompletionRequest(goal);
 		if (goalDriven || pendingHeadlessLegacy) {
 			const pendingV2Request = completionPolicy !== "legacy" && hasPendingCompletionRequest(goal);
+			const operation = pendingV2Request ? captureActiveGoalOperation() : null;
 			if (pendingV2Request) {
+				if (!operation) return;
 				progressRuntime.evaluationStarted(nowMs());
 				updateFooter(ctx);
 			}
 			const verification = pendingV2Request && goalConfig.verifyCommand
 				? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
 				: undefined;
+			if (pendingV2Request && (!isActiveGoalOperation(operation) || !goal)) return;
 
 			if (pendingV2Request) {
 				const v2Run = await runV2CompletionJudge(goal, responseText, ctx, pi, goalConfig, verification, dependencies.complete);
+				if (!isActiveGoalOperation(operation) || !goal) return;
 				const evaluated = withBlueprintEvidenceDiagnostics(v2Run.evaluation);
 				progressRuntime.evaluationEnded(nowMs());
 				updateFooter(ctx);
 				if (ctx.signal?.aborted) {
-						if (goal.headless) { snapshotActiveHeadless(ctx); process.exitCode = 1; return; }
+					if (goal.headless) { snapshotActiveHeadless(ctx); process.exitCode = 1; return; }
 					pauseGoal("interrupted", ctx); return;
 				}
 				if (completionPolicy === "shadow") {
@@ -2402,9 +2464,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					if (!resolved.ok) {
 						return { content: [{ type: "text", text: resolved.reason }], isError: true, details: { kind: "reviewer_result_missing" } };
 					}
+					const operation = captureActiveGoalOperation();
+					if (!operation) {
+						return { content: [{ type: "text", text: "Completion bundle requires the same active goal run for its full verification and commit." }], isError: true, details: { kind: "operation_superseded", status: goal.status } };
+					}
 					const verification = goalConfig.verifyCommand
 						? await runVerifyCommand(goalConfig.verifyCommand, goalConfig.verifyTimeoutMs ?? 120_000)
 						: undefined;
+					if (!isActiveGoalOperation(operation) || !goal) {
+						return { content: [{ type: "text", text: "Completion bundle was not committed because the active goal run changed during verification." }], isError: true, details: { kind: "operation_superseded", status: goal?.status ?? null } };
+					}
 					const prepared = prepareCompletionBundleV3({
 						goal,
 						action,
@@ -2850,9 +2919,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	}
 
 	pi.registerCommand("goal", {
-		description: "Draft, review, start, inspect, steer, pause, resume, edit, fork, or clear a persistent goal",
+		description: "Draft, review, start, inspect, steer, pause, resume, cancel, edit, fork, or clear a persistent goal",
 		getArgumentCompletions: (prefix) => {
-			return ["draft", "review", "start", "status", "pause", "resume", "edit", "fork", "clear", "help", "run", "apply", "telemetry"]
+			return ["draft", "review", "start", "status", "pause", "resume", "cancel", "edit", "fork", "clear", "help", "run", "apply", "telemetry"]
 				.filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
 		},
 		handler: async (args, ctx) => {
@@ -2871,7 +2940,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			}
 			if (!trimmed || trimmed === "status") {
 				if (!goal) {
-					ctx.ui.notify("Usage: /goal draft <objective> [--tokens 50k]\n  /goal review <spec> | start <spec-or-objective> | status | pause | resume | edit | fork | clear\n\nNo goal currently set.", "info");
+					ctx.ui.notify("Usage: /goal draft <objective> [--tokens 50k]\n  /goal review <spec> | start <spec-or-objective> | status | pause | resume | cancel | edit | fork | clear\n\nNo goal currently set.", "info");
 					return;
 				}
 				// Inject a persistent, collapsible goal card into the conversation
@@ -2901,7 +2970,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return;
 			}
 			if (trimmed === "help") {
-				ctx.ui.notify("/goal draft <objective> [--tokens N] — draft and review a goal\n/goal review <path> — review an editable goal spec\n/goal start <path-or-objective> — start from a blueprint or enter the draft/review flow\n/goal status — show current goal\n/goal pause | resume — control execution\n/goal edit — create a new revision in the editor\n/goal fork — create a child run from current evidence\n/goal clear — remove current state\n/goal telemetry — show completed goal statistics", "info");
+				ctx.ui.notify("/goal draft <objective> [--tokens N] — draft and review a goal\n/goal review <path> — review an editable goal spec\n/goal start <path-or-objective> — start from a blueprint or enter the draft/review flow\n/goal status — show current goal\n/goal pause | resume | cancel — control execution\n/goal edit — create a new revision in the editor\n/goal fork — create a child run from current evidence\n/goal clear — remove current state\n/goal telemetry — show completed goal statistics", "info");
 				return;
 			}
 			if (trimmed.startsWith("run ")) {
@@ -2989,6 +3058,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			if (trimmed === "clear") { if (!goal) { ctx.ui.notify("No goal to clear.", "info"); return; } clearGoal(ctx); ctx.ui.notify("Goal cleared.", "info"); return; }
 			if (trimmed === "pause") { if (!goal || goal.status !== "active") { ctx.ui.notify("No active goal.", "info"); return; } pauseGoal("user pause", ctx); ctx.ui.notify("Goal paused.", "info"); return; }
 			if (trimmed === "resume") { if (!goal || !canResumeGoal(goal.status)) { ctx.ui.notify("No resumable goal (paused/budget-limited/usage-limited only; blocked/unmet/complete require /goal clear).", "info"); return; } resumeGoal(ctx); ctx.ui.notify("Goal resumed: " + goal.objective.slice(0, 80) + (goal.objective.length > 80 ? "…" : ""), "info"); return; }
+			if (trimmed === "cancel") { if (!goal) { ctx.ui.notify("No goal to cancel.", "info"); return; } if (!cancelGoal("user cancel", ctx)) ctx.ui.notify("Goal is already terminal (" + goal.status + ").", "info"); return; }
 			if (trimmed === "edit") {
 				if (!goal) { ctx.ui.notify("No goal to edit.", "info"); return; }
 				if (!ctx.hasUI) { ctx.ui.notify("/goal edit requires the interactive editor; edit the spec file and use /goal review <path> in non-UI mode.", "warning"); return; }

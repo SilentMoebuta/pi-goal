@@ -30,6 +30,7 @@ export type GoalStatusV2 =
 	| "usage_limited"
 	| "blocked"
 	| "complete"
+	| "cancelled"
 	| "unmet";
 
 export interface ExecutionDecision {
@@ -293,7 +294,7 @@ export type DecodeGoalSnapshotResult =
 	| { ok: false; kind: "corrupt"; message: string; version?: number }
 	| { ok: false; kind: "future_version"; message: string; version: number };
 
-const GOAL_STATUSES = ["active", "paused", "budget_limited", "usage_limited", "blocked", "complete", "unmet"] as const;
+const GOAL_STATUSES = ["active", "paused", "budget_limited", "usage_limited", "blocked", "complete", "cancelled", "unmet"] as const;
 const TOPOLOGIES = ["direct", "specialist", "team"] as const;
 const EXECUTION_PREFERENCES = ["auto", ...TOPOLOGIES] as const;
 const EXECUTION_REASSESSMENT_TRIGGERS = ["scope_expanded", "new_workstream", "conflict", "stalled"] as const;
@@ -826,7 +827,7 @@ function parseGoalState(value: unknown, path: string): GoalStateV2 {
 	const tokenBudget = object.tokenBudget === null ? null : finiteNonNegative(object.tokenBudget, path + ".tokenBudget");
 	const status = asEnum(object.status, GOAL_STATUSES, path + ".status");
 	const endedAt = nullableNonNegative(object.endedAt, path + ".endedAt");
-	const terminal = status === "complete" || status === "unmet" || status === "blocked";
+	const terminal = status === "complete" || status === "unmet" || status === "blocked" || status === "cancelled";
 	if (terminal !== (endedAt !== null)) {
 		throw new SnapshotValidationError(path + ".endedAt must be set exactly for complete/unmet/blocked status");
 	}

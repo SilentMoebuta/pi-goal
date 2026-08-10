@@ -30,6 +30,8 @@ describe("runtime observability and fault injection V3", () => {
 		assert.equal(metrics.artifactCorrectness, 0.5);
 		assert.equal(metrics.duplicateSideEffects, 1);
 		assert.equal(metrics.latencyMs, 150);
+		const cancelledMetrics = calculateRuntimeMetrics({ status: "cancelled", spans: [span], schemaValid: true, artifactChecks: [], humanAccepted: null, recoveryAttempts: 0, sideEffectKeys: [] });
+		assert.equal(cancelledMetrics.success, false, "cancellation is terminal but not successful completion");
 	});
 
 	it("maps causal event ids into parent span ids", () => {

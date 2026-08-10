@@ -64,7 +64,7 @@ The agent drafts a formal goal (objective + acceptance criteria + constraints), 
 goal active | 1 blocking open | 12.4K tok | active 3m12s | wall 8m41s | DAG 2 running, 1 ready
 ```
 
-**3. Interrupt or steer anytime** — just type a message; your input runs first and the goal resumes after. Use `/goal pause` for an explicit stop, `/goal resume` to continue.
+**3. Interrupt or steer anytime** — just type a message; your input runs first and the goal resumes after. Use `/goal pause` for a resumable stop, `/goal resume` to continue, or `/goal cancel` to end the run with an audited terminal status.
 
 **4. Completion is evidence-based** — when the agent believes it is done it calls `update_goal({ action: "request_completion" })`; a separate evaluator checks the evidence ledger, tests, and (if configured) a deterministic verification command. The goal completes only when blocking outcomes hold:
 
@@ -90,6 +90,7 @@ Goal achieved! ✅
 | `/goal apply <spec.md>` | Load and review a goal spec document (edit it, then start). |
 | `/goal pause` | Pause the active goal. |
 | `/goal resume` | Resume a paused or limited goal. |
+| `/goal cancel` | End a non-terminal goal as `cancelled`, preserving its snapshot, runtime event, and telemetry. |
 | `/goal edit` | Edit the active goal and create a new revision. |
 | `/goal fork` | Create a child run from the active goal's evidence and lineage. |
 | `/goal clear` | Remove the current goal. |
@@ -669,6 +670,7 @@ A required review must come from a real spawned reviewer session. Its blocking f
 |---|---|
 | `active` | The goal is running and may schedule another turn. |
 | `paused` | Execution is halted until `/goal resume`, including a repeated-rejection or interruption pause. |
+| `cancelled` | The user ended the run. It is terminal and remains inspectable until `/goal clear` or replacement. |
 | `usage_limited` | The provider returned a rate limit or transient server failure. |
 | `budget_limited` | The user-specified token budget was exhausted. |
 | `blocked` | The goal was superseded or cannot currently proceed. |

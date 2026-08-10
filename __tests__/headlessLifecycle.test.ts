@@ -11,6 +11,7 @@ type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 class HeadlessFakeAPI {
 	readonly handlers = new Map<string, Handler[]>();
 	readonly tools = new Map<string, any>();
+	readonly commands = new Map<string, any>();
 	readonly sent: Array<{ message: any; options: any }> = [];
 	readonly branch: any[];
 	private flags = new Map<string, unknown>();
@@ -30,7 +31,7 @@ class HeadlessFakeAPI {
 	}
 
 	registerTool(tool: any) { this.tools.set(tool.name, tool); }
-	registerCommand() {}
+	registerCommand(name: string, command: any) { this.commands.set(name, command); }
 	registerMessageRenderer() {}
 	registerFlag(name: string, options: unknown) { this.flagDefs.set(name, options); }
 	getFlag(name: string) { return this.flags.get(name); }
@@ -138,6 +139,59 @@ async function execute(api: HeadlessFakeAPI, name: string, params: unknown, ctx:
 }
 
 describe("headless goal lifecycle", () => {
+	it("uses the same update_goal action API and state transitions for interactive and headless blueprints", async () => {
+		const headlessCwd = project();
+		const interactiveCwd = project();
+		const headlessSpec = path.join(headlessCwd, "spec.md");
+		const interactiveSpec = path.join(interactiveCwd, "spec.md");
+		fs.writeFileSync(headlessSpec, specMarkdown());
+		fs.writeFileSync(interactiveSpec, specMarkdown());
+
+		const headlessApi = new HeadlessFakeAPI();
+		headlessApi.setFlag("goal-run", headlessSpec);
+		piGoalExtension(headlessApi as any);
+		const headlessCtx = context(headlessCwd, headlessApi);
+		await headlessApi.emit("session_start", {}, headlessCtx);
+
+		const interactiveApi = new HeadlessFakeAPI();
+		piGoalExtension(interactiveApi as any);
+		const interactiveCtx = context(interactiveCwd, interactiveApi);
+		await interactiveApi.emit("session_start", {}, interactiveCtx);
+		await interactiveApi.commands.get("goal").handler("run spec.md", interactiveCtx);
+
+		assert.deepEqual(interactiveApi.tools.get("update_goal").parameters, headlessApi.tools.get("update_goal").parameters);
+		const actions = [
+			{
+				action: "record_deviation",
+				subjectId: "execution.topology",
+				description: "Use one sequential pass",
+				reason: "The fixture has one independent output",
+				impact: "none",
+			},
+			{
+				action: "record_evidence",
+				criterionId: "c1",
+				evidence: { id: "e-shared", kind: "command", summary: "Shared verifier passed", verification: "verified", origin: "tool" },
+			},
+		];
+		for (const action of actions) {
+			assert.equal((await execute(headlessApi, "update_goal", action, headlessCtx)).isError, undefined);
+			assert.equal((await execute(interactiveApi, "update_goal", action, interactiveCtx)).isError, undefined);
+		}
+		const headlessView = JSON.parse((await execute(headlessApi, "get_goal", {}, headlessCtx)).content[0].text);
+		const interactiveView = JSON.parse((await execute(interactiveApi, "get_goal", {}, interactiveCtx)).content[0].text);
+		assert.deepEqual(
+			interactiveView.deviations.map(({ id: _id, recordedAt: _recordedAt, ...rest }: any) => rest),
+			headlessView.deviations.map(({ id: _id, recordedAt: _recordedAt, ...rest }: any) => rest),
+		);
+		assert.deepEqual(
+			interactiveView.evidenceLedger.map(({ id: _id, recordedAt: _recordedAt, ...rest }: any) => rest),
+			headlessView.evidenceLedger.map(({ id: _id, recordedAt: _recordedAt, ...rest }: any) => rest),
+		);
+		assert.equal(interactiveView.runtime.entrypoint, "interactive");
+		assert.equal(headlessView.runtime.entrypoint, "headless");
+	});
+
 	it("logs tool calls, llm responses, and heartbeats (activity transparency)", async () => {
 		const cwd = project();
 		const specPath = path.join(cwd, "spec.md");
