@@ -49,6 +49,12 @@ describe("Contract V3 interactive completion prompts", () => {
 		const state = researchGoal();
 		assert.equal(usesAtomicCompletionV3(state), true);
 		for (const prompt of [goalSystemPrompt(state), continuationPrompt(state)]) {
+			assert.match(prompt, /Structured-reference preflight/);
+			assert.match(prompt, /Allowed criterion IDs are exactly \["c1"\]/);
+			assert.match(prompt, /\$constraint:n.*reviewer finding subject.*never.*criterionId\/criterionIds/i);
+			assert.match(prompt, /Before record_evidence.*compare every target ID/i);
+			assert.match(prompt, /Before spawning goal-reviewer.*resultConstraints/i);
+			assert.match(prompt, /Before submit_completion_bundle.*cross-reference/i);
 			assert.match(prompt, /goal-reviewer/);
 			assert.match(prompt, /submit_completion_bundle/);
 			assert.match(prompt, /resultRef/);
@@ -90,6 +96,7 @@ describe("Contract V3 interactive completion prompts", () => {
 
 	it("keeps unattended caller and durable log guidance for headless blueprint runs", () => {
 		const state = blueprintGoal("headless");
+		state.blueprint!.verification = { command: "node verify.mjs" };
 		for (const prompt of [goalSystemPrompt(state), continuationPrompt(state)]) {
 			assert.match(prompt, /<GOAL-BLUEPRINT>/);
 			assert.match(prompt, /Entrypoint: headless/);
@@ -98,6 +105,9 @@ describe("Contract V3 interactive completion prompts", () => {
 			assert.match(prompt, /goal log/);
 			assert.match(prompt, /record_deviation/);
 			assert.match(prompt, /record_evidence/);
+			assert.match(prompt, /Deterministic-verifier preflight/);
+			assert.match(prompt, /inspect.*script or documented requirements.*current artifact/i);
+			assert.match(prompt, /required paths, literal markers, schema fields, and invariants/i);
 		}
 	});
 });

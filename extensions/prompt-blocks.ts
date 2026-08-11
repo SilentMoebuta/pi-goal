@@ -119,6 +119,30 @@ export function reviewerTranscriptContractBlock(goal: GoalState): string {
 		"- Submit those same identifiers through update_goal action=record_review; unbound or contradictory verdicts are rejected.\n";
 }
 
+export function structuredReferencePreflightBlock(goal: GoalState): string {
+	const criterionIds = JSON.stringify(goal.criteria.map((criterion) => criterion.id));
+	const claimIds = JSON.stringify(goal.claims.map((claim) => claim.id));
+	const evidenceIds = JSON.stringify(goal.evidenceLedger.map((evidence) => evidence.id));
+	let block = "\n\nStructured-reference preflight:\n" +
+		"- Allowed criterion IDs are exactly " + criterionIds + ". Allowed claim IDs are exactly " + claimIds + ". Existing ledger evidence IDs are " + evidenceIds + ".\n" +
+		"- Only IDs displayed in the allowed criterion list may be used as criterionId/criterionIds or reviewer criterionCoverage. $constraint:n is a reviewer finding subject only; never use it as criterionId/criterionIds or as a criterion evidence target.\n" +
+		"- Before record_evidence, compare every target ID with the allowed criterion/claim lists; do not infer IDs from descriptions, constraint indexes, check names, or filenames.\n";
+	if (usesAtomicCompletionV3(goal)) {
+		block += "- Before spawning goal-reviewer, derive resultConstraints from the exact criterion IDs, the evidence IDs that will be submitted, and the exact artifact URIs.\n" +
+			"- Before submit_completion_bundle, verify every cross-reference closes over the submitted criteria, claims, evidence, deterministic checks, artifacts, and immutable reviewer result.\n";
+	}
+	return block;
+}
+
+export function deterministicVerifierPreflightBlock(goal: GoalState, config: GoalConfig = DEFAULT_GOAL_CONFIG): string {
+	const command = goal.blueprint?.verification?.command ?? config.verifyCommand;
+	if (!command) return "";
+	return "\n\nDeterministic-verifier preflight:\n" +
+		"- Declared command: " + command + "\n" +
+		"- Before the first execution, inspect the verifier script or documented requirements and compare the current artifact against all required paths, literal markers, schema fields, and invariants.\n" +
+		"- Fix known mismatches before running the command; use verifier output to confirm the artifact, not as the first discovery of requirements that were available for inspection.\n";
+}
+
 export function usesAtomicCompletionV3(goal: GoalState): boolean {
 	return goal.runtime?.contractVersion === 3
 		&& goal.assurance.reviewRequirement !== "none"
@@ -319,9 +343,11 @@ export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT
 	return (
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
 		(injectSuperpowersCoding(config, goal.taskKind) ? superpowersAdaptationBlock() + superpowersDisciplineBlock() : "") +
-			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind, reviewerProtocolHint(goal)) : "") +
-			executionDecisionBlock(goal.execution) +
-			reviewerTranscriptContractBlock(goal) +
+				(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind, reviewerProtocolHint(goal)) : "") +
+				executionDecisionBlock(goal.execution) +
+				structuredReferencePreflightBlock(goal) +
+				deterministicVerifierPreflightBlock(goal, config) +
+				reviewerTranscriptContractBlock(goal) +
 			completionFeedbackBlock(goal, config) +
 		goalBlueprintContinuationBlock(goal) +
 		"---\n\n" +
@@ -403,8 +429,8 @@ export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_G
 		completionInstruction +
 		"The completion evaluator uses the persisted ledger, claims, deterministic verification, and the latest response." +
 		(config.superpowersIntegration ? taskRoutingBlock(config) : "") +
-			(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind, reviewerProtocolHint(goal)) : "") +
-			executionDecisionBlock(goal.execution) + reviewerTranscriptContractBlock(goal) + completionFeedbackBlock(goal, config) +
+				(config.superpowersIntegration ? taskGovernanceBlock(goal.taskKind, reviewerProtocolHint(goal)) : "") +
+				executionDecisionBlock(goal.execution) + structuredReferencePreflightBlock(goal) + deterministicVerifierPreflightBlock(goal, config) + reviewerTranscriptContractBlock(goal) + completionFeedbackBlock(goal, config) +
 		goalBlueprintContinuationBlock(goal) +
 		executionFailureGuidanceBlock();
 }

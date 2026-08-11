@@ -2460,7 +2460,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	pi.registerTool({
 		name: "update_goal", label: "Update Goal",
-		description: "Apply exactly one Goal V2 action. Legacy flat arguments remain accepted for one compatibility cycle.",
+		description: "Apply exactly one Goal V2 action. Preflight structured references before record_evidence, reviewer handoff, or completion submission. Legacy flat arguments remain accepted for one compatibility cycle.",
 			parameters: Type.Object({
 				action: Type.Optional(StringEnum(["record_evidence", "upsert_claim", "request_completion", "record_review", "change_execution", "mark_unmet", "pause", "record_deviation", "submit_completion_bundle"] as const)),
 					bundle: Type.Optional(Type.Object({
@@ -2476,19 +2476,19 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 							id: Type.String(),
 							kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const),
 							summary: Type.String(),
-							criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Criterion ids supported by this evidence; omitted input normalizes to an empty array." })),
+						criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Declared Goal criterion IDs supported by this evidence; $constraint:n is never a criterion ID. Omitted input normalizes to an empty array." })),
 							claimIds: Type.Optional(Type.Array(Type.String())),
 							artifactId: Type.Optional(Type.String({ description: "Exact artifacts[].id. An exact artifact URI alias is accepted and canonicalized." })),
 							digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest when evidence is tied to an artifact." })),
 						})),
 					deterministicChecks: Type.Optional(Type.Array(Type.Object({
-						id: Type.String(), status: StringEnum(["passed", "failed"] as const), summary: Type.String(), evidenceIds: Type.Array(Type.String()),
+						id: Type.String({ description: "Deterministic check ID from a separate namespace; never use it as a criterion ID." }), status: StringEnum(["passed", "failed"] as const), summary: Type.String(), evidenceIds: Type.Array(Type.String()),
 					}))),
 						reviewerResultRef: Type.Object({
 							resultId: Type.String(), agentId: Type.String(), role: Type.String(), status: StringEnum(["completed"] as const),
 							digest: Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest of the immutable reviewer result." }),
 						}),
-				}, { description: "Contract V3 atomic completion bundle. Artifacts are re-hashed before commit." })),
+				}, { description: "Contract V3 atomic completion bundle. Preflight criterion, claim, evidence, check, artifact, and reviewer cross-references; $constraint:n is never a criterion. Artifacts are re-hashed before commit." })),
 			status: Type.Optional(StringEnum(["complete", "unmet"] as const)),
 				evidence: Type.Optional(Type.Union([Type.String(), Type.Object({
 				id: Type.Optional(Type.String()),
@@ -2497,7 +2497,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				// Accept target IDs inside the evidence object as well as at the
 				// canonical top level. Some model providers naturally group all
 				// evidence metadata together; normalization keeps both forms equal.
-				criterionIds: Type.Optional(Type.Array(Type.String())),
+				criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Declared Goal criterion IDs only; $constraint:n is a reviewer finding subject, never a criterion target." })),
 				claimIds: Type.Optional(Type.Array(Type.String())),
 				locator: Type.Optional(Type.String()),
 				excerpt: Type.Optional(Type.String()),
@@ -2512,8 +2512,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				description: Type.Optional(Type.String({ description: "For action=record_deviation: what deviated from the blueprint." })),
 				reason: Type.Optional(Type.String({ description: "For action=record_deviation: why the deviation was necessary." })),
 				impact: Type.Optional(Type.String({ description: "For action=record_deviation: impact on acceptance criteria." })),
-				criterionId: Type.Optional(Type.String({ description: "ID of criterion for per-criterion evidence." })),
-				criterionIds: Type.Optional(Type.Array(Type.String())),
+				criterionId: Type.Optional(Type.String({ description: "Declared Goal criterion ID for per-criterion evidence. $constraint:n is never valid here." })),
+				criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Declared Goal criterion IDs only; preflight every value against the current Goal criteria." })),
 				claimId: Type.Optional(Type.String()),
 				claimIds: Type.Optional(Type.Array(Type.String())),
 			claim: Type.Optional(Type.Object({
@@ -2649,7 +2649,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					const unknownCriteria = action.criterionIds.filter((id) => !goal!.criteria.some((item) => item.id === id));
 					const unknownClaims = action.claimIds.filter((id) => !goal!.claims.some((item) => item.id === id));
 					if (unknownCriteria.length + unknownClaims.length > 0) {
-						return { content: [{ type: "text", text: "Evidence targets do not exist: " + [...unknownCriteria, ...unknownClaims].join(", ") }], isError: true, details: {} };
+						const allowedCriteria = goal.criteria.map((item) => item.id).sort();
+						const allowedClaims = goal.claims.map((item) => item.id).sort();
+						return {
+							content: [{ type: "text", text: "Evidence targets do not exist: " + [...unknownCriteria, ...unknownClaims].join(", ") +
+								". Allowed criterion IDs: " + (allowedCriteria.join(", ") || "none") +
+								". Allowed claim IDs: " + (allowedClaims.join(", ") || "none") +
+								". $constraint:n is a reviewer finding subject, never a criterion evidence target." }],
+							isError: true,
+							details: { allowedCriterionIds: allowedCriteria, allowedClaimIds: allowedClaims },
+						};
 					}
 					const existing = goal.evidenceLedger.find((item) => item.id === action.evidenceId);
 					if (!action.evidence && !existing) {

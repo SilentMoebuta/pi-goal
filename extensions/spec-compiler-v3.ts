@@ -240,16 +240,24 @@ export function migrateGoalSpecMarkdownV2ToV3(markdown: string): MigratedGoalSpe
 }
 
 export function buildContractV3EntryPrompt(spec: GoalProjectSpecV3): string {
+	const criterionIds = JSON.stringify(spec.criteria.map((criterion) => criterion.id));
 	const lines = [
 		"Execute the declared Goal Contract V3 outcome and constraints.",
 		"Persist criterion and claim evidence with structured update_goal actions while working.",
+		`Only IDs declared in criteria may be used as criterionId or criterionIds; the declared criterion IDs are exactly ${criterionIds}.`,
+		"$constraint:n is a reviewer finding subject only, never a criterion evidence target or criterionCoverage ID.",
+		"Preflight record_evidence, reviewer constraints, and the completion bundle against the declared criterion, claim, evidence, check, and artifact namespaces before submission.",
 	];
 	if (spec.profile) lines.push(`Load the project profile named ${spec.profile} through the host's profile/policy layer; it is not a core runtime rule.`);
 	for (const input of spec.inputs ?? []) lines.push(`Input${input.required === false ? " (optional)" : ""}: ${input.uri} - ${input.description}`);
 	for (const output of spec.outputs ?? []) lines.push(`Output${output.required === false ? " (optional)" : ""}: ${output.uri} - ${output.description}`);
 	if (spec.instructions) lines.push("Project instructions: " + spec.instructions);
+	if (spec.verification?.command) {
+		lines.push(`Declared deterministic verification command: ${spec.verification.command}`);
+		lines.push("Before the first deterministic verification run, inspect the verifier script or documented requirements and compare the current artifact against all required paths, literal markers, schema fields, and invariants.");
+		lines.push("Fix inspectable mismatches before executing the verifier; use the command to confirm the artifact rather than discover requirements already available in the project.");
+	}
 	if ((spec.review?.requirement ?? "advisory") !== "none") {
-		const criterionIds = JSON.stringify(spec.criteria.map((criterion) => criterion.id));
 		const artifactUris = JSON.stringify((spec.outputs ?? []).map((output) => output.uri));
 		lines.push("At completion, compute lowercase SHA-256 digests and byte sizes for every submitted local artifact.");
 		lines.push("Spawn the goal-reviewer role with the exact criteria, evidence IDs, deterministic check results, and artifact paths; use its returned immutable resultRef.");

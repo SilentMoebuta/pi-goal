@@ -533,6 +533,21 @@ describe("headless goal lifecycle", () => {
 		await interactiveApi.commands.get("goal").handler("run spec.md", interactiveCtx);
 
 		assert.deepEqual(interactiveApi.tools.get("update_goal").parameters, headlessApi.tools.get("update_goal").parameters);
+		const updateGoalSchema = JSON.stringify(interactiveApi.tools.get("update_goal"));
+		assert.match(updateGoalSchema, /Preflight structured references/);
+		assert.match(updateGoalSchema, /\$constraint:n.*never.*criterion/i);
+		assert.match(updateGoalSchema, /deterministic check ID.*separate namespace/i);
+		for (const [api, ctx] of [[headlessApi, headlessCtx], [interactiveApi, interactiveCtx]] as const) {
+			const rejected = await execute(api, "update_goal", {
+				action: "record_evidence",
+				criterionId: "$constraint:0",
+				evidence: { id: "e-invalid", kind: "observation", summary: "Invalid namespace probe" },
+			}, ctx);
+			assert.equal(rejected.isError, true);
+			assert.match(rejected.content[0].text, /Allowed criterion IDs: c1/);
+			assert.match(rejected.content[0].text, /\$constraint:n is a reviewer finding subject/);
+			assert.deepEqual(rejected.details.allowedCriterionIds, ["c1", "c2"]);
+		}
 		const actions = [
 			{
 				action: "record_deviation",

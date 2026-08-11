@@ -695,6 +695,8 @@ A required review must come from a real spawned reviewer session. Its blocking f
 
 Contract V3 uses one `submit_completion_bundle` call after review. Every evidence entry is canonicalized with explicit `criterionIds` and `claimIds`; omitted input arrays normalize to empty arrays. `artifactId` canonically refers to `artifacts[].id`, while an exact, unambiguous artifact URI is accepted as an input alias and normalized to that ID. A tool result that returns a business-level rejection is recorded as an error span even when the host reports successful tool transport, so offline quality gates cannot mistake a rejected completion attempt for a clean trajectory.
 
+Interactive and headless runs share a structured-reference preflight. Only IDs declared by the active Goal criteria may be used in `criterionId`, `criterionIds`, or reviewer `criterionCoverage`; `$constraint:n` belongs only to reviewer finding subjects, and deterministic check IDs are a separate namespace. Before `record_evidence`, reviewer handoff, and atomic completion, the prompt enumerates or derives the exact reference sets and requires the bundle graph to close over submitted objects. When a deterministic verifier is declared, the agent is instructed to inspect its script or documented requirements and compare the current artifact against required paths, literal markers, schema fields, and invariants before the first run.
+
 ### Completion policy rollout
 
 | `completionPolicy` | Behavior |

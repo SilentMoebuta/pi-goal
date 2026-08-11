@@ -20,6 +20,7 @@ const SOURCE = {
 	outputs: [{ uri: "workspace://brief.md", description: "Research brief" }],
 	execution: { topology: "direct" },
 	review: { requirement: "required", checklist: ["Trace claims to sources"] },
+	verification: { command: "node verify.mjs", timeoutMs: 120000 },
 	retry: { maxInfrastructureAttempts: 3, maxSchemaRepairs: 1, baseDelayMs: 250, maxDelayMs: 2000 },
 };
 
@@ -35,6 +36,11 @@ describe("Goal Project Spec V3 compiler", () => {
 		const entryPrompt = compiled.doc.machine.blueprint?.entry?.prompt ?? "";
 		assert.match(entryPrompt, /resultConstraints\.criterionIds exactly to \["c1"\]/);
 		assert.match(entryPrompt, /resultConstraints\.artifactUris exactly to \["workspace:\/\/brief\.md"\]/);
+		assert.match(entryPrompt, /Only IDs declared in criteria may be used as criterionId or criterionIds/);
+		assert.match(entryPrompt, /\$constraint:n.*reviewer finding subject.*never.*criterion evidence target/i);
+		assert.match(entryPrompt, /Preflight record_evidence, reviewer constraints, and the completion bundle/i);
+		assert.match(entryPrompt, /Before the first deterministic verification run.*inspect.*requirements.*current artifact/i);
+		assert.match(entryPrompt, /required paths, literal markers, schema fields, and invariants/i);
 		assert.match(entryPrompt, /include criterionIds/);
 		assert.match(entryPrompt, /artifactId must reference bundle\.artifacts\[\]\.id/);
 		assert.doesNotMatch(JSON.stringify(SOURCE), /submit_completion_bundle|sessionFile|Ready\/Not ready/);
