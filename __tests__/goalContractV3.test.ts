@@ -155,6 +155,55 @@ describe("Goal Contract V3", () => {
 		if (!staleResult.ok) assert.match(JSON.stringify(staleResult.error.details), /digest/);
 	});
 
+	it("rejects evidence digest without artifactId as an invalid pairing (CB-P0-01)", () => {
+		const input = fixture();
+		const { artifactId: _removed, ...rest } = input.bundle.evidence[0];
+		input.bundle.evidence[0] = { ...rest, artifactId: undefined } as typeof input.bundle.evidence[0];
+		const rejected = applyCompletionBundleV3(input);
+		assert.equal(rejected.ok, false);
+		if (rejected.ok) return;
+		const issues = rejected.error.details?.issues as Array<{ path: string; code: string }> | undefined;
+		assert.ok(issues?.some((issue) => issue.path === "evidence[0].digest" && issue.code === "invalid"), "digest without artifactId must fail closed");
+	});
+
+	it("inlines the first validation issues and keeps the full list in details (CB-P1-01)", () => {
+		const input = fixture();
+		input.bundle.evidence[0].criterionIds = ["unknown-criterion"];
+		input.bundle.summary = "";
+		input.bundle.evaluation.decision = "revise";
+		const rejected = applyCompletionBundleV3(input);
+		assert.equal(rejected.ok, false);
+		if (rejected.ok) return;
+		assert.equal(rejected.error.code, "verification_failed");
+		assert.equal(rejected.error.retryable, false);
+		assert.equal(rejected.error.recovery, "revise");
+		// 主文本内联首批 path/code/reason。
+		assert.match(rejected.error.message, /Completion bundle validation failed:/);
+		assert.match(rejected.error.message, /summary \(required\)/);
+		assert.match(rejected.error.message, /evidence\[0\]\.criterionIds \(unknown_reference\)/);
+		// details.issues 保持完整。
+		const issues = rejected.error.details?.issues as Array<{ path: string; code: string }> | undefined;
+		assert.ok(Array.isArray(issues) && issues.length >= 3);
+		// 恢复信息稳定且 idempotency key 未被消耗。
+		assert.equal(rejected.error.details?.recovery, "revise");
+		assert.equal(rejected.error.details?.retryable, false);
+		assert.equal(rejected.error.details?.idempotencyKeyConsumed, false);
+		assert.match(String(rejected.error.details?.nextAction), /idempotency key was not consumed/);
+	});
+
+	it("caps the inline issue summary and reports the remaining count", () => {
+		const input = fixture();
+		input.bundle.summary = "";
+		input.bundle.evidence[0].criterionIds = ["unknown-1", "unknown-2"];
+		input.bundle.evaluation.decision = "revise";
+		input.bundle.evaluation.criterionCoverage = [];
+		input.bundle.deterministicChecks[0].status = "failed";
+		const rejected = applyCompletionBundleV3(input);
+		assert.equal(rejected.ok, false);
+		if (rejected.ok) return;
+		assert.match(rejected.error.message, /\.\.\. and \d+ more issue/);
+	});
+
 	it("replays an identical idempotent bundle and rejects a conflicting reuse", () => {
 		const input = fixture();
 		const committed = applyCompletionBundleV3(input);

@@ -39,6 +39,11 @@ export interface CompletionEvidenceInput {
 	summary: string;
 	criterionIds: string[];
 	claimIds: string[];
+	/**
+	 * CB-P0-01：artifactId 与 digest 必须成对出现（both-or-neither）。
+	 * 解析器在入口强制该约束；此处 `?:` 只表达"两者同时存在或同时不存在"，
+	 * 不代表可以独立省略其中一项。
+	 */
 	artifactId?: string;
 	digest?: string;
 }
@@ -280,6 +285,12 @@ function legacyEvidenceId(raw: Record<string, unknown>, text: string): string {
 /** 结构化 record_evidence 缺 id 时的稳定错误码与恢复动作（UX-P0-01）。 */
 const EVIDENCE_ID_REQUIRED_CODE = "evidence_id_required";
 const EVIDENCE_ID_REQUIRED_RECOVERY = "provide_immutable_evidence_id";
+
+// CB-P0-01：bundle evidence 的 artifactId/digest 成对契约。缺任何一项都在
+// 入口 fail fast，返回稳定 code/recovery，而不是等 validator 报误导性的
+// "stale"。
+const ARTIFACT_REFERENCE_PAIR_CODE = "artifact_reference_pair_required";
+const ARTIFACT_REFERENCE_PAIR_RECOVERY = "provide_artifactId_and_digest_together";
 
 export function structuredEvidenceInput(raw: Record<string, unknown>): boolean {
 	// 字符串 evidence 是 legacy 兼容输入；对象 evidence 或顶层 kind/summary
@@ -660,13 +671,22 @@ function parseSubmitCompletionBundle(raw: Record<string, unknown>): SubmitComple
 	}
 	const evidence = parseArray(bundle.evidence, "bundle.evidence", (item, index) => {
 		const artifactReference = optionalString(item.artifactId, `bundle.evidence[${index}].artifactId`);
+		const evidenceDigest = item.digest === undefined ? undefined : digest(item.digest, `bundle.evidence[${index}].digest`);
+		// CB-P0-01：artifactId 与 digest 必须成对出现。缺 digest 或只给 digest
+		// 都在入口拒绝；不得自动补全，也不得放宽 validator 的哈希校验。
+		if ((artifactReference === undefined) !== (evidenceDigest === undefined)) {
+			throw new ActionValidationError(
+				`bundle.evidence[${index}]: artifactId and digest must be provided together (both or neither); artifact-linked evidence requires the matching lowercase sha256 digest`,
+				ARTIFACT_REFERENCE_PAIR_CODE,
+				ARTIFACT_REFERENCE_PAIR_RECOVERY,
+			);
+		}
 		const uriMatches = artifactReference === undefined ? [] : artifactIdsByUri.get(artifactReference) ?? [];
 		const artifactId = artifactReference === undefined
 			? undefined
 			: artifactIds.has(artifactReference)
 				? artifactReference
 				: uriMatches.length === 1 ? uriMatches[0] : artifactReference;
-		const evidenceDigest = item.digest === undefined ? undefined : digest(item.digest, `bundle.evidence[${index}].digest`);
 		return {
 			id: requiredString(item.id, `bundle.evidence[${index}].id`),
 			kind: enumValue(item.kind, new Set(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const), `bundle.evidence[${index}].kind`),

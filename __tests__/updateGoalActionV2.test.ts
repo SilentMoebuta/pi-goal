@@ -262,6 +262,73 @@ describe("canonical update_goal action union", () => {
 		assert.deepEqual(action.evidence[0].criterionIds, []);
 		assert.equal(action.evidence[0].artifactId, "decision-record");
 	});
+
+	describe("bundle evidence artifactId/digest pairing (CB-P0-01)", () => {
+		const validPair = {
+			action: "submit_completion_bundle",
+			bundle: {
+				idempotencyKey: "complete-pair",
+				summary: "Verified output",
+				artifacts: [{ id: "a1", uri: "result.md", digest: "a".repeat(64), sizeBytes: 10 }],
+				evidence: [{ id: "e1", kind: "artifact", summary: "checked", criterionIds: ["c1"], claimIds: [], artifactId: "a1", digest: "a".repeat(64) }],
+				reviewerResultRef: { resultId: "role-result:r1", agentId: "r1", role: "goal-reviewer", status: "completed", digest: "b".repeat(64) },
+			},
+		};
+
+		it("rejects artifactId without digest at the entry with a stable code and recovery", () => {
+			const result = normalizeUpdateGoalAction({
+				...validPair,
+				bundle: { ...validPair.bundle, evidence: [{ id: "e1", kind: "artifact", summary: "checked", criterionIds: ["c1"], claimIds: [], artifactId: "a1" }] },
+			}, { now: 1 });
+			assert.equal(result.ok, false);
+			if (result.ok) return;
+			assert.equal(result.kind, "invalid");
+			assert.equal(result.code, "artifact_reference_pair_required");
+			assert.equal(result.recovery, "provide_artifactId_and_digest_together");
+			assert.match(result.reason, /bundle\.evidence\[0\]/);
+			assert.match(result.reason, /digest/);
+		});
+
+		it("rejects digest without artifactId at the entry with the same stable code", () => {
+			const result = normalizeUpdateGoalAction({
+				...validPair,
+				bundle: { ...validPair.bundle, evidence: [{ id: "e1", kind: "artifact", summary: "checked", criterionIds: ["c1"], claimIds: [], digest: "a".repeat(64) }] },
+			}, { now: 1 });
+			assert.equal(result.ok, false);
+			if (result.ok) return;
+			assert.equal(result.code, "artifact_reference_pair_required");
+			assert.equal(result.recovery, "provide_artifactId_and_digest_together");
+			assert.match(result.reason, /artifactId and digest must be provided together/);
+		});
+
+		it("keeps a valid paired digest untouched and canonicalizes a URI alias", () => {
+			const result = normalizeUpdateGoalAction({
+				...validPair,
+				bundle: {
+					...validPair.bundle,
+					artifacts: [{ id: "decision-record", uri: "outputs/decision-record.md", digest: "a".repeat(64), sizeBytes: 10 }],
+					evidence: [{ id: "e1", kind: "artifact", summary: "checked", criterionIds: ["c1"], claimIds: [], artifactId: "outputs/decision-record.md", digest: "a".repeat(64) }],
+				},
+			}, { now: 1 });
+			const action = normalized(result);
+			assert.equal(action.action, "submit_completion_bundle");
+			if (action.action !== "submit_completion_bundle") return;
+			assert.equal(action.evidence[0].artifactId, "decision-record");
+			assert.equal(action.evidence[0].digest, "a".repeat(64));
+		});
+
+		it("accepts non-artifact evidence without artifactId or digest", () => {
+			const result = normalizeUpdateGoalAction({
+				...validPair,
+				bundle: { ...validPair.bundle, evidence: [{ id: "e1", kind: "observation", summary: "observed", criterionIds: ["c1"], claimIds: [] }] },
+			}, { now: 1 });
+			const action = normalized(result);
+			assert.equal(action.action, "submit_completion_bundle");
+			if (action.action !== "submit_completion_bundle") return;
+			assert.equal(action.evidence[0].artifactId, undefined);
+			assert.equal(action.evidence[0].digest, undefined);
+		});
+	});
 });
 
 describe("legacy flat update_goal compatibility", () => {

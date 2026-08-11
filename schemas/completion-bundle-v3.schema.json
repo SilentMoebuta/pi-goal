@@ -58,6 +58,10 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "kind", "summary", "criterionIds", "claimIds", "verification", "verifiedAt", "createdByAttemptId"],
+      "anyOf": [
+        { "required": ["artifactId", "digest"] },
+        { "properties": { "artifactId": false, "digest": false } }
+      ],
       "properties": {
         "id": { "$ref": "#/$defs/id" },
         "kind": { "enum": ["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] },

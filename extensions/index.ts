@@ -2477,15 +2477,24 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 							digest: Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest of the artifact bytes." }),
 							sizeBytes: Type.Number({ minimum: 0 }), mediaType: Type.Optional(Type.String()),
 						})),
-						evidence: Type.Array(Type.Object({
-							id: Type.String({ description: "Immutable evidence ID. Use a new revision evidence ID when content or provenance changes." }),
-							kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const),
-							summary: Type.String(),
-						criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Declared Goal criterion IDs supported by this evidence; $constraint:n is never a criterion ID. Omitted input normalizes to an empty array." })),
-							claimIds: Type.Optional(Type.Array(Type.String())),
-							artifactId: Type.Optional(Type.String({ description: "Exact artifacts[].id. An exact artifact URI alias is accepted and canonicalized." })),
-							digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest when evidence is tied to an artifact." })),
-						})),
+						evidence: Type.Array(Type.Union([
+							Type.Object({
+								id: Type.String({ description: "Immutable evidence ID. Use a new revision evidence ID when content or provenance changes." }),
+								kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const),
+								summary: Type.String(),
+							criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Declared Goal criterion IDs supported by this evidence; $constraint:n is never a criterion ID. Omitted input normalizes to an empty array." })),
+								claimIds: Type.Optional(Type.Array(Type.String())),
+								artifactId: Type.String({ description: "Exact artifacts[].id. An exact artifact URI alias is accepted and canonicalized. artifactId and digest are a required pair (CB-P0-01)." }),
+								digest: Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest of the artifact bytes; required together with artifactId (CB-P0-01)." }),
+							}, { description: "Artifact-linked evidence: artifactId and digest must be provided together." }),
+							Type.Object({
+								id: Type.String({ description: "Immutable evidence ID. Use a new revision evidence ID when content or provenance changes." }),
+								kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const),
+								summary: Type.String(),
+							criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Declared Goal criterion IDs supported by this evidence; $constraint:n is never a criterion ID. Omitted input normalizes to an empty array." })),
+								claimIds: Type.Optional(Type.Array(Type.String())),
+							}, { description: "Non-artifact evidence without artifactId/digest." }),
+						])),
 					deterministicChecks: Type.Optional(Type.Array(Type.Object({
 						id: Type.String({ description: "Deterministic check ID from a separate namespace; never use it as a criterion ID." }), status: StringEnum(["passed", "failed"] as const), summary: Type.String(), evidenceIds: Type.Array(Type.String()),
 					}))),

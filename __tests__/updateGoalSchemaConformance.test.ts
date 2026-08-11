@@ -86,3 +86,30 @@ describe("update_goal evidence schema conformance (UX-P0-01)", () => {
 		assert.equal(legacy.ok, true, "legacy string evidence must remain accepted");
 	});
 });
+
+describe("update_goal bundle evidence schema conformance (CB-P0-01)", () => {
+	function bundleEvidenceSchema() {
+		const api = new FakeExtensionAPI();
+		piGoalExtension(api as any);
+		const tool = api.tools.get("update_goal");
+		assert.ok(tool, "update_goal tool must be registered");
+		const bundle = tool.parameters.properties.bundle;
+		assert.ok(bundle && bundle.type === "object", "bundle must declare an object schema");
+		const evidence = bundle.properties.evidence;
+		assert.ok(evidence && evidence.type === "array" && evidence.items?.anyOf, "bundle evidence must be an array of a both-or-neither union");
+		return evidence.items;
+	}
+
+	it("declares artifactId and digest as a required pair for artifact-linked evidence", () => {
+		const items = bundleEvidenceSchema();
+		const paired = items.anyOf.find((branch: any) => branch.properties?.artifactId);
+		assert.ok(paired, "a branch must declare artifactId");
+		assert.ok(Array.isArray(paired.required) && paired.required.includes("artifactId") && paired.required.includes("digest"), "artifactId and digest must both be required in the paired branch");
+		const artifactId = paired.properties.artifactId;
+		assert.equal(artifactId.optional, undefined, "artifactId must not carry the Type.Optional marker");
+		const plain = items.anyOf.find((branch: any) => branch !== paired);
+		assert.ok(plain, "a plain branch must exist");
+		assert.equal(plain.properties.artifactId, undefined, "plain branch must not declare artifactId");
+		assert.equal(plain.properties.digest, undefined, "plain branch must not declare digest");
+	});
+});

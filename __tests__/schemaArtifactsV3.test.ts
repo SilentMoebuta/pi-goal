@@ -23,6 +23,21 @@ describe("published Goal Contract V3 schemas", () => {
 		assert.deepEqual(schema.$defs.lineage.required, ["goalDefinitionId", "revisionId", "runId", "attemptId"]);
 	});
 
+	it("the completion schema pairs evidence artifactId with digest (CB-P0-01)", () => {
+		const schema = JSON.parse(fs.readFileSync(path.join(root, "schemas", "completion-bundle-v3.schema.json"), "utf8"));
+		const evidence = schema.$defs.evidence ?? schema.properties.bundle.properties.evidence;
+		assert.ok(evidence, "completion schema must define a bundle evidence shape");
+		const anyOf = evidence.anyOf;
+		assert.ok(Array.isArray(anyOf) && anyOf.length === 2, "evidence must use a both-or-neither anyOf pairing");
+		const both = anyOf.find((branch: { required?: string[] }) => branch.required?.includes("artifactId"));
+		assert.ok(both, "one branch must require artifactId and digest together");
+		assert.ok(both.required.includes("digest"), "the paired branch must also require digest");
+		const neither = anyOf.find((branch: { properties?: Record<string, unknown> }) => branch.properties);
+		assert.ok(neither, "the other branch must forbid artifactId and digest");
+		assert.equal(neither.properties.artifactId, false);
+		assert.equal(neither.properties.digest, false);
+	});
+
 	it("the project spec publishes the bounded retry policy", () => {
 		const schema = JSON.parse(fs.readFileSync(path.join(root, "schemas", "goal-project-spec-v3.schema.json"), "utf8"));
 		assert.equal(schema.properties.retry.additionalProperties, false);

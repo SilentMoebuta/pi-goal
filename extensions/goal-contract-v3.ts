@@ -451,6 +451,9 @@ export function validateCompletionBundleV3(input: ApplyCompletionBundleInputV3):
 			const artifact = artifactById.get(evidence.artifactId);
 			if (!artifact) add(`${evidencePath}.artifactId`, "unknown_reference", `unknown artifact ${evidence.artifactId}`);
 			else if (!evidence.digest || !sameDigest(evidence.digest, artifact.digest)) add(`${evidencePath}.digest`, "stale", "artifact evidence digest does not match the submitted artifact");
+		} else if (evidence.digest) {
+			// CB-P0-01 防御：digest 必须伴随 artifactId，与入口成对契约一致。
+			add(`${evidencePath}.digest`, "invalid", "evidence digest requires artifactId");
 		}
 	}
 
@@ -495,6 +498,19 @@ export function validateCompletionBundleV3(input: ApplyCompletionBundleInputV3):
 	return issues.length === 0 ? { ok: true } : { ok: false, issues };
 }
 
+const COMPLETION_ISSUE_INLINE_LIMIT = 3;
+
+/**
+ * CB-P1-01：把拒绝原因投影到主文本，让调用方在不解析 details 时也能看到
+ * 首批 path/code/reason。details.issues 仍保留完整列表。
+ */
+export function formatCompletionBundleIssues(issues: CompletionBundleValidationIssue[]): string {
+	const visible = issues.slice(0, COMPLETION_ISSUE_INLINE_LIMIT);
+	const text = visible.map((issue) => `${issue.path} (${issue.code}): ${issue.message}`).join("; ");
+	const remaining = issues.length - visible.length;
+	return remaining > 0 ? `${text}; ... and ${remaining} more issue${remaining === 1 ? "" : "s"} (see details.issues)` : text;
+}
+
 /**
  * Validate the whole completion bundle before returning any state mutation.
  * Callers persist the returned run, attempt, and bundle together.
@@ -526,7 +542,21 @@ export function applyCompletionBundleV3(input: ApplyCompletionBundleInputV3): Go
 	if (!validation.ok) {
 		return {
 			ok: false,
-			error: createGoalError("verification_failed", "Completion bundle validation failed.", { details: { issues: validation.issues } }),
+			error: createGoalError(
+				"verification_failed",
+				`Completion bundle validation failed: ${formatCompletionBundleIssues(validation.issues)}`,
+				{
+					details: {
+						issues: validation.issues,
+						// CB-P1-01：输入契约问题不可机械重试；修正 payload 后可重新提交，
+						// idempotency key 未被消耗，因此同一 key 可以复用。
+						retryable: false,
+						recovery: "revise",
+						nextAction: "Correct the fields listed in details.issues and resubmit the completion bundle; the idempotency key was not consumed and may be reused for the corrected payload.",
+						idempotencyKeyConsumed: false,
+					},
+				},
+			),
 			lineage,
 		};
 	}
