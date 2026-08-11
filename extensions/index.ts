@@ -3606,6 +3606,7 @@ export * from "./evaluation-v3";
 export * from "./benchmark-fixtures-v3";
 export * from "./observability-v3";
 export * from "./fault-injection-v3";
+export * from "./benchmark-fault-matrix-v3";
 export * from "./runtime-v3";
 
 export default createPiGoalExtension();
