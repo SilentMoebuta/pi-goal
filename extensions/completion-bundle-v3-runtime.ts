@@ -4,6 +4,11 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+	parseGoalReviewerPayload,
+	type GoalReviewerPayloadV1,
+} from "@silentmoebuta/pi-roles-protocol/goal-reviewer-payload";
+
+import {
 	GOAL_CONTRACT_VERSION,
 	applyCompletionBundleV3,
 	createCompletionCommitV3,
@@ -184,8 +189,12 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 	if (input.reviewerResult.role !== "goal-reviewer") {
 		return { ok: false, reason: "Atomic completion requires the typed goal-reviewer role." };
 	}
-	const payload = parseReviewerPayload(input.reviewerResult.payload);
-	if (!payload.ok) return payload;
+	let payload: GoalReviewerPayloadV1;
+	try {
+		payload = parseGoalReviewerPayload(input.reviewerResult.payload);
+	} catch (error) {
+		return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+	}
 	const verifiedArtifacts = verifyCompletionArtifacts(input.action, input.cwd, input.goal.runtime.attemptId, input.now);
 	if (!verifiedArtifacts.ok) return verifiedArtifacts;
 	const artifactById = new Map(verifiedArtifacts.artifacts.map((artifact) => [artifact.id, artifact]));
@@ -229,7 +238,7 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 	const run = runFromGoalV2(input.goal);
 	const attempt = attemptFromGoalV2(input.goal);
 	const allowedCriterionIds = new Set(definition.criteria.map((criterion) => criterion.id));
-	const unknownCriterionIds = [...new Set(payload.value.criterionCoverage
+	const unknownCriterionIds = [...new Set(payload.criterionCoverage
 		.map((coverage) => coverage.criterionId)
 		.filter((criterionId) => !allowedCriterionIds.has(criterionId)))].sort();
 	if (unknownCriterionIds.length > 0) {
@@ -240,7 +249,7 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 	}
 	const submittedEvidenceIds = new Set(evidence.map((item) => item.id));
 	const unknownReviewerEvidenceIds = new Set<string>();
-	const criterionCoverage = payload.value.criterionCoverage.map((coverage) => ({
+	const criterionCoverage = payload.criterionCoverage.map((coverage) => ({
 		...coverage,
 		evidenceIds: coverage.evidenceIds.filter((evidenceId) => {
 			const known = submittedEvidenceIds.has(evidenceId);
@@ -261,7 +270,7 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 			};
 		}
 	}
-	const reviewerAdvisories = [...payload.value.advisories];
+	const reviewerAdvisories = [...payload.advisories];
 	if (unknownReviewerEvidenceIds.size > 0) {
 		reviewerAdvisories.push(
 			`Reviewer referenced evidence IDs not submitted in the completion bundle; ignored: ${[...unknownReviewerEvidenceIds].sort().join(", ")}.`,
@@ -269,7 +278,7 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 	}
 	const reviewerOnlyArtifactUris: string[] = [];
 	const observedArtifacts: GoalEvaluationV3["observedArtifacts"] = [];
-	for (const observed of payload.value.artifacts) {
+	for (const observed of payload.artifacts) {
 		const artifact = verifiedArtifacts.artifacts.find((item) => item.uri === observed.uri || sameArtifactUri(item.uri, observed.uri, input.cwd));
 		if (!artifact) {
 			reviewerOnlyArtifactUris.push(observed.uri);
@@ -290,10 +299,10 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 		revisionId: revision.id,
 		runId: run.id,
 		attemptId: attempt.id,
-		decision: payload.value.decision,
+		decision: payload.decision,
 		evaluator: { kind: "reviewer", id: input.reviewerResult.agentId, independent: true },
 		criterionCoverage,
-		findings: payload.value.findings,
+		findings: payload.findings,
 		advisories: reviewerAdvisories,
 		observedArtifacts,
 		// The reviewer envelope may predate submission. The authoritative evaluation
@@ -471,89 +480,6 @@ function toEmbeddedCriterionEvidence(entry: EvidenceRef): StoredGoalCriterionV2[
 	};
 }
 
-type ReviewerPayload = {
-	decision: "accept" | "revise" | "blocked";
-	summary: string;
-	criterionCoverage: GoalEvaluationV3["criterionCoverage"];
-	findings: GoalEvaluationV3["findings"];
-	artifacts: Array<{ uri: string; digest: string; sizeBytes: number }>;
-	advisories: string[];
-};
-
-function parseReviewerPayload(value: Record<string, unknown> | null):
-	| { ok: true; value: ReviewerPayload }
-	| { ok: false; reason: string } {
-	try {
-		if (!value) throw new Error("Reviewer payload is missing.");
-		const decision = enumString(value.decision, ["accept", "revise", "blocked"] as const, "decision");
-		const summary = stringValue(value.summary, "summary");
-		const criterionCoverage = objectArray(value.criterionCoverage, "criterionCoverage").map((item, index) => ({
-			criterionId: stringValue(item.criterionId, `criterionCoverage[${index}].criterionId`),
-			status: enumString(item.status, ["satisfied", "unsatisfied", "blocked"] as const, `criterionCoverage[${index}].status`),
-			evidenceIds: stringArray(item.evidenceIds, `criterionCoverage[${index}].evidenceIds`),
-		}));
-		const findings = objectArray(value.findings, "findings").map((item, index) => {
-			const missingEvidenceKind = stringValue(item.missingEvidenceKind, `findings[${index}].missingEvidenceKind`, true);
-			return {
-				id: stringValue(item.id, `findings[${index}].id`),
-				code: stringValue(item.code, `findings[${index}].code`),
-				severity: stringValue(item.severity, `findings[${index}].severity`),
-				subjectId: stringValue(item.subjectId, `findings[${index}].subjectId`),
-				reason: stringValue(item.reason, `findings[${index}].reason`),
-				evidenceRefs: stringArray(item.evidenceRefs, `findings[${index}].evidenceRefs`),
-				...(missingEvidenceKind ? { missingEvidenceKind } : {}),
-			};
-		});
-		const artifacts = objectArray(value.artifacts, "artifacts").map((item, index) => ({
-			uri: stringValue(item.uri, `artifacts[${index}].uri`),
-			digest: digestValue(item.digest, `artifacts[${index}].digest`),
-			sizeBytes: integerValue(item.sizeBytes, `artifacts[${index}].sizeBytes`),
-		}));
-		const advisories = value.advisories === undefined ? [] : stringArray(value.advisories, "advisories");
-		return { ok: true, value: { decision, summary, criterionCoverage, findings, artifacts, advisories } };
-	} catch (error) {
-		return { ok: false, reason: error instanceof Error ? error.message : String(error) };
-	}
-}
-
 function verificationSummary(command: string, result: VerifyResult): string {
 	return `${result.ok ? "passed" : "failed"}: ${command} (exit ${result.exitCode ?? "none"})`;
-}
-
-function objectArray(value: unknown, pathName: string): Record<string, unknown>[] {
-	if (!Array.isArray(value)) throw new Error(`${pathName} must be an array`);
-	return value.map((item, index) => {
-		if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`${pathName}[${index}] must be an object`);
-		return item as Record<string, unknown>;
-	});
-}
-
-function stringArray(value: unknown, pathName: string): string[] {
-	if (!Array.isArray(value)) throw new Error(`${pathName} must be an array`);
-	return value.map((item, index) => stringValue(item, `${pathName}[${index}]`));
-}
-
-function stringValue(value: unknown, pathName: string, allowEmpty = false): string {
-	if (typeof value !== "string" || (!allowEmpty && !value.trim())) throw new Error(`${pathName} must be a string`);
-	return value;
-}
-
-function digestValue(value: unknown, pathName: string): string {
-	const supplied = stringValue(value, pathName);
-	// Role output is model-facing and some providers conventionally render a
-	// digest receipt as `sha256:<hex>`. Accept that one unambiguous transport
-	// spelling at this boundary, but keep the Contract V3 representation bare.
-	const digest = supplied.startsWith("sha256:") ? supplied.slice("sha256:".length) : supplied;
-	if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error(`${pathName} must be a lowercase sha256 digest`);
-	return digest;
-}
-
-function integerValue(value: unknown, pathName: string): number {
-	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) throw new Error(`${pathName} must be a non-negative integer`);
-	return value;
-}
-
-function enumString<const T extends readonly string[]>(value: unknown, allowed: T, pathName: string): T[number] {
-	if (typeof value !== "string" || !allowed.includes(value)) throw new Error(`${pathName} must be one of ${allowed.join(", ")}`);
-	return value as T[number];
 }
