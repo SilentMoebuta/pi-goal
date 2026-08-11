@@ -292,8 +292,28 @@ export interface GoalSideEffectJournalEntryV3 {
 	attemptId: string;
 	preparedAt: number;
 	completedAt: number | null;
+	adapterId?: string;
 	responseDigest?: GoalDigestV3;
 	error?: GoalErrorV3;
+}
+
+export interface GoalSideEffectAdapterInputV3 {
+	entry: Readonly<GoalSideEffectJournalEntryV3>;
+	request?: unknown;
+}
+
+export type GoalSideEffectReconcileResultV3 =
+	| { status: "committed"; response?: unknown }
+	| { status: "failed"; error: unknown }
+	| { status: "unknown" };
+
+/** Host-owned adapter for executing and reconciling external side effects.
+ * The Goal runtime owns idempotency and receipts; adapters own the external
+ * system's request and reconciliation semantics. */
+export interface GoalSideEffectAdapterV3 {
+	id: string;
+	execute(input: GoalSideEffectAdapterInputV3): Promise<unknown>;
+	reconcile(input: GoalSideEffectAdapterInputV3): Promise<GoalSideEffectReconcileResultV3>;
 }
 
 export type GoalSideEffectPreflightV3 =
@@ -310,6 +330,7 @@ export function prepareGoalSideEffect(input: {
 	request: unknown;
 	attemptId: string;
 	now: number;
+	adapterId?: string;
 }): GoalSideEffectPreflightV3 {
 	const requestDigest = digest(input.request);
 	const existing = input.journal.find((entry) => entry.idempotencyKey === input.idempotencyKey);
@@ -318,7 +339,7 @@ export function prepareGoalSideEffect(input: {
 			return { action: "conflict", error: createGoalError("idempotency_conflict", "The side-effect idempotency key was reused with a different request.") };
 		}
 		if (existing.status === "committed") return { action: "replay", entry: existing };
-		if (existing.status === "prepared") return { action: "reconcile", entry: existing };
+		if (existing.status === "prepared" || existing.status === "failed") return { action: "reconcile", entry: existing };
 	}
 	const entry: GoalSideEffectJournalEntryV3 = {
 		id: `${input.attemptId}:side-effect:${input.journal.length + 1}`,
@@ -330,6 +351,7 @@ export function prepareGoalSideEffect(input: {
 		attemptId: stringValue(input.attemptId, "attemptId"),
 		preparedAt: input.now,
 		completedAt: null,
+		...(input.adapterId === undefined ? {} : { adapterId: stringValue(input.adapterId, "adapterId") }),
 	};
 	input.journal.push(entry);
 	return { action: "execute", entry };
@@ -444,9 +466,11 @@ function scopeMatches(granted: string, requested: string): boolean {
 	return granted === requested;
 }
 
-function digest(value: unknown): GoalDigestV3 {
+export function digestGoalValueV3(value: unknown): GoalDigestV3 {
 	return { algorithm: "sha256", value: createHash("sha256").update(stableJson(value)).digest("hex") };
 }
+
+const digest = digestGoalValueV3;
 
 function stableJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;

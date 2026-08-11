@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import piGoalExtension, { createPiGoalExtension } from "../extensions/index";
-import { GoalRuntimeHooksV3 } from "../extensions/runtime-v3";
+import { createGoalRuntimeCheckpointV3, GoalRuntimeHooksV3, type GoalSideEffectAdapterV3 } from "../extensions/runtime-v3";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
 
@@ -365,6 +365,90 @@ describe("headless goal lifecycle", () => {
 		assert.equal(retry.details.entry.id, prepared.details.entry.id);
 	});
 
+	it("executes and reconciles external side effects through a trusted adapter", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const calls: string[] = [];
+		let executeFailures = 1;
+		const adapter: GoalSideEffectAdapterV3 = {
+			id: "test-file-adapter",
+			execute: async ({ entry, request }) => {
+				calls.push("execute:" + entry.id);
+				if (executeFailures > 0) {
+					executeFailures -= 1;
+					throw new Error("network adapter unavailable");
+				}
+				fs.writeFileSync(path.join(cwd, String(entry.resource)), String((request as { content?: unknown }).content ?? ""));
+				return { ok: true };
+			},
+			reconcile: async ({ entry }) => {
+			calls.push("reconcile:" + entry.id);
+			return { status: "committed", response: { recovered: true } };
+			},
+		};
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({ sideEffectAdapter: adapter })(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const prepared = await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "adapter-write-1", operation: "write", resource: "outputs/adapter.md", request: { content: "adapter-ok" },
+		}, ctx);
+		const entryId = prepared.details.entry.id;
+		const failed = await execute(api, "execute_goal_side_effect", { entryId, request: { content: "adapter-ok" } }, ctx);
+		assert.equal(failed.isError, true);
+		assert.equal(failed.details.entry.status, "failed");
+		await api.emit("session_tree", {}, ctx);
+		const pending = await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "adapter-write-1", operation: "write", resource: "outputs/adapter.md", request: { content: "adapter-ok" },
+		}, ctx);
+		assert.equal(pending.details.action, "reconcile");
+		const recovered = await execute(api, "reconcile_goal_side_effect", { entryId }, ctx);
+		assert.equal(recovered.details.action, "committed");
+		assert.equal(recovered.details.entry.status, "committed");
+		assert.deepEqual(calls, ["execute:" + entryId, "reconcile:" + entryId]);
+		const replay = await execute(api, "execute_goal_side_effect", { entryId, request: { content: "adapter-ok" } }, ctx);
+		assert.equal(replay.details.action, "replay");
+		assert.deepEqual(calls, ["execute:" + entryId, "reconcile:" + entryId]);
+		assert.equal(fs.existsSync(path.join(cwd, "outputs/adapter.md")), false, "the failed first attempt must not write an artifact");
+	});
+
+	it("blocks mismatched and concurrent adapter execution without duplicating the side effect", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		let calls = 0;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const adapter: GoalSideEffectAdapterV3 = {
+			id: "concurrent-adapter",
+			execute: async () => { calls += 1; await gate; return { ok: true }; },
+			reconcile: async () => ({ status: "unknown" }),
+		};
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension({ sideEffectAdapter: adapter })(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		const prepared = await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "concurrent-1", operation: "send", resource: "queue://jobs/1", request: { value: 1 },
+		}, ctx);
+		const entryId = prepared.details.entry.id;
+		const mismatch = await execute(api, "execute_goal_side_effect", { entryId, request: { value: 2 } }, ctx);
+		assert.equal(mismatch.isError, true);
+		assert.equal(mismatch.details.code, "idempotency_conflict");
+		assert.equal(calls, 0);
+		const first = execute(api, "execute_goal_side_effect", { entryId, request: { value: 1 } }, ctx);
+		const concurrent = await execute(api, "execute_goal_side_effect", { entryId, request: { value: 1 } }, ctx);
+		assert.equal(concurrent.details.action, "reconcile");
+		assert.equal(calls, 1);
+		release();
+		const committed = await first;
+		assert.equal(committed.details.action, "committed");
+		assert.equal(calls, 1);
+	});
+
 	it("fails closed when a persisted runtime checkpoint is tampered with", async () => {
 		const cwd = project();
 		const specPath = path.join(cwd, "spec.md");
@@ -383,6 +467,31 @@ describe("headless goal lifecycle", () => {
 		await api.emit("session_tree", {}, ctx);
 		const result = await execute(api, "get_goal", {}, ctx);
 		assert.match(result.content[0].text, /Runtime control checkpoint rejected: checkpoint checksum mismatch/);
+	});
+
+	it("rejects a checkpoint with a valid checksum but the wrong runtime lineage", async () => {
+		const cwd = project();
+		const specPath = path.join(cwd, "spec.md");
+		fs.writeFileSync(specPath, specMarkdown());
+		const api = new HeadlessFakeAPI();
+		createPiGoalExtension()(api as any);
+		api.setFlag("goal-run", specPath);
+		const ctx = context(cwd, api);
+		await api.emit("session_start", {}, ctx);
+		await execute(api, "prepare_goal_side_effect", {
+			idempotencyKey: "lineage-1", operation: "write", resource: "outputs/lineage.md", request: { content: "x" },
+		}, ctx);
+		const runtimeEvent = api.branch.find((entry) => entry.customType === "pi-goal:runtime-event-v3" && entry.data?.type === "goal.side_effect_prepared");
+		assert.ok(runtimeEvent);
+		const checkpoint = runtimeEvent.data.payload.checkpoint;
+		runtimeEvent.data.payload.checkpoint = createGoalRuntimeCheckpointV3({
+			...checkpoint,
+			checksum: undefined,
+			lineage: { ...checkpoint.lineage, revisionId: checkpoint.lineage.revisionId + ":forged" },
+		});
+		await api.emit("session_tree", {}, ctx);
+		const result = await execute(api, "get_goal", {}, ctx);
+		assert.match(result.content[0].text, /checkpoint lineage does not match the active Goal run/);
 	});
 
 	it("runs an injected deterministic pre-tool hook in the live host event path", async () => {

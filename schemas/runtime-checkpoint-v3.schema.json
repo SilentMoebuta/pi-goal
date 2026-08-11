@@ -10,10 +10,60 @@
     "lineage": { "$ref": "goal-contract-v3.schema.json#/$defs/lineage" },
     "state": {},
     "artifacts": { "type": "array", "items": { "type": "object", "required": ["id", "uri", "digest", "sizeBytes", "verifiedAt"], "properties": { "id": { "type": "string", "minLength": 1 }, "uri": { "type": "string", "minLength": 1 }, "digest": { "$ref": "goal-contract-v3.schema.json#/$defs/digest" }, "sizeBytes": { "type": "integer", "minimum": 0 }, "verifiedAt": { "type": "number", "minimum": 0 } }, "additionalProperties": false } },
-    "approvals": { "type": "array", "items": { "type": "object" } },
-    "sideEffects": { "type": "array", "items": { "type": "object" } },
+    "approvals": { "type": "array", "items": { "$ref": "#/$defs/approval" } },
+    "sideEffects": { "type": "array", "items": { "$ref": "#/$defs/sideEffect" } },
     "lastEventSeq": { "type": "integer", "minimum": 0 },
     "createdAt": { "type": "number", "minimum": 0 },
     "checksum": { "$ref": "goal-contract-v3.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1 },
+    "digest": { "type": "object", "additionalProperties": false, "required": ["algorithm", "value"], "properties": { "algorithm": { "const": "sha256" }, "value": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revisionId", "capability", "scope", "decision", "requestedAt", "decidedAt", "decidedBy"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "revisionId": { "$ref": "#/$defs/id" },
+        "capability": { "$ref": "#/$defs/id" },
+        "scope": { "$ref": "#/$defs/id" },
+        "decision": { "enum": ["pending", "granted", "denied", "revoked"] },
+        "requestedAt": { "type": "number", "minimum": 0 },
+        "decidedAt": { "type": ["number", "null"], "minimum": 0 },
+        "decidedBy": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "retryable", "recovery"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "recovery": { "type": "string", "minLength": 1 },
+        "details": { "type": "object" },
+        "cause": { "$ref": "#/$defs/error" }
+      }
+    },
+    "sideEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "idempotencyKey", "operation", "resource", "requestDigest", "status", "attemptId", "preparedAt", "completedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "idempotencyKey": { "$ref": "#/$defs/id" },
+        "operation": { "$ref": "#/$defs/id" },
+        "resource": { "$ref": "#/$defs/id" },
+        "requestDigest": { "$ref": "#/$defs/digest" },
+        "status": { "enum": ["prepared", "committed", "failed"] },
+        "attemptId": { "$ref": "#/$defs/id" },
+        "preparedAt": { "type": "number", "minimum": 0 },
+        "completedAt": { "type": ["number", "null"], "minimum": 0 },
+        "adapterId": { "$ref": "#/$defs/id" },
+        "responseDigest": { "$ref": "#/$defs/digest" },
+        "error": { "$ref": "#/$defs/error" }
+      }
+    }
   }
 }

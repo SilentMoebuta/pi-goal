@@ -607,6 +607,26 @@ The agent (and you, in tool-capable setups) manages the goal through three tools
 | `propose_goal_draft` | Propose an objective with one or more outcome criteria, task kind, route inputs, assurance inputs, and optional research claims. |
 | `update_goal` | Apply exactly one action (see below). V1 flat arguments are accepted for one compatibility cycle, but must not be mixed with V2 actions. |
 
+### External side effects
+
+Trusted hosts may inject a `GoalSideEffectAdapterV3` when creating the
+extension. The adapter owns the external system; the Goal runtime owns the
+idempotency key, request digest, receipt and checkpoint. The adapter must
+provide `execute({ entry, request })` and `reconcile({ entry })`, and should
+use the journal entry's `idempotencyKey` when talking to the external system.
+
+The live tools are deliberately separate:
+
+| Tool | Description |
+|---|---|
+| `prepare_goal_side_effect` | Register a prepared operation. `execute` means the caller may execute it; `reconcile`, `replay`, and `conflict` are safety decisions. |
+| `execute_goal_side_effect` | Execute through the injected trusted adapter after verifying the request digest and adapter identity. Concurrent calls for one entry are collapsed. |
+| `reconcile_goal_side_effect` | Ask the adapter whether a prepared/failed operation committed, without blindly replaying it. |
+| `settle_goal_side_effect` | Compatibility/manual receipt path for hosts that execute the operation outside the adapter. |
+
+Without a trusted adapter, the execute/reconcile tools fail closed; the
+runtime never invents a filesystem, network, or business-system adapter.
+
 `update_goal` actions:
 
 | Action | Purpose |

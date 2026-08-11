@@ -63,7 +63,7 @@ import {
 	V2_JUDGE_SYSTEM_PROMPT,
 } from "./completion-runtime-v2";
 import { normalizeUpdateGoalAction } from "./update-goal-action-v2";
-import { GOAL_HEADLESS_EVENT_TYPE, appendGoalEventLog, createGoalFromBlueprint, finalizeHeadlessGoal, snapshotActiveHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
+import { GOAL_HEADLESS_EVENT_TYPE, appendGoalEventLog, appendGoalLog, createGoalFromBlueprint, finalizeHeadlessGoal, snapshotActiveHeadlessGoal, summarizeValue, validateBlueprint } from "./headless";
 import { inspectCommittedArtifactsV3, prepareCompletionBundleV3, preflightCompletionSubmissionV3 } from "./completion-bundle-v3-runtime";
 import { completionBundleDigest, type GoalErrorV3 } from "./goal-contract-v3";
 import { resolveRoleResultFromBranch, type RoleResultRefV1 } from "./role-result-v1";
@@ -86,11 +86,13 @@ import {
 	GoalRuntimeHooksV3,
 	createGoalRuntimeCheckpointV3,
 	deserializeGoalRuntimeCheckpointV3,
+	digestGoalValueV3,
 	rolloverRuntimeAttempt,
 	type GoalEventEnvelopeV3,
 	type GoalApprovalRecordV3,
 	type GoalSideEffectJournalEntryV3,
 	type GoalCapabilityGrantV3,
+	type GoalSideEffectAdapterV3,
 } from "./runtime-v3";
 import { buildGoalPublicViewV3 } from "./goal-contract-v3-adapter";
 import {
@@ -160,6 +162,7 @@ interface PiGoalRuntimeDependencies {
 	setInterval: (callback: () => void, ms: number) => ReturnType<typeof setInterval>;
 	clearInterval: (timer: ReturnType<typeof setInterval>) => void;
 	runtimeHooks?: GoalRuntimeHooksV3;
+	sideEffectAdapter?: GoalSideEffectAdapterV3;
 }
 
 function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDependencies) {
@@ -180,6 +183,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	}
 	const nowMs = dependencies.now;
 	const runtimeHooks = dependencies.runtimeHooks ?? new GoalRuntimeHooksV3();
+	const sideEffectAdapter = dependencies.sideEffectAdapter;
 	let goal: GoalState | null = null;
 	let goalConfig: GoalConfig = DEFAULT_GOAL_CONFIG;
 	let judgeParseFailures = 0;
@@ -220,6 +224,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	let retryTimer: ReturnType<typeof setTimeout> | null = null;
 	let approvals: GoalApprovalRecordV3[] = [];
 	let sideEffectJournal: GoalSideEffectJournalEntryV3[] = [];
+	const sideEffectInFlight = new Set<string>();
 
 	type ActiveGoalOperationFence = Readonly<{
 		goalId: string;
@@ -335,7 +340,15 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	function recordRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; causationId?: string | null } = {}): void {
 		if (!goal) return;
 		const entry = traceRuntimeEvent(type, payload, options);
-		if (entry) pi.appendEntry(GOAL_RUNTIME_EVENT_TYPE, entry);
+		if (entry) {
+			pi.appendEntry(GOAL_RUNTIME_EVENT_TYPE, entry);
+			// Headless consumers must see the same runtime-control envelope that
+			// produced the trace span. Keeping it in the canonical JSONL stream
+			// prevents a control event from colliding with the following tool event.
+			if (goal.headless?.logPath) {
+				appendGoalLog(goal.headless.logPath, { v: 1, ts: entry.time, ...entry, ...entry.payload });
+			}
+		}
 	}
 
 	function currentRuntimeLineage() {
@@ -904,7 +917,13 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 									}
 									try {
 										const checkpoint = deserializeGoalRuntimeCheckpointV3(JSON.stringify(rawCheckpoint));
-										if (checkpoint.lineage.runId !== goal.runtime?.runId || checkpoint.lineage.attemptId !== goal.runtime?.attemptId) throw new Error("checkpoint lineage does not match the active Goal run");
+										const runtimeLineage = currentRuntimeLineage();
+										if (!runtimeLineage
+											|| checkpoint.lineage.goalDefinitionId !== runtimeLineage.goalDefinitionId
+											|| checkpoint.lineage.revisionId !== runtimeLineage.revisionId
+											|| checkpoint.lineage.runId !== runtimeLineage.runId
+											|| checkpoint.lineage.attemptId !== runtimeLineage.attemptId) throw new Error("checkpoint lineage does not match the active Goal run");
+										if (checkpoint.lastEventSeq !== data.seq) throw new Error("checkpoint sequence does not match its runtime event");
 										approvals = structuredClone(checkpoint.approvals);
 										sideEffectJournal = structuredClone(checkpoint.sideEffects);
 									} catch (error) {
@@ -2314,10 +2333,83 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				request: params.request,
 				attemptId: goal.runtime.attemptId,
 				now: nowMs(),
+				adapterId: sideEffectAdapter?.id,
 			});
 			if (result.action === "conflict") return { content: [{ type: "text", text: result.error.message }], isError: true, details: { action: result.action, error: result.error } };
 			if (result.action === "execute") recordRuntimeControlEvent("goal.side_effect_prepared", { entry: result.entry });
 			return { content: [{ type: "text", text: JSON.stringify({ action: result.action, entry: result.entry }) }], details: { action: result.action, entry: result.entry } };
+		},
+	});
+
+	pi.registerTool({
+		name: "execute_goal_side_effect", label: "Execute Goal Side Effect",
+		description: "Execute a prepared external side effect through the trusted host adapter, then persist its receipt. The request must match the prepared digest.",
+		parameters: Type.Object({
+			entryId: Type.String({ minLength: 1 }),
+			request: Type.Unknown(),
+		}),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			if (!goal || goal.status !== "active" || !goal.runtime) return { content: [{ type: "text", text: "No active Goal runtime." }], isError: true, details: {} };
+			if (!sideEffectAdapter) return { content: [{ type: "text", text: "No trusted Goal side-effect adapter is configured." }], isError: true, details: { code: "policy_denied" } };
+			const index = sideEffectJournal.findIndex((entry) => entry.id === params.entryId);
+			if (index < 0) return { content: [{ type: "text", text: "Unknown side-effect entry: " + params.entryId }], isError: true, details: {} };
+			const entry = sideEffectJournal[index];
+			if (entry.status === "committed") return { content: [{ type: "text", text: JSON.stringify({ action: "replay", entry }) }], details: { action: "replay", entry } };
+			if (entry.status === "failed") return { content: [{ type: "text", text: "Reconcile the failed side effect before attempting execution again." }], isError: true, details: { action: "reconcile", entry } };
+			if (entry.adapterId !== sideEffectAdapter.id) return { content: [{ type: "text", text: "Side-effect entry belongs to a different adapter." }], isError: true, details: { code: "idempotency_conflict", entry } };
+			if (digestGoalValueV3(params.request).value !== entry.requestDigest.value) return { content: [{ type: "text", text: "Side-effect request does not match the prepared digest." }], isError: true, details: { code: "idempotency_conflict", entry } };
+			if (sideEffectInFlight.has(entry.id)) return { content: [{ type: "text", text: JSON.stringify({ action: "reconcile", entry }) }], details: { action: "reconcile", entry } };
+			const hookError = runRuntimeHook({ target: "tool", phase: "pre", operation: "side_effect.execute", payload: { entryId: entry.id, request: params.request } });
+			if (hookError) return { content: [{ type: "text", text: hookError.message }], isError: true, details: { code: hookError.code, entry } };
+			sideEffectInFlight.add(entry.id);
+			try {
+				const response = await sideEffectAdapter.execute({ entry: structuredClone(entry), request: params.request });
+				const settled = settleGoalSideEffect(entry, { response, now: nowMs() });
+				sideEffectJournal[index] = settled;
+				recordRuntimeControlEvent("goal.side_effect_settled", { entry: settled, adapterId: sideEffectAdapter.id });
+				runRuntimeHook({ target: "tool", phase: "post", operation: "side_effect.execute", payload: { entryId: entry.id, request: params.request }, result: response });
+				return { content: [{ type: "text", text: JSON.stringify({ action: "committed", entry: settled }) }], details: { action: "committed", entry: settled } };
+			} catch (error) {
+				const typed = classifyGoalError(error);
+				const settled = settleGoalSideEffect(entry, { error: typed, now: nowMs() });
+				sideEffectJournal[index] = settled;
+				recordRuntimeControlEvent("goal.side_effect_settled", { entry: settled, adapterId: sideEffectAdapter.id });
+				runRuntimeHook({ target: "tool", phase: "post", operation: "side_effect.execute", payload: { entryId: entry.id, request: params.request }, error: typed });
+				return { content: [{ type: "text", text: typed.message }], isError: true, details: { action: "failed", entry: settled, error: typed } };
+			} finally {
+				sideEffectInFlight.delete(entry.id);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "reconcile_goal_side_effect", label: "Reconcile Goal Side Effect",
+		description: "Ask the trusted host adapter whether a prepared or failed external side effect committed, without blindly replaying it.",
+		parameters: Type.Object({ entryId: Type.String({ minLength: 1 }) }),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			if (!goal || goal.status !== "active" || !goal.runtime) return { content: [{ type: "text", text: "No active Goal runtime." }], isError: true, details: {} };
+			if (!sideEffectAdapter) return { content: [{ type: "text", text: "No trusted Goal side-effect adapter is configured." }], isError: true, details: { code: "policy_denied" } };
+			const index = sideEffectJournal.findIndex((entry) => entry.id === params.entryId);
+			if (index < 0) return { content: [{ type: "text", text: "Unknown side-effect entry: " + params.entryId }], isError: true, details: {} };
+			const entry = sideEffectJournal[index];
+			if (entry.status === "committed") return { content: [{ type: "text", text: JSON.stringify({ action: "replay", entry }) }], details: { action: "replay", entry } };
+			if (entry.adapterId !== sideEffectAdapter.id) return { content: [{ type: "text", text: "Side-effect entry belongs to a different adapter." }], isError: true, details: { code: "idempotency_conflict", entry } };
+			const hookError = runRuntimeHook({ target: "tool", phase: "pre", operation: "side_effect.reconcile", payload: { entryId: entry.id } });
+			if (hookError) return { content: [{ type: "text", text: hookError.message }], isError: true, details: { code: hookError.code, entry } };
+			try {
+				const result = await sideEffectAdapter.reconcile({ entry: structuredClone(entry) });
+				if (result.status === "unknown") return { content: [{ type: "text", text: JSON.stringify({ action: "reconcile", entry }) }], details: { action: "reconcile", entry } };
+				const settled = result.status === "committed"
+					? settleGoalSideEffect(entry, { response: result.response, now: nowMs() })
+					: settleGoalSideEffect(entry, { error: result.error, now: nowMs() });
+				sideEffectJournal[index] = settled;
+				recordRuntimeControlEvent("goal.side_effect_settled", { entry: settled, adapterId: sideEffectAdapter.id, reconciled: true });
+				runRuntimeHook({ target: "tool", phase: "post", operation: "side_effect.reconcile", payload: { entryId: entry.id }, result });
+				return { content: [{ type: "text", text: JSON.stringify({ action: settled.status, entry: settled }) }], details: { action: settled.status, entry: settled } };
+			} catch (error) {
+				const typed = classifyGoalError(error);
+				return { content: [{ type: "text", text: typed.message }], isError: true, details: { action: "reconcile", entry, error: typed } };
+			}
 		},
 	});
 
@@ -3473,5 +3565,6 @@ export * from "./evaluation-v3";
 export * from "./benchmark-fixtures-v3";
 export * from "./observability-v3";
 export * from "./fault-injection-v3";
+export * from "./runtime-v3";
 
 export default createPiGoalExtension();
