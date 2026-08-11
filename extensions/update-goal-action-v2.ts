@@ -74,6 +74,12 @@ export interface RecordEvidenceAction {
 	evidenceId: string;
 	criterionIds: string[];
 	claimIds: string[];
+	/**
+	 * false 仅用于 legacy 字符串 evidence（kind=legacy_text）：该记录无法
+	 * 直接进入 Contract V3 completion bundle，调用方需改用带不可变 id 的
+	 * 结构化 evidence。结构化与 reuse 路径均为 true。
+	 */
+	completionCompatible: boolean;
 }
 
 export interface UpsertClaimAction {
@@ -143,7 +149,7 @@ export type NormalizedUpdateGoalAction =
 
 export type NormalizeUpdateGoalActionResult =
 	| { ok: true; action: NormalizedUpdateGoalAction; legacy: boolean; warnings: string[] }
-	| { ok: false; kind: "invalid" | "mixed_action"; reason: string };
+	| { ok: false; kind: "invalid" | "mixed_action"; reason: string; code?: string; recovery?: string };
 
 export interface NormalizeUpdateGoalActionOptions {
 	now: number;
@@ -171,7 +177,16 @@ const REASSESSMENT_TRIGGERS = new Set<ExecutionReassessmentTrigger>([
 	"scope_expanded", "new_workstream", "conflict", "stalled",
 ]);
 
-class ActionValidationError extends Error {}
+class ActionValidationError extends Error {
+	readonly code?: string;
+	readonly recovery?: string;
+
+	constructor(message: string, code?: string, recovery?: string) {
+		super(message);
+		this.code = code;
+		this.recovery = recovery;
+	}
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -262,13 +277,31 @@ function legacyEvidenceId(raw: Record<string, unknown>, text: string): string {
 	return `legacy-update:${createHash("sha256").update(context).digest("hex").slice(0, 20)}`;
 }
 
+/** 结构化 record_evidence 缺 id 时的稳定错误码与恢复动作（UX-P0-01）。 */
+const EVIDENCE_ID_REQUIRED_CODE = "evidence_id_required";
+const EVIDENCE_ID_REQUIRED_RECOVERY = "provide_immutable_evidence_id";
+
+export function structuredEvidenceInput(raw: Record<string, unknown>): boolean {
+	// 字符串 evidence 是 legacy 兼容输入；对象 evidence 或顶层 kind/summary
+	// 字段都是结构化输入，必须显式携带不可变 id。
+	return !(typeof raw.evidence === "string" && raw.evidence.trim() !== "");
+}
+
 function parseEvidence(raw: Record<string, unknown>, now: number): EvidenceRef {
 	const nested = isRecord(raw.evidence) ? raw.evidence : raw;
 	const legacyText = typeof raw.evidence === "string" ? raw.evidence.trim() : undefined;
 	const id = optionalString(nested.id, "evidence.id")
 		?? optionalString(raw.evidenceId, "evidenceId")
 		?? (legacyText ? legacyEvidenceId(raw, legacyText) : undefined);
-	if (!id) throw new ActionValidationError("record_evidence requires evidence.id or evidenceId");
+	if (!id) {
+		// UX-P0-01：schema 与 parser 统一为显式必填 id。结构化的 JSON 字符串
+		// 序列化不是合法的结构化输入——legacy 兼容只接受真正的字符串 evidence。
+		throw new ActionValidationError(
+			"Structured record_evidence requires an immutable evidence.id (use a new revision evidence ID when content or provenance changes); JSON-stringified evidence is not a structured input.",
+			EVIDENCE_ID_REQUIRED_CODE,
+			EVIDENCE_ID_REQUIRED_RECOVERY,
+		);
+	}
 	const kind = enumValue(
 		nested.kind ?? raw.kind,
 		EVIDENCE_KINDS,
@@ -328,6 +361,7 @@ function parseRecordEvidence(raw: Record<string, unknown>, now: number): RecordE
 		evidenceId: evidence?.id ?? evidenceId,
 		criterionIds: singularAndPlural(targetFields, "criterionId", "criterionIds"),
 		claimIds: singularAndPlural(targetFields, "claimId", "claimIds"),
+		completionCompatible: structuredEvidenceInput(raw),
 	};
 }
 
@@ -729,6 +763,13 @@ export function normalizeUpdateGoalAction(
 			warnings: legacy ? ["Legacy flat update_goal input was normalized to one V2 action."] : [],
 		};
 	} catch (error) {
-		return { ok: false, kind: "invalid", reason: error instanceof Error ? error.message : String(error) };
+		const typed = error instanceof ActionValidationError ? error : null;
+		return {
+			ok: false,
+			kind: "invalid",
+			reason: error instanceof Error ? error.message : String(error),
+			...(typed?.code ? { code: typed.code } : {}),
+			...(typed?.recovery ? { recovery: typed.recovery } : {}),
+		};
 	}
 }

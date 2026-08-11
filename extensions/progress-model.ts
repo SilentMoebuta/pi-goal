@@ -64,6 +64,69 @@ export interface GoalRuntimeActivity {
 	lastOutcomeDeltaAt: number;
 }
 
+export interface CompactOutcomeItem {
+	id: string;
+	kind: OutcomeProgressItem["kind"];
+	level: OutcomeProgressItem["level"];
+	status: OutcomeProgressStatus;
+	/** 逐项引用计数；完整 evidenceRefs 只留在 full/delta 视图。 */
+	evidenceRefCount: number;
+}
+
+/**
+ * UX-P2-02：compact 投影。保留做下一步决策所需的 counts/blocking/
+ * activity/assurance/health/resources 摘要，但 items 只暴露精简的
+ * id/kind/level/status/evidenceRefCount——去掉长 label 与完整
+ * evidenceRefs，使大目标的 compact 序列化体积远小于 full。
+ */
+export function compactGoalProgress(progress: GoalProgressSnapshot): {
+	version: GoalProgressSnapshot["version"];
+	goalId: string;
+	status: GoalProgressSnapshot["status"];
+	generatedAt: number;
+	goal: GoalProgressSnapshot["goal"];
+	route: GoalProgressSnapshot["route"];
+	outcomes: {
+		revision: number;
+		items: CompactOutcomeItem[];
+		counts: GoalProgressSnapshot["outcomes"]["counts"];
+		blocking: GoalProgressSnapshot["outcomes"]["blocking"];
+	};
+	activity: GoalProgressSnapshot["activity"];
+	evidence: GoalProgressSnapshot["evidence"];
+	assurance: GoalProgressSnapshot["assurance"];
+	health: GoalProgressSnapshot["health"];
+	resources: GoalProgressSnapshot["resources"];
+	timestamps: GoalProgressSnapshot["timestamps"];
+} {
+	return {
+		version: progress.version,
+		goalId: progress.goalId,
+		status: progress.status,
+		generatedAt: progress.generatedAt,
+		goal: progress.goal,
+		route: progress.route,
+		outcomes: {
+			revision: progress.outcomes.revision,
+			items: progress.outcomes.items.map((item) => ({
+				id: item.id,
+				kind: item.kind,
+				level: item.level,
+				status: item.status,
+				evidenceRefCount: item.evidenceRefs.length,
+			})),
+			counts: progress.outcomes.counts,
+			blocking: progress.outcomes.blocking,
+		},
+		activity: progress.activity,
+		evidence: progress.evidence,
+		assurance: progress.assurance,
+		health: progress.health,
+		resources: progress.resources,
+		timestamps: progress.timestamps,
+	};
+}
+
 export interface GoalProgressSnapshot {
 	version: 1;
 	goalId: string;
@@ -616,9 +679,16 @@ function outcomeItems(goal: GoalStateV2, evaluationFresh: boolean): OutcomeProgr
 		const coverage = criterionCoverage.get(id);
 		const finding = findings.get(id);
 		const evidenceRefs = coverage?.evidenceRefs ?? finding?.evidenceRefs ?? [];
+		// UX-P2-01：fresh accept/complete 时，没有 blocking finding 的 constraint
+		// 视为 verified（完成评审已确认无约束违反），不再把 open blocker 与
+		// complete 并存；有 constraint finding 时仍准确 blocked；非终态保持
+		// pending，不会凭空 verified。constraint 不是 criterion evidence target，
+		// 其 id 仅作为 reviewer finding subject（见 structured-reference preflight）。
+		const acceptedComplete = goal.status === "complete" && evaluationFresh && evaluation?.decision === "accept";
 		let status: OutcomeProgressStatus = evidenceRefs.length > 0 ? "evidenced" : "pending";
 		if (coverage?.status === "satisfied") status = "verified";
 		else if (coverage?.status === "blocked" || coverage?.status === "unsatisfied" || finding) status = "blocked";
+		else if (acceptedComplete) status = "verified";
 		return {
 			id,
 			kind: "constraint",

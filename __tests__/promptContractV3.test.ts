@@ -71,9 +71,26 @@ describe("Contract V3 interactive completion prompts", () => {
 		}
 	});
 
-	it("keeps an already-started V2 completion request on its compatibility path", () => {
+	it("does not downgrade the atomic protocol when transient completion state is set", () => {
+		// UX-P0-02：协议选择基于稳定谓词 requiresAtomicCompletionV3，不受
+		// requestedAt/lastEvaluation 等 transient 状态影响。历史状态即使残留
+		// requestedAt，prompt 仍只引导 reviewer + submit_completion_bundle。
 		const state = goal();
 		state.completion.requestedAt = 2;
+		assert.equal(usesAtomicCompletionV3(state), true);
+		for (const prompt of [goalSystemPrompt(state), continuationPrompt(state)]) {
+			assert.match(prompt, /goal-reviewer/);
+			assert.match(prompt, /submit_completion_bundle/);
+			assert.doesNotMatch(prompt, /request_completion\(\)|"request_completion"/);
+		}
+	});
+
+	it("keeps request_completion on the compatibility path when review is not required", () => {
+		// 无需 reviewer 的 V3（reviewRequirement=none）与 V2 保持原行为。
+		const state = goal();
+		state.assurance.reviewRequirement = "none";
+		state.assurance.independent = false;
+		state.assurance.reviewStatus = "not_required";
 		assert.equal(usesAtomicCompletionV3(state), false);
 		assert.match(goalSystemPrompt(state), /request_completion/);
 	});

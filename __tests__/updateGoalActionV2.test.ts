@@ -12,6 +12,52 @@ function normalized(result: NormalizeUpdateGoalActionResult) {
 }
 
 describe("canonical update_goal action union", () => {
+	it("rejects structured record_evidence without an immutable id with a stable code", () => {
+		const result = normalizeUpdateGoalAction({
+			action: "record_evidence",
+			evidence: { kind: "artifact", summary: "Built artifact" },
+			criterionIds: ["c1"],
+		}, { now: 100 });
+		assert.equal(result.ok, false);
+		if (result.ok) return;
+		assert.equal(result.kind, "invalid");
+		assert.equal(result.code, "evidence_id_required");
+		assert.equal(result.recovery, "provide_immutable_evidence_id");
+		assert.match(result.reason, /immutable evidence\.id/);
+	});
+
+	it("routes a JSON-stringified evidence object to legacy with completionCompatible=false", () => {
+		// 把结构化对象序列化成字符串不是合法输入：走 legacy 兼容会生成
+		// legacy_text，而 V3 bundle 不接受该 kind——直接拒绝并给出恢复动作。
+		const jsonString = JSON.stringify({ kind: "artifact", summary: "Built artifact" });
+		const result = normalizeUpdateGoalAction({
+			action: "record_evidence",
+			evidence: jsonString,
+			criterionIds: ["c1"],
+		}, { now: 100 });
+		assert.equal(result.ok, true, result.ok ? undefined : result.reason);
+		if (!result.ok) return;
+		assert.equal(result.action.action, "record_evidence");
+		if (result.action.action !== "record_evidence") return;
+		assert.equal(result.action.completionCompatible, false, "string evidence must be flagged not completion-compatible");
+	});
+
+	it("marks structured evidence completionCompatible=true and preserves id/kind", () => {
+		const result = normalizeUpdateGoalAction({
+			action: "record_evidence",
+			evidence: { id: "ev:typed", kind: "artifact", summary: "Built artifact", verification: "verified" },
+			criterionIds: ["c1"],
+		}, { now: 100 });
+		assert.equal(result.ok, true, result.ok ? undefined : result.reason);
+		if (!result.ok) return;
+		assert.equal(result.action.action, "record_evidence");
+		if (result.action.action !== "record_evidence") return;
+		assert.equal(result.action.completionCompatible, true);
+		assert.equal(result.action.evidence?.id, "ev:typed");
+		assert.equal(result.action.evidence?.kind, "artifact");
+		assert.equal(result.action.evidence?.verification, "verified");
+	});
+
 	it("normalizes record_evidence with locator/time/origin defaults", () => {
 		const action = normalized(normalizeUpdateGoalAction({
 			action: "record_evidence",
@@ -233,6 +279,7 @@ describe("legacy flat update_goal compatibility", () => {
 			assert.equal(a.evidence.id, b.evidence.id);
 			assert.equal(a.evidence.kind, "legacy_text");
 			assert.equal(a.evidence.origin, "legacy");
+			assert.equal(a.completionCompatible, false, "legacy string evidence must be flagged not completion-compatible");
 			assert.deepEqual(a.criterionIds, ["c1"]);
 		}
 	});

@@ -98,7 +98,7 @@ export function legacyAcceptedEvaluation(goal: GoalState, reason: string, evalua
 
 export function reviewerTranscriptContractBlock(goal: GoalState): string {
 	if (goal.assurance.reviewRequirement === "none") return "";
-	if (usesAtomicCompletionV3(goal)) {
+	if (requiresAtomicCompletionV3(goal)) {
 		const criterionIds = JSON.stringify(goal.criteria.map((criterion) => criterion.id));
 		const evidenceIds = JSON.stringify(goal.evidenceLedger.map((evidence) => evidence.id));
 		return "\n\nGoal Contract V3 completion protocol:\n" +
@@ -129,7 +129,7 @@ export function structuredReferencePreflightBlock(goal: GoalState): string {
 		"- Before record_evidence, compare every target ID with the allowed criterion/claim lists; do not infer IDs from descriptions, constraint indexes, check names, or filenames.\n" +
 		"- Evidence ledger IDs are immutable. If artifact bytes, digest, summary, locator, excerpt, verification outcome, or provenance changes, create a new revision evidence ID and use it in reviewer constraints and the completion bundle.\n" +
 		"- Reuse an existing evidence ID only when attaching the exact same ledger record to additional targets; never overwrite it with a revised record.\n";
-	if (usesAtomicCompletionV3(goal)) {
+	if (requiresAtomicCompletionV3(goal)) {
 		block += "- Before spawning goal-reviewer, derive resultConstraints from the exact criterion IDs, the evidence IDs that will be submitted, and the exact artifact URIs.\n" +
 			"- Before submit_completion_bundle, verify every cross-reference closes over the submitted criteria, claims, evidence, deterministic checks, artifacts, and immutable reviewer result.\n";
 	}
@@ -145,16 +145,28 @@ export function deterministicVerifierPreflightBlock(goal: GoalState, config: Goa
 		"- Fix known mismatches before running the command; use verifier output to confirm the artifact, not as the first discovery of requirements that were available for inspection.\n";
 }
 
-export function usesAtomicCompletionV3(goal: GoalState): boolean {
+export function requiresAtomicCompletionV3(goal: GoalState): boolean {
+	// 稳定协议谓词（UX-P0-02）：契约 V3 且独立 review 是完成门禁
+	// （reviewRequirement=required）的 Goal，其完成协议永远是
+	// reviewer + submit_completion_bundle，与 transient completion 状态
+	// （requestedAt/lastEvaluation）无关。协议选择不得因状态变化降级。
+	// advisory 不是完成门禁（“review is not a completion gate”），与 none
+	// 一样保持 request_completion / V2 judge 兼容路径。
 	return goal.runtime?.contractVersion === 3
-		&& goal.assurance.reviewRequirement !== "none"
-		&& goal.completion.requestedAt === null
-		&& goal.completion.lastEvaluation === null;
+		&& goal.assurance.reviewRequirement === "required";
+}
+
+/**
+ * @deprecated 协议选择不再依赖 transient completion state；使用
+ * `requiresAtomicCompletionV3`。保留导出以兼容既有调用与测试。
+ */
+export function usesAtomicCompletionV3(goal: GoalState): boolean {
+	return requiresAtomicCompletionV3(goal);
 }
 
 function reviewerProtocolHint(goal: GoalState): ReviewerProtocolHint {
 	if (goal.assurance.reviewRequirement === "none") return "none";
-	return usesAtomicCompletionV3(goal) ? "atomic-v3" : "legacy-v2";
+	return requiresAtomicCompletionV3(goal) ? "atomic-v3" : "legacy-v2";
 }
 
 // continuationPrompt — uses string concatenation (no template literals with backticks)
@@ -337,7 +349,7 @@ export function continuationPrompt(goal: GoalState, config: GoalConfig = DEFAULT
 	const criteriaBlock = buildCriteriaBlock(goal.criteria);
 	const criteriaInstruction = goal.criteria.length > 0
 		? "\n3. Record evidence with update_goal({ action: \"record_evidence\", criterionId, evidence: {...} }).\n4. Maintain research claims with action: \"upsert_claim\" when applicable.\n5. " +
-			(usesAtomicCompletionV3(goal)
+			(requiresAtomicCompletionV3(goal)
 				? "When blocking outcomes are satisfied, obtain a goal-reviewer resultRef and call update_goal({ action: \"submit_completion_bundle\", ... })."
 				: "When blocking outcomes are satisfied, call update_goal({ action: \"request_completion\", summary }).")
 		: "";
@@ -413,7 +425,7 @@ export function goalSystemPrompt(goal: GoalState, config: GoalConfig = DEFAULT_G
 	const budgetInfo = goal.tokenBudget != null
 		? "Token budget: " + formatTokens(goal.tokenBudget) + " (" + formatTokens(Math.max(0, goal.tokenBudget - goal.tokensUsed)) + " remaining)"
 		: "No token budget";
-	const completionInstruction = usesAtomicCompletionV3(goal)
+	const completionInstruction = requiresAtomicCompletionV3(goal)
 		? "When blocking outcomes are satisfied, obtain an independent goal-reviewer resultRef and submit one atomic update_goal action=submit_completion_bundle.\n"
 		: 'When blocking outcomes are satisfied, call update_goal({ action: "request_completion", summary: "..." }).\n';
 

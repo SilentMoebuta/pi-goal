@@ -70,7 +70,7 @@ import { resolveRoleResultFromBranch, type RoleResultRefV1 } from "./role-result
 import { proposalToMarkdown, parseGoalSpecMarkdown, parseBlueprint, slugifyTitle, type SpecCriterion } from "./spec-doc";
 import { runJudge, runV2CompletionJudge, type JudgeVerdict } from "./judge";
 import { formatTokens, formatDuration, escapeXml, extractOutputTokens, extractTextContent, isAssistantMessage, GOAL_STORAGE_TYPE, GOAL_EVENT_TYPE, GOAL_CONTINUATION_TYPE, GOAL_JUDGE_TYPE } from "./util";
-import { buildCriteriaBlock, completionFeedbackBlock, reviewerTranscriptDecision, transcriptBindsFinding, assuranceAfterOutcomeMutation, isTerminalGoalStatus, legacyAcceptedEvaluation, reviewerTranscriptContractBlock, superpowersAdaptationBlock, superpowersDisciplineBlock, continuationPrompt, budgetLimitPrompt, goalSystemPrompt } from "./prompt-blocks";
+import { buildCriteriaBlock, completionFeedbackBlock, reviewerTranscriptDecision, transcriptBindsFinding, assuranceAfterOutcomeMutation, isTerminalGoalStatus, legacyAcceptedEvaluation, reviewerTranscriptContractBlock, superpowersAdaptationBlock, superpowersDisciplineBlock, continuationPrompt, budgetLimitPrompt, goalSystemPrompt, requiresAtomicCompletionV3 } from "./prompt-blocks";
 import { proposalToSpecInput, specDocToProposal, writeGoalSpecDoc, showGoalReview, type GoalCriterionDraft, type GoalProposal, type ReviewResult } from "./draft-review-ui";
 import { mechanicallyVerifyEvidence } from "./evidence-verify";
 import { appendGoalTelemetry, buildGoalTelemetryEntry, readGoalTelemetry } from "./telemetry";
@@ -97,6 +97,7 @@ import {
 import { buildGoalPublicViewV3 } from "./goal-contract-v3-adapter";
 import {
 	GoalRuntimeTracker,
+	compactGoalProgress,
 	deriveGoalProgress,
 	outcomeSignature,
 	renderCompactGoalProgress,
@@ -2153,7 +2154,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			&& completionPolicy === "legacy"
 			&& hasPendingCompletionRequest(goal);
 		if (goalDriven || pendingHeadlessLegacy) {
-			const pendingV2Request = completionPolicy !== "legacy" && hasPendingCompletionRequest(goal);
+			const pendingV2Request = completionPolicy !== "legacy"
+				&& hasPendingCompletionRequest(goal)
+				&& !requiresAtomicCompletionV3(goal);
 			const operation = pendingV2Request ? captureActiveGoalOperation() : null;
 			if (pendingV2Request) {
 				if (!operation) return;
@@ -2323,7 +2326,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 					? {
 						apiVersion: 2, view: "compact", id: goal.id, objective: goal.objective, status: goal.status,
 						pausedReason: goal.pausedReason, blocker: goal.blocker, runtime: goal.runtime,
-						progress: fullView.progress, usage: fullView.usage,
+						// UX-P2-02：compact 使用真正精简的 progress 投影，不再返回
+						// 完整 outcome items/label/evidenceRefs；明细留在 full/delta。
+						progress: compactGoalProgress(fullView.progress), usage: fullView.usage,
 					}
 					: mode === "delta"
 						? {
@@ -2491,7 +2496,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				}, { description: "Contract V3 atomic completion bundle. Preflight criterion, claim, evidence, check, artifact, and reviewer cross-references; $constraint:n is never a criterion. Artifacts are re-hashed before commit." })),
 			status: Type.Optional(StringEnum(["complete", "unmet"] as const)),
 				evidence: Type.Optional(Type.Union([Type.String(), Type.Object({
-				id: Type.Optional(Type.String({ description: "Immutable evidence ID. Use a new revision evidence ID when content or provenance changes." })),
+				id: Type.String({ description: "Immutable evidence ID (required for structured evidence). Use a new revision evidence ID when content or provenance changes." }),
 				kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation", "legacy_text"] as const),
 				summary: Type.String(),
 				// Accept target IDs inside the evidence object as well as at the
@@ -2623,7 +2628,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			}
 				const normalized = normalizeUpdateGoalAction(params, { now: nowMs() });
 				if (!normalized.ok) {
-					return { content: [{ type: "text", text: normalized.reason }], isError: true, details: { kind: normalized.kind } };
+					return {
+						content: [{ type: "text", text: normalized.reason }],
+						isError: true,
+						details: {
+							kind: normalized.kind,
+							...(normalized.code ? { code: normalized.code } : {}),
+							...(normalized.recovery ? { recovery: normalized.recovery } : {}),
+							...(normalized.code ? { completionCompatible: false } : {}),
+						},
+					};
 				}
 				for (const warning of normalized.warnings) console.warn("[pi-goal] " + warning);
 					const action = normalized.action;
@@ -2739,9 +2753,16 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						}, ctx);
 					goalLog(ctx, "evidence_recorded", { entry: record, criterionIds: action.criterionIds, claimIds: action.claimIds });
 					return {
-						content: [{ type: "text", text: "Evidence recorded: " + record.id + (conflicts.length > 0 ? " (conflict diagnostics recorded)" : "") }],
-						details: { evidenceId: record.id, criterionIds: action.criterionIds, claimIds: action.claimIds, conflicts },
-					};
+						content: [{ type: "text", text: "Evidence recorded: " + record.id + (conflicts.length > 0 ? " (conflict diagnostics recorded)" : "") + (action.completionCompatible ? "" : " (legacy_text: not eligible for the V3 completion bundle; record structured evidence with an immutable id instead)") }],
+					details: {
+						evidenceId: record.id,
+						criterionIds: action.criterionIds,
+						claimIds: action.claimIds,
+						conflicts,
+						completionCompatible: action.completionCompatible,
+						...(action.completionCompatible ? {} : { recovery: "provide_structured_evidence_with_immutable_id" }),
+					},
+				};
 				}
 
 					if (action.action === "upsert_claim") {
@@ -2764,6 +2785,24 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				}
 
 				if (action.action === "request_completion") {
+					// UX-P0-02：需要独立 reviewer 的 Contract V3 Goal 的完成协议是
+					// reviewer + submit_completion_bundle。request_completion 必须
+					// fail fast——不写 pending、不改状态，避免 turn 结束时误入 V2
+					// completion judge，也避免 usesAtomicCompletionV3 因 requestedAt
+					// 被污染而降级协议提示。
+					if (requiresAtomicCompletionV3(goal)) {
+						const criterionIds = goal.criteria.map((criterion) => criterion.id);
+						return {
+							content: [{ type: "text", text: "This goal requires the Contract V3 atomic completion protocol. Run the read-only goal-reviewer via spawn_role with resultConstraints (criterionIds " + JSON.stringify(criterionIds) + ", exact submitted evidenceIds and artifactUris), then submit artifacts, evidence, deterministicChecks and the reviewerResultRef in one update_goal action=submit_completion_bundle call. request_completion is not accepted for this goal; no pending completion was written and goal state is unchanged." }],
+							isError: true,
+							details: {
+								code: "atomic_completion_required",
+								recovery: "spawn_goal_reviewer_then_submit_completion_bundle",
+								completionProtocol: "atomic-v3",
+								statusUnchanged: true,
+							},
+						};
+					}
 					const requestedAt = Math.max(
 						nowMs(),
 						(goal.completion.requestedAt ?? -1) + 1,
@@ -3224,7 +3263,12 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				return {
 					content: [{ type: "text", text: "Call list_roles before propose_goal_draft so routing uses the real registered role catalog." }],
 					isError: true,
-					details: { requiredTool: "list_roles" },
+					details: {
+						requiredTool: "list_roles",
+						// UX-P2-03：结构化恢复字段，不改变路由策略。
+						nextAction: "call_list_roles_then_retry_propose_goal_draft",
+						roleCatalogRequired: true,
+					},
 				};
 			}
 			const rawAvailableRoles: unknown[] = observedRoleCatalog ?? (Array.isArray(raw.availableRoles) ? raw.availableRoles : []);

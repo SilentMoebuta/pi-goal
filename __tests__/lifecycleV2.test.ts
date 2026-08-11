@@ -350,6 +350,8 @@ describe("real ExtensionAPI Goal V2 lifecycle", () => {
 		assert.equal(beforeCatalog.isError, true);
 		assert.match(beforeCatalog.content[0].text, /call list_roles before propose_goal_draft/i);
 		assert.equal(beforeCatalog.details.requiredTool, "list_roles");
+		assert.equal(beforeCatalog.details.nextAction, "call_list_roles_then_retry_propose_goal_draft", "UX-P2-03: structured recovery field");
+		assert.equal(beforeCatalog.details.roleCatalogRequired, true, "UX-P2-03: structured role-catalog flag");
 		assert.equal(api.branch.length, 0, "a rejected preflight must not persist goal state");
 
 		await api.emit("tool_result", {

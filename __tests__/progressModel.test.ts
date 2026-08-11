@@ -307,6 +307,61 @@ describe("Goal progress projection", () => {
 		assert.match(renderGoalProgressLines(progress).join("\n"), /advisory criterion c2/);
 	});
 
+	it("does not count constraints as open blockers after a fresh accept completion (UX-P2-01)", () => {
+		const state = goal();
+		state.constraints = ["Only modify outputs/", "Keep changes idempotent"];
+		addEvidence(state, "e1", 1_100);
+		state.criteria[0].evidenceRefs.push("e1");
+		state.criteria[1].evidenceRefs.push("e1");
+		state.status = "complete";
+		state.completion.lastEvaluation = {
+			decision: "accept", evaluatedAt: 1_200,
+			criterionCoverage: [
+				{ criterionId: "c1", status: "satisfied", evidenceRefs: ["e1"], reason: "Covered." },
+				{ criterionId: "c2", status: "satisfied", evidenceRefs: ["e1"], reason: "Covered." },
+			],
+			claimCoverage: [], findings: [], advisories: [], evaluator: { kind: "judge" }, fingerprint: null,
+		};
+		state.progress = { outcomeRevision: 1, lastOutcomeDeltaAt: 1_200, lastEvaluatedOutcomeRevision: 1 };
+		const progress = deriveGoalProgress(state, null, { now: 1_300 });
+		const constraint = progress.outcomes.items.find((item) => item.id === "$constraint:0");
+		assert.ok(constraint, "constraint must be projected");
+		assert.equal(constraint!.status, "verified", "fresh accept must mark un-failed constraints verified");
+		assert.equal(progress.outcomes.blocking.open, 0, "a complete goal must not report open blockers");
+		const rendered = renderCompactGoalProgress(progress);
+		assert.doesNotMatch(rendered, /open/);
+	});
+
+	it("keeps a constraint with a blocking finding blocked even after completion (UX-P2-01)", () => {
+		const state = goal();
+		state.constraints = ["Only modify outputs/"];
+		state.status = "complete";
+		state.completion.lastEvaluation = {
+			decision: "revise", evaluatedAt: 1_200,
+			criterionCoverage: [
+				{ criterionId: "c1", status: "satisfied", evidenceRefs: [], reason: "Covered." },
+				{ criterionId: "c2", status: "satisfied", evidenceRefs: [], reason: "Covered." },
+				{ criterionId: "$constraint:0", status: "unsatisfied", evidenceRefs: [], reason: "No confirmation." },
+			],
+			claimCoverage: [],
+			findings: [{ code: "blocking_requirement_unsatisfied", subjectId: "$constraint:0", reason: "Constraint not verified." }],
+			advisories: [], evaluator: { kind: "judge" }, fingerprint: "fp",
+		};
+		state.progress = { outcomeRevision: 1, lastOutcomeDeltaAt: 1_200, lastEvaluatedOutcomeRevision: 1 };
+		const progress = deriveGoalProgress(state, null, { now: 1_300 });
+		assert.equal(progress.outcomes.items.find((item) => item.id === "$constraint:0")?.status, "blocked");
+		assert.equal(progress.outcomes.blocking.open, 1);
+	});
+
+	it("keeps constraints pending in non-terminal states without inventing verified (UX-P2-01)", () => {
+		const state = goal();
+		state.constraints = ["Only modify outputs/"];
+		state.status = "active";
+		const progress = deriveGoalProgress(state, null, { now: 1_300 });
+		assert.equal(progress.outcomes.items.find((item) => item.id === "$constraint:0")?.status, "pending");
+		assert.equal(progress.outcomes.blocking.open, 3, "active goal still counts unverified blocking outcomes");
+	});
+
 	it("projects explicit constraints as blocking outcomes and renders their subjects", () => {
 		const state = goal();
 		state.constraints = ["Do not publish the result"];
