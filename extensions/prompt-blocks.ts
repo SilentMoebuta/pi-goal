@@ -126,7 +126,9 @@ export function structuredReferencePreflightBlock(goal: GoalState): string {
 	let block = "\n\nStructured-reference preflight:\n" +
 		"- Allowed criterion IDs are exactly " + criterionIds + ". Allowed claim IDs are exactly " + claimIds + ". Existing ledger evidence IDs are " + evidenceIds + ".\n" +
 		"- Only IDs displayed in the allowed criterion list may be used as criterionId/criterionIds or reviewer criterionCoverage. $constraint:n is a reviewer finding subject only; never use it as criterionId/criterionIds or as a criterion evidence target.\n" +
-		"- Before record_evidence, compare every target ID with the allowed criterion/claim lists; do not infer IDs from descriptions, constraint indexes, check names, or filenames.\n";
+		"- Before record_evidence, compare every target ID with the allowed criterion/claim lists; do not infer IDs from descriptions, constraint indexes, check names, or filenames.\n" +
+		"- Evidence ledger IDs are immutable. If artifact bytes, digest, summary, locator, excerpt, verification outcome, or provenance changes, create a new revision evidence ID and use it in reviewer constraints and the completion bundle.\n" +
+		"- Reuse an existing evidence ID only when attaching the exact same ledger record to additional targets; never overwrite it with a revised record.\n";
 	if (usesAtomicCompletionV3(goal)) {
 		block += "- Before spawning goal-reviewer, derive resultConstraints from the exact criterion IDs, the evidence IDs that will be submitted, and the exact artifact URIs.\n" +
 			"- Before submit_completion_bundle, verify every cross-reference closes over the submitted criteria, claims, evidence, deterministic checks, artifacts, and immutable reviewer result.\n";

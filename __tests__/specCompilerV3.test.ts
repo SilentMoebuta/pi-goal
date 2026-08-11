@@ -39,6 +39,9 @@ describe("Goal Project Spec V3 compiler", () => {
 		assert.match(entryPrompt, /Only IDs declared in criteria may be used as criterionId or criterionIds/);
 		assert.match(entryPrompt, /\$constraint:n.*reviewer finding subject.*never.*criterion evidence target/i);
 		assert.match(entryPrompt, /Preflight record_evidence, reviewer constraints, and the completion bundle/i);
+		assert.match(entryPrompt, /Evidence ledger IDs are immutable/);
+		assert.match(entryPrompt, /artifact bytes.*digest.*summary.*locator.*provenance.*new revision evidence ID/i);
+		assert.match(entryPrompt, /Reuse an existing evidence ID only.*exact same ledger record/i);
 		assert.match(entryPrompt, /Before the first deterministic verification run.*inspect.*requirements.*current artifact/i);
 		assert.match(entryPrompt, /required paths, literal markers, schema fields, and invariants/i);
 		assert.match(entryPrompt, /include criterionIds/);

@@ -535,6 +535,7 @@ describe("headless goal lifecycle", () => {
 		assert.deepEqual(interactiveApi.tools.get("update_goal").parameters, headlessApi.tools.get("update_goal").parameters);
 		const updateGoalSchema = JSON.stringify(interactiveApi.tools.get("update_goal"));
 		assert.match(updateGoalSchema, /Preflight structured references/);
+		assert.match(updateGoalSchema, /Evidence IDs are immutable/);
 		assert.match(updateGoalSchema, /\$constraint:n.*never.*criterion/i);
 		assert.match(updateGoalSchema, /deterministic check ID.*separate namespace/i);
 		for (const [api, ctx] of [[headlessApi, headlessCtx], [interactiveApi, interactiveCtx]] as const) {
@@ -565,6 +566,17 @@ describe("headless goal lifecycle", () => {
 		for (const action of actions) {
 			assert.equal((await execute(headlessApi, "update_goal", action, headlessCtx)).isError, undefined);
 			assert.equal((await execute(interactiveApi, "update_goal", action, interactiveCtx)).isError, undefined);
+		}
+		for (const [api, ctx] of [[headlessApi, headlessCtx], [interactiveApi, interactiveCtx]] as const) {
+			const rejected = await execute(api, "update_goal", {
+				action: "record_evidence",
+				criterionId: "c1",
+				evidence: { id: "e-shared", kind: "command", summary: "Changed verifier result", verification: "verified", origin: "tool" },
+			}, ctx);
+			assert.equal(rejected.isError, true);
+			assert.match(rejected.content[0].text, /Evidence IDs are immutable/);
+			assert.match(rejected.content[0].text, /create a new revision evidence ID/i);
+			assert.equal(rejected.details.existingEvidenceId, "e-shared");
 		}
 		const headlessView = JSON.parse((await execute(headlessApi, "get_goal", {}, headlessCtx)).content[0].text);
 		const interactiveView = JSON.parse((await execute(interactiveApi, "get_goal", {}, interactiveCtx)).content[0].text);

@@ -697,6 +697,8 @@ Contract V3 uses one `submit_completion_bundle` call after review. Every evidenc
 
 Interactive and headless runs share a structured-reference preflight. Only IDs declared by the active Goal criteria may be used in `criterionId`, `criterionIds`, or reviewer `criterionCoverage`; `$constraint:n` belongs only to reviewer finding subjects, and deterministic check IDs are a separate namespace. Before `record_evidence`, reviewer handoff, and atomic completion, the prompt enumerates or derives the exact reference sets and requires the bundle graph to close over submitted objects. When a deterministic verifier is declared, the agent is instructed to inspect its script or documented requirements and compare the current artifact against required paths, literal markers, schema fields, and invariants before the first run.
 
+Evidence ledger IDs are immutable. Reusing an existing ID is valid only when attaching the exact same ledger record to another criterion or claim. If artifact bytes, digest, summary, locator, excerpt, verification outcome, or provenance changes after a revision, the agent must create a new revision evidence ID and carry that ID through reviewer constraints and the completion bundle.
+
 ### Completion policy rollout
 
 | `completionPolicy` | Behavior |

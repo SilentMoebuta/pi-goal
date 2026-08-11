@@ -247,6 +247,8 @@ export function buildContractV3EntryPrompt(spec: GoalProjectSpecV3): string {
 		`Only IDs declared in criteria may be used as criterionId or criterionIds; the declared criterion IDs are exactly ${criterionIds}.`,
 		"$constraint:n is a reviewer finding subject only, never a criterion evidence target or criterionCoverage ID.",
 		"Preflight record_evidence, reviewer constraints, and the completion bundle against the declared criterion, claim, evidence, check, and artifact namespaces before submission.",
+		"Evidence ledger IDs are immutable. If artifact bytes, digest, summary, locator, excerpt, verification outcome, or provenance changes, create a new revision evidence ID and carry it through reviewer constraints and completion.",
+		"Reuse an existing evidence ID only for the exact same ledger record attached to additional targets; never overwrite it with revised content.",
 	];
 	if (spec.profile) lines.push(`Load the project profile named ${spec.profile} through the host's profile/policy layer; it is not a core runtime rule.`);
 	for (const input of spec.inputs ?? []) lines.push(`Input${input.required === false ? " (optional)" : ""}: ${input.uri} - ${input.description}`);

@@ -53,6 +53,9 @@ describe("Contract V3 interactive completion prompts", () => {
 			assert.match(prompt, /Allowed criterion IDs are exactly \["c1"\]/);
 			assert.match(prompt, /\$constraint:n.*reviewer finding subject.*never.*criterionId\/criterionIds/i);
 			assert.match(prompt, /Before record_evidence.*compare every target ID/i);
+			assert.match(prompt, /Evidence ledger IDs are immutable/);
+			assert.match(prompt, /artifact bytes.*digest.*summary.*locator.*provenance.*new revision evidence ID/i);
+			assert.match(prompt, /Reuse an existing evidence ID only.*exact same ledger record/i);
 			assert.match(prompt, /Before spawning goal-reviewer.*resultConstraints/i);
 			assert.match(prompt, /Before submit_completion_bundle.*cross-reference/i);
 			assert.match(prompt, /goal-reviewer/);
