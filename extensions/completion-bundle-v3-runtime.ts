@@ -224,6 +224,16 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 	const revision = revisionFromGoalV2(input.goal);
 	const run = runFromGoalV2(input.goal);
 	const attempt = attemptFromGoalV2(input.goal);
+	const allowedCriterionIds = new Set(definition.criteria.map((criterion) => criterion.id));
+	const unknownCriterionIds = [...new Set(payload.value.criterionCoverage
+		.map((coverage) => coverage.criterionId)
+		.filter((criterionId) => !allowedCriterionIds.has(criterionId)))].sort();
+	if (unknownCriterionIds.length > 0) {
+		return {
+			ok: false,
+			reason: `Reviewer criterionCoverage referenced unknown criterion IDs: ${unknownCriterionIds.join(", ")}. Allowed criterion IDs: ${[...allowedCriterionIds].sort().join(", ")}. Obtain a corrected immutable reviewer result.`,
+		};
+	}
 	const submittedEvidenceIds = new Set(evidence.map((item) => item.id));
 	const unknownReviewerEvidenceIds = new Set<string>();
 	const criterionCoverage = payload.value.criterionCoverage.map((coverage) => ({
@@ -237,7 +247,14 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 	for (const criterion of definition.criteria.filter((item) => item.level === "blocking")) {
 		const coverage = criterionCoverage.find((item) => item.criterionId === criterion.id);
 		if (coverage?.status === "satisfied" && coverage.evidenceIds.length === 0) {
-			return { ok: false, reason: `Reviewer accepted blocking criterion ${criterion.id} without a submitted evidence reference.` };
+			const unknown = [...unknownReviewerEvidenceIds].sort();
+			const submitted = [...submittedEvidenceIds].sort();
+			return {
+				ok: false,
+				reason: `Reviewer accepted blocking criterion ${criterion.id} without a submitted evidence reference.` +
+					(unknown.length > 0 ? ` Unknown reviewer evidence IDs: ${unknown.join(", ")}.` : "") +
+					` Submitted evidence IDs: ${submitted.join(", ") || "none"}. Obtain a corrected immutable reviewer result.`,
+			};
 		}
 	}
 	const reviewerAdvisories = [...payload.value.advisories];

@@ -99,11 +99,16 @@ export function legacyAcceptedEvaluation(goal: GoalState, reason: string, evalua
 export function reviewerTranscriptContractBlock(goal: GoalState): string {
 	if (goal.assurance.reviewRequirement === "none") return "";
 	if (usesAtomicCompletionV3(goal)) {
+		const criterionIds = JSON.stringify(goal.criteria.map((criterion) => criterion.id));
+		const evidenceIds = JSON.stringify(goal.evidenceLedger.map((evidence) => evidence.id));
 		return "\n\nGoal Contract V3 completion protocol:\n" +
 			"- Use the read-only goal-reviewer role for the independent completion review. Pass exact criteria, evidence IDs, deterministic checks, and artifact paths.\n" +
+			"- Call spawn_role with resultConstraints.criterionIds exactly " + criterionIds + "; deterministic check IDs are not criterion IDs.\n" +
+			"- Set resultConstraints.evidenceIds to the exact non-empty IDs submitted in the completion bundle (currently persisted: " + evidenceIds + ") and resultConstraints.artifactUris to the exact submitted artifact URIs.\n" +
 			"- The reviewer returns decision, summary, criterionCoverage, structured findings, artifact SHA-256/size receipts, and an immutable resultRef.\n" +
 			"- Compute the same lowercase SHA-256 digests and byte sizes from current artifact bytes.\n" +
 			"- Submit artifacts, evidence, deterministicChecks, and reviewerResultRef in one update_goal action=submit_completion_bundle call.\n" +
+			"- An accept reviewer result is ready for atomic submission; advisories are non-blocking. If artifact bytes change, obtain a new constrained reviewer result before submitting.\n" +
 			"- Do not inspect reviewer session files, parse identifiers from filenames, use symbolic verdict phrases, or separately record review/completion.\n";
 	}
 	return "\n\nReviewer transcript contract:\n" +

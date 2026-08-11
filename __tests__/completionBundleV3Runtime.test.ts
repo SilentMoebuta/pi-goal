@@ -206,7 +206,26 @@ describe("Contract V3 completion runtime", () => {
 		}];
 		const result = prepareCompletionBundleV3(input);
 		assert.equal(result.ok, false);
-		if (!result.ok) assert.match(result.reason, /without a submitted evidence reference/);
+		if (!result.ok) {
+			assert.match(result.reason, /without a submitted evidence reference/);
+			assert.match(result.reason, /reviewer-private-observation/);
+			assert.match(result.reason, /Submitted evidence IDs: e1/);
+		}
+	});
+
+	it("rejects reviewer coverage for a deterministic check id with the allowed criteria listed", () => {
+		const input = makeInput();
+		(input.reviewerResult.payload as any).criterionCoverage.push({
+			criterionId: "dc-verify",
+			status: "satisfied",
+			evidenceIds: ["e1"],
+		});
+		const result = prepareCompletionBundleV3(input);
+		assert.equal(result.ok, false);
+		if (!result.ok) {
+			assert.match(result.reason, /unknown criterion IDs: dc-verify/);
+			assert.match(result.reason, /Allowed criterion IDs: c1/);
+		}
 	});
 
 	it("distinguishes an identical idempotent replay from conflicting key reuse", () => {

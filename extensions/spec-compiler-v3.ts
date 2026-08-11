@@ -249,8 +249,11 @@ export function buildContractV3EntryPrompt(spec: GoalProjectSpecV3): string {
 	for (const output of spec.outputs ?? []) lines.push(`Output${output.required === false ? " (optional)" : ""}: ${output.uri} - ${output.description}`);
 	if (spec.instructions) lines.push("Project instructions: " + spec.instructions);
 	if ((spec.review?.requirement ?? "advisory") !== "none") {
+		const criterionIds = JSON.stringify(spec.criteria.map((criterion) => criterion.id));
+		const artifactUris = JSON.stringify((spec.outputs ?? []).map((output) => output.uri));
 		lines.push("At completion, compute lowercase SHA-256 digests and byte sizes for every submitted local artifact.");
 		lines.push("Spawn the goal-reviewer role with the exact criteria, evidence IDs, deterministic check results, and artifact paths; use its returned immutable resultRef.");
+		lines.push(`Set spawn_role resultConstraints.criterionIds exactly to ${criterionIds}; deterministic check IDs are not criteria. Set resultConstraints.evidenceIds to the exact evidence IDs in the completion bundle and resultConstraints.artifactUris exactly to ${artifactUris}.`);
 		lines.push("Submit artifacts, evidence, checks, and reviewerResultRef atomically with update_goal action=submit_completion_bundle. Do not inspect child session files or use symbolic verdict text.");
 	} else {
 		lines.push("When blocking criteria are evidenced, request the configured deterministic completion evaluation with update_goal action=request_completion.");

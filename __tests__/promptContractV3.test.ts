@@ -52,6 +52,10 @@ describe("Contract V3 interactive completion prompts", () => {
 			assert.match(prompt, /goal-reviewer/);
 			assert.match(prompt, /submit_completion_bundle/);
 			assert.match(prompt, /resultRef/);
+			assert.match(prompt, /resultConstraints\.criterionIds exactly \["c1"\]/);
+			assert.match(prompt, /deterministic check IDs are not criterion IDs/);
+			assert.match(prompt, /resultConstraints\.evidenceIds/);
+			assert.match(prompt, /resultConstraints\.artifactUris/);
 			assert.doesNotMatch(prompt, /findings\[0\].*Ready|reviewerSessionFile|✅ Ready|❌ Not ready/);
 		}
 	});

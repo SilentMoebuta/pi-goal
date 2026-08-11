@@ -32,6 +32,9 @@ describe("Goal Project Spec V3 compiler", () => {
 		assert.deepEqual(compiled.doc.machine.blueprint?.retry, SOURCE.retry);
 		assert.match(compiled.markdown, /submit_completion_bundle/);
 		assert.match(compiled.markdown, /goal-reviewer/);
+		const entryPrompt = compiled.doc.machine.blueprint?.entry?.prompt ?? "";
+		assert.match(entryPrompt, /resultConstraints\.criterionIds exactly to \["c1"\]/);
+		assert.match(entryPrompt, /resultConstraints\.artifactUris exactly to \["workspace:\/\/brief\.md"\]/);
 		assert.doesNotMatch(JSON.stringify(SOURCE), /submit_completion_bundle|sessionFile|Ready\/Not ready/);
 	});
 
