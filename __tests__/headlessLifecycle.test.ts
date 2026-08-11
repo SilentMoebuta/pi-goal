@@ -615,6 +615,19 @@ describe("headless goal lifecycle", () => {
 		assert.equal(traces.find((span) => span.name === "goal.steering_received").attributes["goal.steering.kind"], "initial");
 		assert.equal(traces.some((span) => span.attributes["tool.name"] === "get_goal"), false);
 
+		await api.emit("tool_execution_start", { toolCallId: "t2", toolName: "update_goal", args: { action: "submit_completion_bundle" } }, ctx);
+		await api.emit("tool_execution_end", {
+			toolCallId: "t2",
+			toolName: "update_goal",
+			result: { content: [{ type: "text", text: "Completion rejected." }], isError: true, details: { kind: "completion_bundle_rejected" } },
+			isError: false,
+		}, ctx);
+		const rejectedEvents = fs.readFileSync(path.join(cwd, "spec.goal.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const rejected = rejectedEvents.find((entry) => entry.type === "tool_ended" && entry.toolCallId === "t2");
+		assert.equal(rejected.isError, true, "business-level tool rejection is logged as an error");
+		const rejectedTraces = fs.readFileSync(path.join(cwd, "spec.goal.jsonl.trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(rejectedTraces.find((span) => span.name === "goal.tool_ended" && span.attributes["tool.call_id"] === "t2").status, "error");
+
 		// 心跳：触发捕获的 interval 回调
 		await api.emit("turn_start", { turnIndex: 3, timestamp: Date.now() }, ctx);
 		assert.equal(intervals.length, 1, "heartbeat interval registered");

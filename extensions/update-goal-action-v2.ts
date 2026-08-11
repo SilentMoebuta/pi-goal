@@ -619,8 +619,19 @@ function parseSubmitCompletionBundle(raw: Record<string, unknown>): SubmitComple
 			...(mediaType === undefined ? {} : { mediaType }),
 		};
 	});
+	const artifactIds = new Set(artifacts.map((artifact) => artifact.id));
+	const artifactIdsByUri = new Map<string, string[]>();
+	for (const artifact of artifacts) {
+		artifactIdsByUri.set(artifact.uri, [...(artifactIdsByUri.get(artifact.uri) ?? []), artifact.id]);
+	}
 	const evidence = parseArray(bundle.evidence, "bundle.evidence", (item, index) => {
-		const artifactId = optionalString(item.artifactId, `bundle.evidence[${index}].artifactId`);
+		const artifactReference = optionalString(item.artifactId, `bundle.evidence[${index}].artifactId`);
+		const uriMatches = artifactReference === undefined ? [] : artifactIdsByUri.get(artifactReference) ?? [];
+		const artifactId = artifactReference === undefined
+			? undefined
+			: artifactIds.has(artifactReference)
+				? artifactReference
+				: uriMatches.length === 1 ? uriMatches[0] : artifactReference;
 		const evidenceDigest = item.digest === undefined ? undefined : digest(item.digest, `bundle.evidence[${index}].digest`);
 		return {
 			id: requiredString(item.id, `bundle.evidence[${index}].id`),

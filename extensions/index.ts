@@ -1845,20 +1845,25 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	pi.on("tool_execution_end", (event, ctx) => {
 		if (isSubagentSession(ctx)) return;
 		if (event.toolName === "get_goal") return;
-		progressRuntime.toolEnded(event.toolCallId, event.result, event.isError, nowMs());
+		const resultRejected = typeof event.result === "object"
+			&& event.result !== null
+			&& !Array.isArray(event.result)
+			&& (event.result as { isError?: unknown }).isError === true;
+		const effectiveError = Boolean(event.isError) || resultRejected;
+		progressRuntime.toolEnded(event.toolCallId, event.result, effectiveError, nowMs());
 		if (goal) {
 			const started = headlessToolStarts.get(event.toolCallId);
 			headlessToolStarts.delete(event.toolCallId);
 			goalLog(ctx, "tool_ended", {
 				tool: event.toolName,
 				toolCallId: event.toolCallId,
-				isError: Boolean(event.isError),
+				isError: effectiveError,
 				durationMs: started ? Math.max(0, nowMs() - started.startedAt) : null,
 				result: summarizeValue(event.result, 500),
 			}, { parentId: started?.eventId ?? null });
 			for (const [agentId, child] of headlessSubagents) {
 				if (child.parentToolCallId !== event.toolCallId) continue;
-				goalLog(ctx, "subagent_completed", { agentId, role: child.role ?? null, sessionFile: child.sessionFile ?? null, phase: event.isError ? "error" : "completed", turnCount: child.turnCount, tool: child.tool ?? null }, { parentId: child.startEventId ?? started?.eventId ?? null });
+				goalLog(ctx, "subagent_completed", { agentId, role: child.role ?? null, sessionFile: child.sessionFile ?? null, phase: effectiveError ? "error" : "completed", turnCount: child.turnCount, tool: child.tool ?? null }, { parentId: child.startEventId ?? started?.eventId ?? null });
 				headlessSubagents.delete(agentId);
 			}
 		}
@@ -2462,15 +2467,18 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 						idempotencyKey: Type.String({ description: "Stable key for safe retry of this exact completion submission." }),
 						summary: Type.String(),
 						artifacts: Type.Array(Type.Object({
-							id: Type.String(), uri: Type.String(),
+							id: Type.String({ description: "Stable artifact identifier used by evidence.artifactId." }),
+							uri: Type.String({ description: "Artifact path or URI; distinct from the stable artifact id." }),
 							digest: Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest of the artifact bytes." }),
 							sizeBytes: Type.Number({ minimum: 0 }), mediaType: Type.Optional(Type.String()),
 						})),
 						evidence: Type.Array(Type.Object({
 							id: Type.String(),
 							kind: StringEnum(["source", "artifact", "command", "tool_result", "observation", "user_confirmation"] as const),
-							summary: Type.String(), criterionIds: Type.Array(Type.String()), claimIds: Type.Optional(Type.Array(Type.String())),
-							artifactId: Type.Optional(Type.String()),
+							summary: Type.String(),
+							criterionIds: Type.Optional(Type.Array(Type.String(), { description: "Criterion ids supported by this evidence; omitted input normalizes to an empty array." })),
+							claimIds: Type.Optional(Type.Array(Type.String())),
+							artifactId: Type.Optional(Type.String({ description: "Exact artifacts[].id. An exact artifact URI alias is accepted and canonicalized." })),
 							digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", description: "Lowercase SHA-256 digest when evidence is tied to an artifact." })),
 						})),
 					deterministicChecks: Type.Optional(Type.Array(Type.Object({

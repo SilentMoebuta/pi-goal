@@ -203,7 +203,11 @@ export function prepareCompletionBundleV3(input: PrepareCompletionBundleInput): 
 	}));
 	for (const item of evidence) {
 		if (item.artifactId && !artifactById.has(item.artifactId)) {
-			return { ok: false, reason: `Evidence ${item.id} references unknown artifact ${item.artifactId}.` };
+			const registered = [...artifactById.keys()].sort();
+			return {
+				ok: false,
+				reason: `Evidence ${item.id} references unknown artifact ${item.artifactId}. Registered artifact ids: ${registered.length > 0 ? registered.join(", ") : "none"}.`,
+			};
 		}
 	}
 	const deterministicChecks: GoalDeterministicCheckV3[] = input.action.deterministicChecks.map((check) => ({

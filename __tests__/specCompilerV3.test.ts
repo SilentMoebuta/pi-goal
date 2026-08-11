@@ -35,6 +35,8 @@ describe("Goal Project Spec V3 compiler", () => {
 		const entryPrompt = compiled.doc.machine.blueprint?.entry?.prompt ?? "";
 		assert.match(entryPrompt, /resultConstraints\.criterionIds exactly to \["c1"\]/);
 		assert.match(entryPrompt, /resultConstraints\.artifactUris exactly to \["workspace:\/\/brief\.md"\]/);
+		assert.match(entryPrompt, /include criterionIds/);
+		assert.match(entryPrompt, /artifactId must reference bundle\.artifacts\[\]\.id/);
 		assert.doesNotMatch(JSON.stringify(SOURCE), /submit_completion_bundle|sessionFile|Ready\/Not ready/);
 	});
 

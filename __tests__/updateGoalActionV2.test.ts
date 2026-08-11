@@ -199,6 +199,23 @@ describe("canonical update_goal action union", () => {
 		if (action.action !== "submit_completion_bundle") return;
 		assert.deepEqual(action.evidence[0].claimIds, []);
 	});
+
+	it("defaults omitted criterionIds and canonicalizes an artifact URI reference", () => {
+		const action = normalized(normalizeUpdateGoalAction({
+			action: "submit_completion_bundle",
+			bundle: {
+				idempotencyKey: "complete-with-uri-reference",
+				summary: "Verified output",
+				artifacts: [{ id: "decision-record", uri: "outputs/decision-record.md", digest: "a".repeat(64), sizeBytes: 10 }],
+				evidence: [{ id: "e1", kind: "artifact", summary: "checked", artifactId: "outputs/decision-record.md", digest: "a".repeat(64) }],
+				reviewerResultRef: { resultId: "role-result:r1", agentId: "r1", role: "goal-reviewer", status: "completed", digest: "b".repeat(64) },
+			},
+		}, { now: 1 }));
+		assert.equal(action.action, "submit_completion_bundle");
+		if (action.action !== "submit_completion_bundle") return;
+		assert.deepEqual(action.evidence[0].criterionIds, []);
+		assert.equal(action.evidence[0].artifactId, "decision-record");
+	});
 });
 
 describe("legacy flat update_goal compatibility", () => {

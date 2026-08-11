@@ -56,6 +56,8 @@ describe("Contract V3 interactive completion prompts", () => {
 			assert.match(prompt, /deterministic check IDs are not criterion IDs/);
 			assert.match(prompt, /resultConstraints\.evidenceIds/);
 			assert.match(prompt, /resultConstraints\.artifactUris/);
+			assert.match(prompt, /include criterionIds for every entry/);
+			assert.match(prompt, /artifactId refers to bundle\.artifacts\[\]\.id/);
 			assert.doesNotMatch(prompt, /findings\[0\].*Ready|reviewerSessionFile|✅ Ready|❌ Not ready/);
 		}
 	});

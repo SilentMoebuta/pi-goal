@@ -649,6 +649,7 @@ runtime never invents a filesystem, network, or business-system adapter.
 | `record_review` | Persist an independent review from a real spawned reviewer session (transcript-verified; findings must bind to criteria/evidence). |
 | `change_execution` | Change or lock the execution preference, selected topology, and optional registered specialist role. |
 | `record_deviation` | Record a blueprint deviation (subjectId/description/reason/impact) — required whenever the agent deviates from a declared blueprint in any entrypoint. |
+| `submit_completion_bundle` | Atomically submit Contract V3 artifacts, evidence, deterministic checks, and an immutable typed reviewer result. Artifact bytes and cross-references are verified before any terminal state mutation. |
 | `mark_unmet` | End the goal as unmet with a concrete blocker. |
 | `pause` | Pause the goal and report why to the user. |
 
@@ -691,6 +692,8 @@ Repeated identical blocking findings escalate instead of encouraging filler evid
 The default `risk_based` policy requires independent review for high-risk work, high-risk material claims, conflicting evidence, irreversible external actions, or an explicit user request. Medium-risk work and low-risk work without deterministic verification may receive advisory review. Ordinary non-coding work is not forced through a reviewer solely because of its task type.
 
 A required review must come from a real spawned reviewer session. Its blocking findings must identify a criterion or claim and bind to evidence; the reviewer model name, thinking level, and number of URLs are not completion gates.
+
+Contract V3 uses one `submit_completion_bundle` call after review. Every evidence entry is canonicalized with explicit `criterionIds` and `claimIds`; omitted input arrays normalize to empty arrays. `artifactId` canonically refers to `artifacts[].id`, while an exact, unambiguous artifact URI is accepted as an input alias and normalized to that ID. A tool result that returns a business-level rejection is recorded as an error span even when the host reports successful tool transport, so offline quality gates cannot mistake a rejected completion attempt for a clean trajectory.
 
 ### Completion policy rollout
 

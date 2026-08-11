@@ -107,6 +107,7 @@ export function reviewerTranscriptContractBlock(goal: GoalState): string {
 			"- Set resultConstraints.evidenceIds to the exact non-empty IDs submitted in the completion bundle (currently persisted: " + evidenceIds + ") and resultConstraints.artifactUris to the exact submitted artifact URIs.\n" +
 			"- The reviewer returns decision, summary, criterionCoverage, structured findings, artifact SHA-256/size receipts, and an immutable resultRef.\n" +
 			"- Compute the same lowercase SHA-256 digests and byte sizes from current artifact bytes.\n" +
+			"- In bundle.evidence, include criterionIds for every entry (use [] when the evidence is claim-only). artifactId refers to bundle.artifacts[].id, not its URI; every referenced artifact must be registered in bundle.artifacts.\n" +
 			"- Submit artifacts, evidence, deterministicChecks, and reviewerResultRef in one update_goal action=submit_completion_bundle call.\n" +
 			"- An accept reviewer result is ready for atomic submission; advisories are non-blocking. If artifact bytes change, obtain a new constrained reviewer result before submitting.\n" +
 			"- Do not inspect reviewer session files, parse identifiers from filenames, use symbolic verdict phrases, or separately record review/completion.\n";
