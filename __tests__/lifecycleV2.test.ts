@@ -1463,6 +1463,23 @@ describe("interactive Goal Runtime V3 controls", () => {
 		assert.equal((await publicGoal(api, ctx)).status, "active");
 		await api.emit("input", { source: "user", text: "Keep the marker exact." }, ctx);
 		assert.ok(api.branch.some((entry) => entry.customType === "pi-goal:runtime-event-v3" && entry.data?.type === "steering.received"));
+		await api.emit("tool_execution_start", { toolCallId: "interactive-tool-1", toolName: "bash", args: { command: "node verify.mjs" } }, ctx);
+		await api.emit("tool_execution_end", { toolCallId: "interactive-tool-1", toolName: "bash", result: { stdout: "ok" }, isError: false }, ctx);
+		await api.emit("message_end", { message: { role: "assistant", usage: { input: 3, output: 2, totalTokens: 5, cost: { total: 0.001 } }, stopReason: "stop" } }, ctx);
+		const interactiveTraces = fs.readFileSync(path.join(cwd, "docs", "goals", "trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const interactiveToolStart = interactiveTraces.find((span) => span.name === "goal.tool_started");
+		const interactiveToolEnd = interactiveTraces.find((span) => span.name === "goal.tool_ended");
+		assert.equal(interactiveToolStart.attributes["tool.name"], "bash");
+		assert.equal(interactiveToolEnd.parentSpanId, interactiveToolStart.spanId);
+		assert.equal(interactiveTraces.find((span) => span.name === "goal.llm_response").attributes["gen_ai.usage.cost_usd"], 0.001);
+		const sequenceBeforeReload = Math.max(...interactiveTraces.map((span) => Number(span.attributes["goal.event_seq"])));
+		await api.emit("session_tree", {}, ctx);
+		await api.emit("tool_execution_start", { toolCallId: "interactive-tool-2", toolName: "read", args: { path: "README.md" } }, ctx);
+		await api.emit("tool_execution_end", { toolCallId: "interactive-tool-2", toolName: "read", result: { text: "ok" }, isError: false }, ctx);
+		const tracesAfterReload = fs.readFileSync(path.join(cwd, "docs", "goals", "trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const sequencesAfterReload = tracesAfterReload.map((span) => Number(span.attributes["goal.event_seq"]));
+		assert.equal(new Set(sequencesAfterReload).size, sequencesAfterReload.length, "interactive trace event sequences remain unique after reload");
+		assert.ok(Math.max(...sequencesAfterReload) > sequenceBeforeReload);
 
 		const sourceRun = (await publicGoal(api, ctx)).runtime.runId;
 		await api.commands.get("goal").handler("fork", ctx);

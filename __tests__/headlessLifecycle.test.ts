@@ -605,6 +605,14 @@ describe("headless goal lifecycle", () => {
 		assert.ok(events.some((entry) => entry.type === "steering_received"), "headless steering is logged, not trace-only");
 		const traces = fs.readFileSync(path.join(cwd, "spec.goal.jsonl.trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
 		assert.deepEqual(traces.map((span) => span.name), events.map((entry) => `goal.${entry.type}`));
+		const tracedToolStart = traces.find((span) => span.name === "goal.tool_started");
+		const tracedToolEnd = traces.find((span) => span.name === "goal.tool_ended");
+		assert.equal(tracedToolStart.attributes["tool.name"], "bash");
+		assert.equal(tracedToolEnd.attributes["tool.name"], "bash");
+		assert.equal(tracedToolEnd.parentSpanId, tracedToolStart.spanId);
+		const tracedLlm = traces.find((span) => span.name === "goal.llm_response");
+		assert.equal(tracedLlm.attributes["gen_ai.usage.input_tokens"], 10);
+		assert.equal(traces.find((span) => span.name === "goal.steering_received").attributes["goal.steering.kind"], "initial");
 
 		// 心跳：触发捕获的 interval 回调
 		await api.emit("turn_start", { turnIndex: 3, timestamp: Date.now() }, ctx);

@@ -595,9 +595,21 @@ The reusable P3 evaluation surface is exported from the extension package:
 four neutral benchmark fixtures (`coding`, `research`, `document`, `business`),
 deterministic checks, LLM-judge/pairwise/human-annotation contracts, historical
 regression reports, OTel-compatible trace spans, runtime metrics, and fault
-injection helpers. Interactive lifecycle events are written to
-`docs/goals/trace.jsonl` (or `<headless-log>.trace.jsonl`); traces can be turned
-into redacted offline trajectory samples without exposing prompt contents.
+injection helpers. Interactive activity is written to `docs/goals/trace.jsonl`
+without adding high-frequency tool events to the persisted Goal snapshot or
+session branch; headless spans use `<headless-log>.trace.jsonl`. Spans expose
+bounded attributes for tools, child agents, retries, approvals, checkpoints,
+evaluations, usage, and cost while keeping prompt text, tool arguments,
+artifact bodies, and checkpoint state out of trace attributes.
+
+`npm run goal-quality -- --input <gate-input.json> --output <gate-result.json>`
+turns a persisted Contract V3 result, event log, and trace into a stable offline
+trajectory plus a no-average regression decision. The gate reports final
+output, tool trajectory, artifact correctness, human intervention, recovery
+correctness, cost, and latency separately; one required non-passing dimension
+fails or blocks the fixture. Human acceptance remains `unverified` until a real
+annotation is supplied and cannot be inferred from model or deterministic
+scores. Published schemas include the trajectory sample and run-quality result.
 
 The agent (and you, in tool-capable setups) manages the goal through three tools:
 

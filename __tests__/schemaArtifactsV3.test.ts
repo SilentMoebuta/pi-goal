@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 describe("published Goal Contract V3 schemas", () => {
-	for (const name of ["goal-contract-v3.schema.json", "completion-bundle-v3.schema.json", "goal-project-spec-v3.schema.json", "goal-event-v3.schema.json", "runtime-checkpoint-v3.schema.json", "benchmark-fixture-v1.schema.json", "evaluation-v1.schema.json", "human-annotation-v1.schema.json", "pairwise-comparison-v1.schema.json", "trace-span-v1.schema.json"]) {
+	for (const name of ["goal-contract-v3.schema.json", "completion-bundle-v3.schema.json", "goal-project-spec-v3.schema.json", "goal-event-v3.schema.json", "runtime-checkpoint-v3.schema.json", "benchmark-fixture-v1.schema.json", "evaluation-v1.schema.json", "human-annotation-v1.schema.json", "pairwise-comparison-v1.schema.json", "trace-span-v1.schema.json", "offline-trajectory-sample-v1.schema.json", "run-quality-evaluation-v1.schema.json"]) {
 		it(`${name} is a Draft 2020-12 schema with a stable id`, () => {
 			const schema = JSON.parse(fs.readFileSync(path.join(root, "schemas", name), "utf8"));
 			assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");

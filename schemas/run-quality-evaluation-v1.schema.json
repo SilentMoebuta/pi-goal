@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/run-quality-evaluation-v1.schema.json",
+  "title": "PI Run Quality Evaluation V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "fixtureId", "policy", "decision", "dimensions", "trajectorySampleId", "evaluatedAt"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "fixtureId": { "type": "string", "minLength": 1 },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "decision": { "enum": ["accept", "revise", "blocked"] },
+    "dimensions": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dimension", "status", "summary", "value", "threshold"],
+        "properties": {
+          "dimension": { "enum": ["final_output", "tool_trajectory", "artifact_correctness", "human_intervention", "recovery_correctness", "cost", "latency"] },
+          "status": { "enum": ["passed", "failed", "unverified", "not_applicable"] },
+          "summary": { "type": "string", "minLength": 1 },
+          "value": { "type": ["string", "number", "boolean", "null"] },
+          "threshold": { "type": ["string", "number", "boolean", "null"] }
+        }
+      }
+    },
+    "trajectorySampleId": { "type": "string", "minLength": 1 },
+    "evaluatedAt": { "type": "number", "minimum": 0 }
+  }
+}

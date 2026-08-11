@@ -21,7 +21,8 @@
 	"scripts": {
 		"test": "tsx --test \"__tests__/**/*.test.ts\"",
 		"typecheck": "tsc --noEmit",
-		"goal-spec": "tsx scripts/goal-spec-v3.ts"
+		"goal-spec": "tsx scripts/goal-spec-v3.ts",
+		"goal-quality": "tsx scripts/run-quality-gate-v3.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "^0.84.1",

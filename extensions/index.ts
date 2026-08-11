@@ -74,7 +74,7 @@ import { buildCriteriaBlock, completionFeedbackBlock, reviewerTranscriptDecision
 import { proposalToSpecInput, specDocToProposal, writeGoalSpecDoc, showGoalReview, type GoalCriterionDraft, type GoalProposal, type ReviewResult } from "./draft-review-ui";
 import { mechanicallyVerifyEvidence } from "./evidence-verify";
 import { appendGoalTelemetry, buildGoalTelemetryEntry, readGoalTelemetry } from "./telemetry";
-import { appendTraceJsonl, GoalTraceCollectorV3 } from "./observability-v3";
+import { appendTraceJsonl, GoalTraceCollectorV3, lastTraceEventSequenceV3 } from "./observability-v3";
 import { createInitialRuntimeMetadataV3 } from "./goal-contract-v3";
 import {
 	classifyGoalError,
@@ -281,15 +281,22 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		);
 	}
 
-	/** Headless 实时日志 + 事件回显（仅在 goal.headless 时生效）。 */
-	function goalLog(ctx: ExtensionContext, type: string, payload: Record<string, unknown>): void {
-		if (!goal || !goal.headless) return;
-		const entry = appendGoalEventLog(goal, type, payload, nowMs());
+	/** Persist one observed Goal event. Headless also writes the canonical JSONL projection. */
+	function goalLog(
+		ctx: ExtensionContext,
+		type: string,
+		payload: Record<string, unknown>,
+		options: { nodeId?: string | null; parentId?: string | null; causationId?: string | null } = {},
+	): GoalEventEnvelopeV3 | undefined {
+		if (!goal) return;
+		if (!goal.headless) return traceRuntimeEvent(type, payload, options);
+		const entry = appendGoalEventLog(goal, type, payload, nowMs(), options);
 		traceGoalEvent(entry);
 		pi.sendMessage(
 			{ customType: GOAL_HEADLESS_EVENT_TYPE, content: type, display: false, details: { event: entry } },
 			{ triggerTurn: false },
 		);
+		return entry;
 	}
 
 	function traceGoalEvent(entry: GoalEventEnvelopeV3): void {
@@ -316,7 +323,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			&& typeof candidate.runId === "string";
 	}
 
-	function traceRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; causationId?: string | null } = {}): GoalEventEnvelopeV3 | undefined {
+	function traceRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; parentId?: string | null; causationId?: string | null } = {}): GoalEventEnvelopeV3 | undefined {
 		if (!goal) return;
 		const runtime = goal.runtime ?? createInitialRuntimeMetadataV3({ goalId: goal.id, entrypoint: goal.headless ? "headless" : "interactive" });
 		const entry = createGoalEventV3({
@@ -331,13 +338,14 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			time: nowMs(),
 			payload,
 			nodeId: options.nodeId,
+			parentId: options.parentId,
 			causationId: options.causationId,
 		});
 		traceGoalEvent(entry);
 		return entry;
 	}
 
-	function recordRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; causationId?: string | null } = {}): void {
+	function recordRuntimeEvent(type: string, payload: Record<string, unknown>, options: { nodeId?: string | null; parentId?: string | null; causationId?: string | null } = {}): GoalEventEnvelopeV3 | undefined {
 		if (!goal) return;
 		const entry = traceRuntimeEvent(type, payload, options);
 		if (entry) {
@@ -349,6 +357,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				appendGoalLog(goal.headless.logPath, { v: 1, ts: entry.time, ...entry, ...entry.payload });
 			}
 		}
+		return entry;
 	}
 
 	function currentRuntimeLineage() {
@@ -480,13 +489,14 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			: { ...evaluation, advisories: [...new Set([...evaluation.advisories, ...diagnostics])].sort() };
 	}
 
-	// ── headless 活动日志（turn 内黑盒透明化）────────────────────────────
+	// ── runtime 活动日志（turn 内黑盒透明化）─────────────────────────────
 	// 外部 agent 需要区分"卡死"与"大任务进行中"：tool_started/tool_ended 记录
 	// 每次工具调用，llm_response 记录每轮模型响应，heartbeat 保证最长 30s 必有
 	// 信号（含当前 phase 与距上次活动时间）。
-	const headlessToolStarts = new Map<string, { name: string; startedAt: number }>();
+	const headlessToolStarts = new Map<string, { name: string; startedAt: number; eventId?: string }>();
 	const headlessSubagents = new Map<string, {
 		parentToolCallId: string;
+		startEventId?: string;
 		role?: string;
 		sessionFile?: string;
 		phase: string;
@@ -937,6 +947,10 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 								// doing so would duplicate approvals and prepared entries.
 							}
 						}
+						const tracePath = goal.headless?.logPath
+							? goal.headless.logPath + ".trace.jsonl"
+							: path.join(ctx.cwd, goalConfig.goalSpecDir ?? "docs/goals", "trace.jsonl");
+						runtimeEventSeq = Math.max(runtimeEventSeq, lastTraceEventSequenceV3(tracePath, goal.runtime?.runId ?? ""));
 					}
 				return;
 		}
@@ -1772,10 +1786,9 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		// Reading the projection must not make the projection report itself as work.
 		if (event.toolName === "get_goal") return;
 		progressRuntime.toolStarted(event.toolCallId, event.toolName, event.args, nowMs());
-		if (goal.headless) {
-			headlessToolStarts.set(event.toolCallId, { name: event.toolName, startedAt: nowMs() });
-			goalLog(ctx, "tool_started", { tool: event.toolName, args: summarizeValue(event.args, 300) });
-		}
+		const startedAt = nowMs();
+		const observed = goalLog(ctx, "tool_started", { tool: event.toolName, toolCallId: event.toolCallId, args: summarizeValue(event.args, 300) });
+		headlessToolStarts.set(event.toolCallId, { name: event.toolName, startedAt, ...(observed ? { eventId: observed.eventId } : {}) });
 		updateFooter(ctx);
 	});
 
@@ -1788,11 +1801,12 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 		const details = partial?.details && typeof partial.details === "object"
 			? partial.details as Record<string, unknown>
 			: null;
-		if (goal.headless && details?.kind === "subagent-progress" && typeof details.id === "string") {
+		if (details?.kind === "subagent-progress" && typeof details.id === "string") {
 			const agentId = details.id;
 			const previous = headlessSubagents.get(agentId);
 			const child = {
 				parentToolCallId: event.toolCallId,
+				...(previous?.startEventId ? { startEventId: previous.startEventId } : {}),
 				...(typeof details.role === "string" ? { role: details.role } : {}),
 				...(typeof details.sessionFile === "string" ? { sessionFile: details.sessionFile } : {}),
 				phase: typeof details.phase === "string" ? details.phase : "thinking",
@@ -1800,7 +1814,6 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 				...(typeof details.tool === "string" ? { tool: details.tool } : {}),
 				lastActivityAt: typeof details.lastActivityAt === "number" ? details.lastActivityAt : nowMs(),
 			};
-			headlessSubagents.set(agentId, child);
 			const terminal = child.phase === "completed" || child.phase === "error";
 			const changed = !previous
 				|| previous.role !== child.role
@@ -1811,15 +1824,19 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			// pi-roles may emit the same sanitized state repeatedly while a child
 			// is thinking. Persist only semantic transitions; heartbeats retain the
 			// latest activity for observers without inflating the JSONL log.
-			if (changed || terminal) goalLog(ctx, !previous ? "subagent_started" : terminal ? "subagent_completed" : "subagent_progress", {
-				agentId,
-				role: child.role ?? null,
-				sessionFile: child.sessionFile ?? null,
-				phase: child.phase,
-				turnCount: child.turnCount,
-				tool: child.tool ?? null,
-				lastActivityAt: child.lastActivityAt,
-			});
+			if (changed || terminal) {
+				const observed = goalLog(ctx, !previous ? "subagent_started" : terminal ? "subagent_completed" : "subagent_progress", {
+					agentId,
+					role: child.role ?? null,
+					sessionFile: child.sessionFile ?? null,
+					phase: child.phase,
+					turnCount: child.turnCount,
+					tool: child.tool ?? null,
+					lastActivityAt: child.lastActivityAt,
+				}, { parentId: previous?.startEventId ?? headlessToolStarts.get(event.toolCallId)?.eventId ?? null });
+				if (!previous && observed) child.startEventId = observed.eventId;
+			}
+			headlessSubagents.set(agentId, child);
 			if (terminal) headlessSubagents.delete(agentId);
 		}
 		updateFooter(ctx);
@@ -1828,18 +1845,19 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 	pi.on("tool_execution_end", (event, ctx) => {
 		if (isSubagentSession(ctx)) return;
 		progressRuntime.toolEnded(event.toolCallId, event.result, event.isError, nowMs());
-		if (goal?.headless) {
+		if (goal) {
 			const started = headlessToolStarts.get(event.toolCallId);
 			headlessToolStarts.delete(event.toolCallId);
 			goalLog(ctx, "tool_ended", {
 				tool: event.toolName,
+				toolCallId: event.toolCallId,
 				isError: Boolean(event.isError),
 				durationMs: started ? Math.max(0, nowMs() - started.startedAt) : null,
 				result: summarizeValue(event.result, 500),
-			});
+			}, { parentId: started?.eventId ?? null });
 			for (const [agentId, child] of headlessSubagents) {
 				if (child.parentToolCallId !== event.toolCallId) continue;
-				goalLog(ctx, "subagent_completed", { agentId, role: child.role ?? null, sessionFile: child.sessionFile ?? null, phase: event.isError ? "error" : "completed", turnCount: child.turnCount, tool: child.tool ?? null });
+				goalLog(ctx, "subagent_completed", { agentId, role: child.role ?? null, sessionFile: child.sessionFile ?? null, phase: event.isError ? "error" : "completed", turnCount: child.turnCount, tool: child.tool ?? null }, { parentId: child.startEventId ?? started?.eventId ?? null });
 				headlessSubagents.delete(agentId);
 			}
 		}
@@ -1898,7 +1916,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			const error = classifyGoalError(msg.errorMessage);
 			if (error.retryable) providerFailure = { error };
 		}
-		if (!goal?.headless) return;
+		if (!goal) return;
 		goalLog(ctx, "llm_response", {
 			...(msg.usage === undefined ? {} : { usage: msg.usage }),
 			...(msg.stopReason === undefined ? {} : { stopReason: msg.stopReason }),
@@ -2087,7 +2105,8 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 			clearRetryTimer();
 			providerFailure = null;
 			userSuspended = false;
-			const payload = { source: event.source, input: summarizeValue(event, 500) };
+			const initial = Boolean(goal.headless && currentTurn === null && goal.autoTurnCount === 0);
+			const payload = { source: event.source, kind: initial ? "initial" : "steering", input: summarizeValue(event, 500) };
 			if (goal.headless) goalLog(ctx, "steering_received", payload);
 			else recordRuntimeEvent("steering.received", payload);
 			clearTimer();

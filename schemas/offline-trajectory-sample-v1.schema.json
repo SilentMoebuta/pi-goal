@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentmoebuta.github.io/pi-goal/schemas/offline-trajectory-sample-v1.schema.json",
+  "title": "PI Offline Trajectory Sample V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "sampleId", "traceId", "spanNames", "steps", "durationMs", "status", "attributes", "anomalyReasons", "eligibleForRegression"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "sampleId": { "type": "string", "minLength": 1 },
+    "traceId": { "type": "string", "minLength": 1 },
+    "spanNames": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spanId", "parentSpanId", "name", "status", "attributes"],
+        "properties": {
+          "spanId": { "type": "string", "minLength": 1 },
+          "parentSpanId": { "type": ["string", "null"] },
+          "name": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["unset", "ok", "error"] },
+          "attributes": { "type": "object" }
+        }
+      }
+    },
+    "durationMs": { "type": "number", "minimum": 0 },
+    "status": { "enum": ["unset", "ok", "error"] },
+    "attributes": { "type": "object" },
+    "anomalyReasons": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "eligibleForRegression": { "type": "boolean" }
+  }
+}

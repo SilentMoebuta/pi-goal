@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildRegressionReport, evaluateBenchmarkOutput, validateHumanAnnotation, validateLLMJudgeEvaluation, validatePairwiseComparison } from "../extensions/evaluation-v3";
+import { RUN_QUALITY_DIMENSIONS_V3, buildRegressionReport, buildRunQualityRegressionReportV3, evaluateBenchmarkOutput, evaluateRunQualityV3, validateHumanAnnotation, validateLLMJudgeEvaluation, validatePairwiseComparison } from "../extensions/evaluation-v3";
 import { defaultBenchmarkFixtures } from "../extensions/benchmark-fixtures-v3";
+import { GoalTraceCollectorV3, calculateRuntimeMetrics, traceToOfflineDataset } from "../extensions/observability-v3";
 
 describe("cross-project evaluation V3", () => {
 	it("ships coding, research, document, and business fixtures", () => {
@@ -70,5 +71,90 @@ describe("cross-project evaluation V3", () => {
 			"annotation comments are required",
 			"annotation createdAt must be positive",
 		]);
+	});
+
+	it("evaluates all seven run dimensions without averaging away a failure", async () => {
+		const fixture = defaultBenchmarkFixtures()[0];
+		const finalOutput = await evaluateBenchmarkOutput(fixture, {}, [
+			() => ({ id: "output", status: "passed", summary: "final output passed" }),
+		]);
+		const collector = new GoalTraceCollectorV3("run-quality", () => 100);
+		collector.startSpan({ name: "goal.tool_started" }).end("ok");
+		collector.startSpan({ name: "goal.tool_ended" }).end("ok");
+		const trajectory = traceToOfflineDataset(collector.getSpans(), { sampleId: () => fixture.id })[0];
+		const metrics = calculateRuntimeMetrics({
+			status: "complete",
+			spans: collector.getSpans(),
+			schemaValid: true,
+			artifactChecks: ["correct"],
+			humanAccepted: null,
+			humanInterventions: 0,
+			recoveryAttempts: 0,
+			sideEffectKeys: ["one"],
+			costUsd: 0.01,
+		});
+		const automatedDimensions = RUN_QUALITY_DIMENSIONS_V3.filter((dimension) => dimension !== "human_intervention" && dimension !== "recovery_correctness");
+		const evaluation = evaluateRunQualityV3({
+			fixtureId: fixture.id,
+			finalOutput,
+			trajectory,
+			metrics,
+			policy: {
+				id: "automated-release",
+				version: "1",
+				requiredDimensions: automatedDimensions,
+				requiredTrajectorySpanNames: ["goal.tool_started", "goal.tool_ended"],
+				maxHumanInterventions: 0,
+				maxCostUsd: 0.02,
+				maxLatencyMs: 1,
+			},
+			evaluatedAt: 1,
+		});
+		assert.equal(evaluation.dimensions.length, 7);
+		assert.equal(evaluation.decision, "accept");
+		assert.equal(evaluation.dimensions.find((dimension) => dimension.dimension === "recovery_correctness")?.status, "not_applicable");
+		assert.equal(buildRunQualityRegressionReportV3([
+			{ fixtureId: fixture.id, fixtureVersion: fixture.version, requiredDimensions: automatedDimensions },
+		], [evaluation]).status, "passed");
+
+		const costly = evaluateRunQualityV3({
+			fixtureId: fixture.id,
+			finalOutput,
+			trajectory,
+			metrics,
+			policy: { id: "strict", version: "1", requiredDimensions: ["final_output", "cost"], maxCostUsd: 0.001 },
+			evaluatedAt: 2,
+		});
+		assert.equal(costly.decision, "revise");
+		assert.equal(costly.dimensions.find((dimension) => dimension.dimension === "final_output")?.status, "passed");
+		assert.equal(costly.dimensions.find((dimension) => dimension.dimension === "cost")?.status, "failed");
+		assert.equal(buildRunQualityRegressionReportV3([
+			{ fixtureId: fixture.id, fixtureVersion: fixture.version, requiredDimensions: ["final_output", "cost"] },
+		], [costly]).status, "failed");
+	});
+
+	it("keeps missing human and recovery evidence blocked when the release policy requires it", async () => {
+		const fixture = defaultBenchmarkFixtures()[3];
+		const finalOutput = await evaluateBenchmarkOutput(fixture, {}, [() => ({ id: "output", status: "passed", summary: "ok" })]);
+		const collector = new GoalTraceCollectorV3("external-gate", () => 1);
+		collector.startSpan({ name: "goal.tool_started" }).end("ok");
+		const evaluation = evaluateRunQualityV3({
+			fixtureId: fixture.id,
+			finalOutput,
+			trajectory: traceToOfflineDataset(collector.getSpans())[0],
+			metrics: calculateRuntimeMetrics({ status: "complete", spans: collector.getSpans(), schemaValid: true, artifactChecks: ["correct"], humanAccepted: null, recoveryAttempts: 0, sideEffectKeys: [], costUsd: 0.01 }),
+			policy: {
+				id: "external-release",
+				version: "1",
+				requiredDimensions: [...RUN_QUALITY_DIMENSIONS_V3],
+				requireHumanAcceptance: true,
+				requireRecoveryExercise: true,
+				maxCostUsd: 1,
+				maxLatencyMs: 1,
+			},
+		});
+		assert.equal(evaluation.decision, "blocked");
+		assert.equal(evaluation.dimensions.find((dimension) => dimension.dimension === "human_intervention")?.status, "unverified");
+		assert.equal(evaluation.dimensions.find((dimension) => dimension.dimension === "recovery_correctness")?.status, "unverified");
 	});
 });
