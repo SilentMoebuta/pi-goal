@@ -109,7 +109,10 @@ export function goalEventTraceAttributes(event: GoalEventEnvelopeV3): Record<str
 		recordAttribute(attributes, "goal.steering.source", payload.source);
 	}
 	if (/completion|review|evaluation/.test(event.type)) {
-		recordAttribute(attributes, "goal.evaluation.decision", payload.decision ?? payload.status);
+		const result = payload.result && typeof payload.result === "object" ? payload.result as Record<string, unknown> : {};
+		const completion = result.completion && typeof result.completion === "object" ? result.completion as Record<string, unknown> : {};
+		const impliedDecision = event.type === "completion_bundle_committed" ? "accept" : undefined;
+		recordAttribute(attributes, "goal.evaluation.decision", payload.decision ?? payload.status ?? completion.decision ?? impliedDecision);
 		recordAttribute(attributes, "goal.evaluation.finding_count", Array.isArray(payload.findings) ? payload.findings.length : payload.findings);
 		recordAttribute(attributes, "goal.evaluation.advisory_count", Array.isArray(payload.advisories) ? payload.advisories.length : payload.advisories);
 	}

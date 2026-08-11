@@ -613,6 +613,7 @@ describe("headless goal lifecycle", () => {
 		const tracedLlm = traces.find((span) => span.name === "goal.llm_response");
 		assert.equal(tracedLlm.attributes["gen_ai.usage.input_tokens"], 10);
 		assert.equal(traces.find((span) => span.name === "goal.steering_received").attributes["goal.steering.kind"], "initial");
+		assert.equal(traces.some((span) => span.attributes["tool.name"] === "get_goal"), false);
 
 		// 心跳：触发捕获的 interval 回调
 		await api.emit("turn_start", { turnIndex: 3, timestamp: Date.now() }, ctx);

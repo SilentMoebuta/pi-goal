@@ -1844,6 +1844,7 @@ function registerPiGoalExtension(pi: ExtensionAPI, dependencies: PiGoalRuntimeDe
 
 	pi.on("tool_execution_end", (event, ctx) => {
 		if (isSubagentSession(ctx)) return;
+		if (event.toolName === "get_goal") return;
 		progressRuntime.toolEnded(event.toolCallId, event.result, event.isError, nowMs());
 		if (goal) {
 			const started = headlessToolStarts.get(event.toolCallId);

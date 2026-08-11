@@ -57,7 +57,9 @@ describe("runtime observability and fault injection V3", () => {
 		assert.equal(goalEventTraceAttributes(approval)["goal.checkpoint.approval_count"], 1);
 		const evaluation = createGoalEventV3({ lineage, seq: 5, type: "completion_evaluated", time: 5, payload: { decision: "accept", findings: [], advisories: ["note"] } });
 		assert.equal(goalEventTraceAttributes(evaluation)["goal.evaluation.advisory_count"], 1);
-		const llm = createGoalEventV3({ lineage, seq: 6, type: "llm_response", time: 6, payload: { usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.01 } }, stopReason: "stop" } });
+		const committed = createGoalEventV3({ lineage, seq: 6, type: "completion_bundle_committed", time: 6 });
+		assert.equal(goalEventTraceAttributes(committed)["goal.evaluation.decision"], "accept");
+		const llm = createGoalEventV3({ lineage, seq: 7, type: "llm_response", time: 7, payload: { usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.01 } }, stopReason: "stop" } });
 		assert.equal(goalEventTraceAttributes(llm)["gen_ai.usage.cost_usd"], 0.01);
 	});
 
