@@ -24,6 +24,9 @@
 		"goal-spec": "tsx scripts/goal-spec-v3.ts",
 		"goal-quality": "tsx scripts/run-quality-gate-v3.ts"
 	},
+	"dependencies": {
+		"@silentmoebuta/pi-roles-protocol": "https://github.com/SilentMoebuta/pi-roles/archive/b38086ce21bb690ef301de9b75113d5a6a442fe8.tar.gz"
+	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "^0.84.1",
 		"@earendil-works/pi-coding-agent": "^0.84.1",
