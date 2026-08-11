@@ -1,8 +1,9 @@
-import { Container, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
-import { DynamicBorder, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type SelectItem } from "@earendil-works/pi-tui";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseGoalSpecMarkdown, proposalToMarkdown, slugifyTitle, type SpecCriterion } from "./spec-doc";
+import { GoalReviewPanel } from "./draft-review-panel";
 import type { AssuranceDecision, ExecutionDecision, GateLevel, GoalCriterionV2, ResearchClaim } from "./state";
 import type { TaskKind, ExecutionPreference } from "./config";
 
@@ -135,71 +136,18 @@ export async function showGoalReview(
 	];
 
 	const choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-		const container = new Container();
-		const headerBorder = new DynamicBorder((s) => theme.fg("accent", s));
-		container.addChild(headerBorder);
-		container.addChild(new Text(theme.fg("accent", theme.bold(" Goal Draft Review "))));
-		container.addChild(new Text(""));
-		container.addChild(new Text(theme.fg("accent", theme.bold("Objective:"))));
-		container.addChild(new Text(theme.fg("text", "  " + proposal.objective)));
-		container.addChild(new Text(""));
-		container.addChild(new Text(theme.fg("accent", theme.bold("Route:"))));
-		container.addChild(new Text(theme.fg("text", "  " + proposal.taskKind + " · " + proposal.execution.selected + (proposal.execution.role ? " · " + proposal.execution.role : ""))));
-		for (const reason of proposal.execution.reasons) container.addChild(new Text(theme.fg("dim", "  " + reason)));
-		container.addChild(new Text(theme.fg("accent", theme.bold("Assurance:"))));
-		container.addChild(new Text(theme.fg("text", "  " + proposal.assurance.reviewRequirement + " · " + proposal.assurance.depth)));
-		for (const reason of proposal.assurance.reasons) container.addChild(new Text(theme.fg("dim", "  " + reason)));
-		container.addChild(new Text(""));
-
-		if (proposal.decisions && proposal.decisions.length > 0) {
-			container.addChild(new Text(theme.fg("accent", theme.bold("Clarifications:"))));
-			for (const decision of proposal.decisions) {
-				container.addChild(new Text(theme.fg("dim", "  Q: " + decision.question)));
-				container.addChild(new Text(theme.fg("dim", "  A: " + decision.answer)));
-			}
-			container.addChild(new Text(""));
-		}
-		if (proposal.criteria.length > 0) {
-			container.addChild(new Text(theme.fg("accent", theme.bold("Acceptance Criteria:"))));
-			for (const c of proposal.criteria) {
-				container.addChild(new Text(theme.fg("dim", "  \u2610 [" + c.level + "] " + c.description)));
-			}
-			container.addChild(new Text(""));
-		}
-		if (proposal.constraints.length > 0) {
-			container.addChild(new Text(theme.fg("accent", theme.bold("Constraints:"))));
-			for (const c of proposal.constraints) {
-				container.addChild(new Text(theme.fg("dim", "  \u2022 " + c)));
-			}
-			container.addChild(new Text(""));
-		}
-		if (proposal.claims.length > 0) {
-			container.addChild(new Text(theme.fg("accent", theme.bold("Research Claims:"))));
-			for (const claim of proposal.claims) {
-				container.addChild(new Text(theme.fg("dim", "  " + claim.id + " [" + claim.materiality + (claim.risk ? " · " + claim.risk : "") + "] " + claim.text)));
-			}
-			container.addChild(new Text(""));
-		}
-
-		const selectList = new SelectList(items, items.length, {
-			selectedPrefix: (text) => theme.fg("accent", text),
-			selectedText: (text) => theme.fg("accent", text),
-			description: (text) => theme.fg("muted", text),
-			scrollInfo: (text) => theme.fg("dim", text),
-			noMatch: (text) => theme.fg("warning", text),
+		const panel = new GoalReviewPanel({
+			proposal,
+			theme,
+			items,
+			// 高度预算直接来自真实终端行数：regular custom 路径没有自动
+			// viewport 高度，组件自身必须按 `tui.terminal.rows` 有界输出。
+			rows: () => tui.terminal.rows,
+			requestRender: () => tui.requestRender(),
 		});
-		selectList.onSelect = (item) => done(item.value);
-		selectList.onCancel = () => done(null);
-		container.addChild(selectList);
-		container.addChild(new Text(""));
-		container.addChild(new Text(theme.fg("dim", "  Enter: confirm  Esc: cancel")));
-		container.addChild(new DynamicBorder((s) => theme.fg("accent", s)));
-
-		return {
-			render(width: number) { return container.render(width); },
-			invalidate() { container.invalidate(); },
-			handleInput(data: string) { selectList.handleInput(data); tui.requestRender(); },
-		};
+		panel.onSelect = (item) => done(item.value);
+		panel.onCancel = () => done(null);
+		return panel;
 	});
 
 	return (choice as ReviewResult) ?? "cancel";
